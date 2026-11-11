@@ -17,7 +17,7 @@ waypoint-organization-service owns organizations and who belongs to them. NestJS
 | Data       | Organizations (name, address slug, logo, language), members and roles, invitations and invite link, guests, verified domains, security policies, the audit log (90 days). |
 | API        | Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export.                                                              |
 | Emits      | `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified`                             |
-| Listens to | events relevant to the audit log, `subscription.changed` (updates seat count)                                                                                          |
+| Listens to | events relevant to the audit log, `subscription.changed` (updates seat count)                                                                                             |
 | External   | DNS lookups for domain verification (TXT record).                                                                                                                         |
 | Phase      | Extracted later, when needed                                                                                                                                              |
 

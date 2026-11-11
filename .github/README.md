@@ -2,14 +2,14 @@
 
 waypoint-organization-service owns organizations and who belongs to them. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3011.
 
-| | |
-| --- | --- |
-| Data | Organizations (name, address slug, logo, language), members and roles, invitations and invite link, guests, verified domains, security policies, the audit log (90 days). |
-| API | Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export. |
-| Emits | `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified` |
-| Listens to | `almost every event, to feed the audit log`, `subscription.changed (seat count)` |
-| External | DNS lookups for domain verification (TXT record). |
-| Phase | Extracted later, when needed |
+|            |                                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data       | Organizations (name, address slug, logo, language), members and roles, invitations and invite link, guests, verified domains, security policies, the audit log (90 days). |
+| API        | Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export.                                                              |
+| Emits      | `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified`                             |
+| Listens to | `almost every event, to feed the audit log`, `subscription.changed (seat count)`                                                                                          |
+| External   | DNS lookups for domain verification (TXT record).                                                                                                                         |
+| Phase      | Extracted later, when needed                                                                                                                                              |
 
 Starts as a module of waypoint-identity-service; this repository receives it when the extraction is decided.
 
