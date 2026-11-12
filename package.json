@@ -1,6 +1,6 @@
 {
   "name": "cadenway-organization-service",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Cadenway organization service: organizations, members, invitations, domains and audit log.",
   "private": true,
   "license": "UNLICENSED",
