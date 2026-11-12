@@ -2,7 +2,7 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "waypoint-organization-service",
+      "name": "cadenway-organization-service",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": [
         "start:dev"
