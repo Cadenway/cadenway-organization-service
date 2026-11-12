@@ -1,6 +1,6 @@
-# waypoint-organization-service documentation
+# cadenway-organization-service documentation
 
-Planned role: waypoint-organization-service owns organizations and who belongs to them. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@waypoint/nest-messaging`, internal REST for the API gateway. Local port 3011.
+Planned role: cadenway-organization-service owns organizations and who belongs to them. NestJS, its own PostgreSQL database (one database and one user in the shared PostgreSQL of the VPS), events over NATS JetStream through `@cadenway/nest-messaging`, internal REST for the API gateway. Local port 3011.
 
 ## Current status
 
