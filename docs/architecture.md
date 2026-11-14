@@ -17,9 +17,9 @@ cadenway-organization-service owns organizations and who belongs to them. NestJS
 | Emits      | `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified`                             |
 | Listens to | events relevant to the audit log, `subscription.changed` (updates seat count)                                                                                             |
 | External   | DNS lookups for domain verification (TXT record).                                                                                                                         |
-| Phase      | Extracted later, when needed                                                                                                                                              |
+| Phase      | First version                                                                                                                                                             |
 
-Starts as a module of cadenway-identity-service; this repository receives it when the extraction is decided.
+Built in this repository from the start: it never lives as a module of another service.
 
 ## Architectural ownership
 
