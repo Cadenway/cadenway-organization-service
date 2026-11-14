@@ -31,7 +31,9 @@ Organizations and who belongs to them.
 
 ## Notes
 
-Starts as a module of cadenway-identity-service; this repository receives it when the extraction is decided.
+Built in this repository from the start: it never lives as a module of another service.
+
+Decided: the authentication policies (required MFA, session lifetime, allowed sign-in methods) and the SAML connections belong to cadenway-identity-service, which enforces them: the "security policies" of the data above are not stored here. For the Share dialog this service supplies the directory of members and guests; access grants on spaces and lists, access requests and favorites belong to cadenway-task-service. It keeps a projection of user profiles from `user.profile-updated` and `user.deleted`.
 
 Everything above comes from the [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N) and the
 [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et). If the mockup disagrees with this guide, update the guide and its source skill for both assistants.
