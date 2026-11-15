@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/Cadenway/cadenway-organization-service/compare/v0.1.0...v0.2.0) (2026-11-15)
+
+
+### Miscellaneous Chores
+
+* release 0.2.0 ([424bac5](https://github.com/Cadenway/cadenway-organization-service/commit/424bac5380ce3cad809a93de883d435119872793))
+
 ## 0.1.0 (2026-11-12)
 
 
