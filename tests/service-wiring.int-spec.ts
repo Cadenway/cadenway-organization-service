@@ -541,9 +541,7 @@ describe('organization-service wiring', () => {
       async () => {
         const result = await runWithOrganizationContext(memberOf(atelierNordId), () =>
           tenant.run((tx) =>
-            tx.client.query<{ status: string }>('select status from outbox_events where id = $1', [
-              id,
-            ]),
+            tx.client.query('select status from outbox_events where id = $1', [id]),
           ),
         );
         expect(result.rows).toEqual([{ status: 'sent' }]);
