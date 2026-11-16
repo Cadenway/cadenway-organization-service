@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/Cadenway/cadenway-organization-service/compare/v0.2.0...v0.3.0) (2026-11-16)
+
+
+### Features
+
+* wire messaging and the outbox onto nest-common 0.3.0 ([#20](https://github.com/Cadenway/cadenway-organization-service/issues/20)) ([bca2307](https://github.com/Cadenway/cadenway-organization-service/commit/bca23071abf405a43feb14cf009e89868ab562a4))
+
+
+### Bug Fixes
+
+* **deploy:** keep the migrator url out of the running service ([#22](https://github.com/Cadenway/cadenway-organization-service/issues/22)) ([2b5c33e](https://github.com/Cadenway/cadenway-organization-service/commit/2b5c33ecb68a9f127e06d222d4b5845a250f7d44))
+
 ## [0.2.0](https://github.com/Cadenway/cadenway-organization-service/compare/v0.1.0...v0.2.0) (2026-11-15)
 
 
