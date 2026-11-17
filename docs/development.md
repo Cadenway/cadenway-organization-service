@@ -11,8 +11,8 @@ the internal token on every route but the health probes, connects to NATS as the
 user, runs the outbox relay, and its readiness checks PostgreSQL and NATS. The migrations create
 the tables of the service kit, owned by the platform module (`src/modules/platform/MODULE.md`), and
 those of the organizations module (`src/modules/organizations/MODULE.md`): organizations, members,
-invitations and the user directory. The service serves the internal routes of
-`openapi/internal/organization-service.yaml`, publishes the events of
+invitations, the ledger of invitation emails and the user directory. The service serves the
+internal routes of `openapi/internal/organization-service.yaml`, publishes the events of
 `asyncapi/organization-service.yaml` through its outbox and consumes the account events of
 identity-service. Later capabilities follow the target architecture in this guide.
 
@@ -153,15 +153,19 @@ role, and assembles the application as `main.ts` does, as `organization_app` and
 `organization`. It checks the ownership and forced row-level security of the kit tables, that the
 application role reads and writes the rows of its organization only, runs no DDL and cannot touch
 the migration journal of the `drizzle` schema, that the relay runs against an empty outbox, that
-the broker enforces the permissions of cadenway-ops, the health routes (readiness 503 while NATS or
-PostgreSQL is down and from the start of a shutdown, back to 200 once NATS returns) and the
-internal token. `tests/organizations.int-spec.ts` starts its own throwaway project the same way
+the broker enforces the permissions of cadenway-ops (the `organization` user reaches its own three
+durable consumers only, by their exact names, so a handler without its grant cannot start), the
+health routes (readiness 503 while NATS or PostgreSQL is down and from the start of a shutdown,
+back to 200 once NATS returns) and the internal token. `tests/organizations.int-spec.ts` starts its own throwaway project the same way
 (`tests/support/service-stack.ts`), publishes account events of identity-service with the NATS
 command line before the service starts, and drives every internal route as the gateway would: the
 role rules, the isolation between organizations and the forced row-level security of the business
-tables, the invitation lifecycle, the events in `EVENTS`, the directory projection with its
-redeliveries, and the rollback of a failed creation. Both move to the fixtures of
-`@cadenway/nest-testing` once that package exports them.
+tables, the invitation lifecycle, the invitation email limits (the hour between two sendings, the
+100 emails of 24 hours, two concurrent batches), the events in `EVENTS`, the directory projection
+with its redeliveries and the schedule of its consumers, and the rollback of a failed creation.
+`tests/directory-redelivery.int-spec.ts` gives the directory consumers a short schedule and
+watches a failing event delivered again after each delay, then given up. They move to the
+fixtures of `@cadenway/nest-testing` once that package exports them.
 
 ## Minimum checks by change
 

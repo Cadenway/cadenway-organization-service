@@ -46,6 +46,25 @@ describe('answerRefusals', () => {
         'invitation.expired',
         { expiresAt: '2026-11-02T15:00:00.000Z' },
       ],
+      [
+        {
+          reason: 'invitation-resend-throttled',
+          resendAvailableAt: new Date('2026-11-06T17:20:00Z'),
+        },
+        429,
+        'invitation.resend-throttled',
+        { resendAvailableAt: '2026-11-06T17:20:00.000Z' },
+      ],
+      [
+        {
+          reason: 'invitation-daily-limit-reached',
+          remaining: 2,
+          nextAvailableAt: new Date('2026-11-07T09:12:00Z'),
+        },
+        429,
+        'invitation.daily-limit-reached',
+        { remaining: 2, nextAvailableAt: '2026-11-07T09:12:00.000Z' },
+      ],
       [{ reason: 'user-not-found' }, 404, 'user.not-found', undefined],
       [{ reason: 'user-not-synchronized' }, 404, 'user.not-synchronized', undefined],
       [
@@ -65,6 +84,44 @@ describe('answerRefusals', () => {
       expect(problem).toMatchObject({ status, code });
       expect((problem as { details?: unknown }).details).toEqual(details);
     }
+  });
+
+  it('sets Retry-After on a 429, in whole seconds rounded up and 1 at least', async () => {
+    /**
+     * The headers a refusal sets on the response.
+     *
+     * @param refusal - The refusal.
+     * @returns The headers.
+     */
+    async function headersOf(refusal: Refusal): Promise<Record<string, string>> {
+      const headers: Record<string, string> = {};
+      const response = {
+        setHeader: (name: string, value: string): void => {
+          headers[name] = value;
+        },
+      };
+      await expect(
+        answerRefusals(() => Promise.reject(new OrganizationRefusal(refusal)), response),
+      ).rejects.toBeInstanceOf(ProblemException);
+      return headers;
+    }
+    const now: number = Date.now();
+
+    const throttled = await headersOf({
+      reason: 'invitation-resend-throttled',
+      resendAvailableAt: new Date(now + 3_599_500),
+    });
+    const limited = await headersOf({
+      reason: 'invitation-daily-limit-reached',
+      remaining: 0,
+      nextAvailableAt: new Date(now - 5_000),
+    });
+    const notLimited = await headersOf({ reason: 'invitation-revoked' });
+
+    expect(Number(throttled['Retry-After'])).toBeGreaterThanOrEqual(3599);
+    expect(Number(throttled['Retry-After'])).toBeLessThanOrEqual(3600);
+    expect(limited['Retry-After']).toBe('1');
+    expect(notLimited).toEqual({});
   });
 
   it('lets any other error through', async () => {

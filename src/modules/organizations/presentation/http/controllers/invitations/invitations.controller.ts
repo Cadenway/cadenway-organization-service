@@ -4,7 +4,8 @@ import type {
   InvitationPage,
 } from '@cadenway/contracts/types/internal/organization-service';
 import { InternalAccess } from '@cadenway/nest-common';
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 
 import type { PagePosition } from '../../../../application/models/pagination/page-position.model.js';
 import type { InvitationView } from '../../../../application/projections/invitations/invitation-view.projection.js';
@@ -126,21 +127,28 @@ export class InvitationsController {
    *
    * @description
    * `POST /internal/v1/invitations`: `200` with the outcome of each distinct address; `400`,
-   * `403 organization.role-forbidden`, `404 organization.not-found`.
+   * `403 organization.role-forbidden`, `404 organization.not-found`,
+   * `429 invitation.daily-limit-reached` with `Retry-After`.
    *
    * @param {InviteMembersBody} body - The addresses and the role.
+   * @param {Response} response - The response, for `Retry-After`.
    * @returns {Promise<InvitationBatchResult>} The outcomes.
    */
   @Post()
   @HttpCode(200)
-  public async invite(@Body() body: InviteMembersBody): Promise<InvitationBatchResult> {
-    const output: InviteMembersOutput = await answerRefusals(() =>
-      this.inviteMembers.execute({
-        actorUserId: toActorUserId(),
-        organizationId: toOrganizationId(),
-        emails: body.emails,
-        role: body.role,
-      }),
+  public async invite(
+    @Body() body: InviteMembersBody,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<InvitationBatchResult> {
+    const output: InviteMembersOutput = await answerRefusals(
+      () =>
+        this.inviteMembers.execute({
+          actorUserId: toActorUserId(),
+          organizationId: toOrganizationId(),
+          emails: body.emails,
+          role: body.role,
+        }),
+      response,
     );
     return { invitations: output.invitations.map(toInvitationResultResponse) };
   }
@@ -201,10 +209,12 @@ export class InvitationsController {
    * @description
    * `POST /internal/v1/invitations/{invitationId}/resend`: `200` with the invitation, its new
    * expiry and its `ETag`; `400`, `403 organization.role-forbidden`, `404 invitation.not-found`,
-   * `409 invitation.revoked` or `invitation.answered`.
+   * `409 invitation.revoked` or `invitation.answered`, `429 invitation.resend-throttled` or
+   * `invitation.daily-limit-reached` with `Retry-After`.
    *
    * @param {EmptyBody} _body - The empty object of the contract, validated only.
    * @param {InvitationPath} path - The id of the invitation.
+   * @param {Response} response - The response, for `Retry-After`.
    * @returns {Promise<Invitation>} The invitation.
    */
   @Post(':invitationId/resend')
@@ -212,13 +222,16 @@ export class InvitationsController {
   public async resend(
     @Body() _body: EmptyBody,
     @Param() path: InvitationPath,
+    @Res({ passthrough: true }) response: Response,
   ): Promise<Invitation> {
-    const view: InvitationView = await answerRefusals(() =>
-      this.resendInvitation.execute({
-        actorUserId: toActorUserId(),
-        organizationId: toOrganizationId(),
-        invitationId: path.invitationId,
-      }),
+    const view: InvitationView = await answerRefusals(
+      () =>
+        this.resendInvitation.execute({
+          actorUserId: toActorUserId(),
+          organizationId: toOrganizationId(),
+          invitationId: path.invitationId,
+        }),
+      response,
     );
     return toInvitationResponse(view);
   }

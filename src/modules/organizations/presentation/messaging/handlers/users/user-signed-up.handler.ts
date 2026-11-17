@@ -4,6 +4,7 @@ import { EventConsumers } from '@cadenway/nest-messaging';
 import { Injectable } from '@nestjs/common';
 import type { OnApplicationBootstrap } from '@nestjs/common';
 
+import { DIRECTORY_REDELIVERY } from '../../../../application/models/directory/directory-redelivery.model.js';
 import { ProjectUserSignUp } from '../../../../application/use-cases/commands/directory/project-user-sign-up/project-user-sign-up.use-case.js';
 
 /**
@@ -14,7 +15,9 @@ import { ProjectUserSignUp } from '../../../../application/use-cases/commands/di
  * consumer `organization-service__project-user-signed-up`. It starts from what the stream still
  * holds (`deliverPolicy: 'all'`, the default), so a new deployment learns the accounts signed up
  * before it. The deduplicator of the kit records each event id with the effect, in the system
- * transaction of the delivery, so a redelivery is skipped; the use case applies by version.
+ * transaction of the delivery, so a redelivery is skipped; the use case applies by version. A
+ * failing delivery is retried on `DIRECTORY_REDELIVERY`, about 25 hours before its dead letter,
+ * since the directory decides which account accepts an invitation.
  */
 @Injectable()
 export class UserSignedUpHandler implements OnApplicationBootstrap {
@@ -73,6 +76,7 @@ export class UserSignedUpHandler implements OnApplicationBootstrap {
       handler: 'project-user-signed-up',
       schemas: eventSchemas,
       event: 'user.signed-up.v1',
+      redelivery: DIRECTORY_REDELIVERY,
       handle: (payload: UserSignedUpV1): Promise<void> =>
         this.projectUserSignUp.execute({
           userId: payload.userId,

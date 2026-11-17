@@ -9,7 +9,9 @@ Organizations and who belongs to them, for P2b of the plan:
   the owner;
 - members: one membership per account and organization with its role (`owner`, `admin`, `member`,
   `guest`), kept after a removal with its last version;
-- invitations: an address invited with a role, valid 7 days, resent, revoked, accepted or refused;
+- invitations: an address invited with a role, valid 7 days, resent at most once an hour, revoked,
+  accepted or refused, and the ledger of the invitation emails that holds each organization to 100
+  of them in any 24 hours;
 - the user directory: the name, the address and its verification of every account of
   identity-service, projected from its events, to show the members and match the invitations.
 
@@ -33,18 +35,29 @@ providers of the module; no other module imports it.
 
 ## Owned tables
 
-| Table             | Key                                                 | Organization scoping                                   |
-| ----------------- | --------------------------------------------------- | ------------------------------------------------------ |
-| `organizations`   | `id`, unique `slug`                                 | Policy on `id` (the organization itself), forced       |
-| `members`         | `id`; one active per (`organization_id`, `user_id`) | `organization_id`, policy forced                       |
-| `invitations`     | `id`; one pending per (`organization_id`, `email`)  | `organization_id`, policy forced                       |
-| `directory_users` | `user_id`, the id identity-service gave the account | None: an account belongs to no organization, no policy |
+| Table               | Key                                                 | Organization scoping                                   |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------------ |
+| `organizations`     | `id`, unique `slug`                                 | Policy on `id` (the organization itself), forced       |
+| `members`           | `id`; one active per (`organization_id`, `user_id`) | `organization_id`, policy forced                       |
+| `invitations`       | `id`; one pending per (`organization_id`, `email`)  | `organization_id`, policy forced                       |
+| `invitation_emails` | `id`; one row per invitation email sent             | `organization_id`, policy forced                       |
+| `directory_users`   | `user_id`, the id identity-service gave the account | None: an account belongs to no organization, no policy |
 
-Created by `migrations/0001_organizations_members_invitations.sql`, with the `FORCE ROW LEVEL
-SECURITY` statements added by hand. One owner at most per organization (partial unique index).
-`user_id` and `invited_by_user_id` name accounts of identity-service without a foreign key; the
-foreign keys stay inside the module. `name_key` columns hold `searchKeyOf` of the names, the sort
-and search key. The application role `organization_app` reads and writes the rows and runs no DDL.
+Created by `migrations/0001_organizations_members_invitations.sql` and
+`migrations/0002_invitation_emails.sql`, with the `FORCE ROW LEVEL SECURITY` statements added by
+hand. One owner at most per organization (partial unique index). `user_id` and
+`invited_by_user_id` name accounts of identity-service without a foreign key; the foreign keys stay
+inside the module. `name_key` columns hold `searchKeyOf` of the names, the sort and search key. The
+application role `organization_app` reads and writes the rows and runs no DDL.
+
+`invitation_emails` is the ledger of the daily allowance of invitation emails: one row per issue
+(batch or creation) and per resend, with the organization, the invitation and the instant, never
+the address. A resend overwrites `invitations.sent_at`, so that column cannot count the emails. A
+row is written once and never changed, so it has no `version` nor `updated_at`. Each batch or
+resend of an organization deletes its rows sent 24 hours ago or more, under the lock of the check:
+the table holds 100 rows at most per organization, and no job purges it, so an organization that
+stops inviting keeps its last rows. Their foreign keys are `no action`: the deletion of an
+organization or of an invitation, a later phase, deletes its ledger rows first.
 
 ## API
 
@@ -62,16 +75,19 @@ tenant transaction; "none" routes ignore it.
 | `GET /internal/v1/members/{memberId}`                      | Required     | 200, `ETag`             | 400, 403, 404 `member.not-found`                                                                                                                          |
 | `PATCH /internal/v1/members/{memberId}`                    | Required     | 200, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`, 422 `member.owner-protected`                                                                               |
 | `DELETE /internal/v1/members/{memberId}`                   | Required     | 204                     | 400, 403, 404, 422 `member.owner-protected`                                                                                                               |
-| `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`                                                                                                                    |
+| `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`, 429 `invitation.daily-limit-reached`                                                                              |
 | `GET /internal/v1/invitations`                             | Required     | 200                     | 400, 403, 404                                                                                                                                             |
 | `DELETE /internal/v1/invitations/{invitationId}`           | Required     | 204                     | 400, 403, 404 `invitation.not-found`, 409 `invitation.answered`                                                                                           |
-| `POST /internal/v1/invitations/{invitationId}/resend`      | Required     | 200, `ETag`             | 400, 403, 404, 409 `invitation.revoked`, `invitation.answered`                                                                                            |
+| `POST /internal/v1/invitations/{invitationId}/resend`      | Required     | 200, `ETag`             | 400, 403, 404, 409 `invitation.revoked`, `invitation.answered`, 429 `invitation.resend-throttled`, `invitation.daily-limit-reached`                       |
 | `GET /internal/v1/users/{userId}/invitations`              | None         | 200                     | 400, 404 `user.not-found`                                                                                                                                 |
 | `POST /internal/v1/users/{userId}/invitations/{id}/accept` | None         | 200                     | 400, 403 `invitation.email-mismatch`, 404 `invitation.not-found`, `user.not-found`, 409 `invitation.revoked`, `invitation.answered`, `invitation.expired` |
 | `POST /internal/v1/users/{userId}/invitations/{id}/refuse` | None         | 204                     | As the acceptance                                                                                                                                         |
 
 Every route also answers the 401 and 403 of the internal token guard. The titles are the English
-reason phrases; the gateway answers the French titles of the public specs.
+reason phrases; the gateway answers the French titles of the public specs. A 429 carries
+`Retry-After`, the seconds until `details.resendAvailableAt` or `details.nextAvailableAt`, rounded
+up and 1 at least. The gateway relays the two 429 codes only once it lists them: it must ship them
+in the same deployment as this module or before, otherwise they reach the browser as 503.
 
 ## Events emitted
 
@@ -111,8 +127,21 @@ the seven days the stream holds when it starts; a consumer that needs the member
   `email_version`) and an older event never overwrites a newer one, whatever the order of arrival.
 - The entry is locked (`select … for update` after an `insert … on conflict do nothing`), so two
   events of one account apply one after the other.
+- The directory decides which account accepts an invitation, so a failing event is not given up
+  before 24 hours (decision 3 of the P2b security follow-ups): the three consumers retry on
+  `DIRECTORY_REDELIVERY` (`application/models/directory/`), 1 s, 5 s, 30 s, 2 min, 10 min, 30 min,
+  then every hour, 32 deliveries, about 25 h 43 min before the dead letter, the schedule the README
+  of `@cadenway/nest-messaging` gives for security projections. The kit applies it with
+  `nak(delay)` and sets `max_deliver` to 32 on each consumer when the service starts, in place.
+  **A rollout of this schedule, or of any change to it, must replace every replica**: a replica
+  still on the previous limit (5 deliveries) treats its own last delivery as final and can use up
+  the remaining deliveries at once, and sets `max_deliver` back when it restarts.
 - A dead letter of these consumers is replayed by an operator once its cause is fixed; applying an
   event twice changes nothing.
+- The NATS user `organization` may create, read, pull from and acknowledge on these three consumers
+  only, each by its exact name and filter (cadenway-ops, `docs/messaging.md`); `compose.dev.yaml`
+  grants the same, so a handler without its grant fails to start in the integration tests. A new
+  handler gets its consumer granted in cadenway-ops before the release that adds it.
 
 **Beyond the retention of the stream.** An account whose events left `EVENTS` (seven days) before
 this service first consumed them, or a directory lost and recreated, is not recovered by the
@@ -149,15 +178,27 @@ of received invitations.
   for the verified address of an active member, `already-invited` with the pending invitation,
   `invited` otherwise; the verified address of the creator in the creation form is
   `already-member`.
+- The email of an invitation goes out at most once an hour: a resend less than an hour after its
+  `sentAt` (the issue or the previous resend) answers `429 invitation.resend-throttled` with
+  `details.resendAvailableAt`, `sentAt` plus one hour, checked after the invitation is found and
+  pending (decision 1 of the P2b security follow-ups).
+- An organization causes at most 100 invitation emails in any 24 hours: each `invited` address of a
+  batch or of the creation and each resend takes one. Once the role is accepted, a batch whose
+  addresses to invite need more than what remains, or a resend with none left (after the hour
+  rule), answers `429 invitation.daily-limit-reached` with `details.remaining` (`0` or more) and
+  `details.nextAvailableAt` (the oldest email counted plus 24 hours), and writes, sends and emits
+  nothing. A batch that invites nobody is never refused. The creation is never refused (50
+  addresses at most) but counts.
 - An invitation is accepted or refused only by the account whose verified address, in the
   directory, is the invited address (decision 5); the checks run in the order of the contract, and
   the address is checked again under the lock of the invitation.
 - A cursor is unsigned: its id must be a UUID and its key the sort key of its list (an instant for
-  the invitation lists), else `400 request.invalid`, the code of the contract.
+  the invitation lists), else `400 request.invalid`, the code of the contract. The kit answers a
+  malformed cursor and a malformed `If-Match` with that code itself; this module answers it for
+  the checks it makes on a decoded position.
 - Every refusal answers a code the operation declares in `openapi/internal/organization-service.yaml`
-  (`tests/organizations.int-spec.ts` checks each error response against it): the kit's
-  `pagination.cursor-invalid` and `request.if-match-invalid` are answered as `request.invalid`, a
-  stale `If-Match` as `412 request.version-mismatch` with `details.version`.
+  (`tests/organizations.int-spec.ts` checks each error response against it); a stale `If-Match`
+  answers `412 request.version-mismatch` with `details.version`.
 - The directory applies each part of an account by version; a directory entry is never deleted.
 - Never logged by this module: an address, a name, a token.
 
@@ -169,6 +210,18 @@ acceptance and the refusal in two (a read-only check, then the write):
 - Tenant transaction of the organization of the token: reading and patching the organization,
   every member and invitation route. The membership of the actor, the change, its version check
   and its event commit together.
+- The batches and the resends of an organization run one after the other: the check of the daily
+  allowance locks the row of the organization (`select … for no key update`) until the end of the
+  transaction, then counts the ledger, so two concurrent requests cannot both pass on the same
+  remaining emails. The lock leaves the key of the organization alone: the foreign keys of
+  concurrent inserts (an acceptance writing a membership) do not wait on it, while a patch of the
+  organization (`for update`) waits for it and the reverse. Every writer of the ledger locks the
+  organization before an invitation (the resend: organization, then the invitation), so the locks
+  are always taken in that order. The count is a statement of its own after the lock, so it sees
+  what the previous holder committed under READ COMMITTED, the isolation the kit's runners open; a
+  runner opened at REPEATABLE READ would break the check. The creation writes the ledger of an
+  organization nobody else can see yet and takes no lock. A request waiting on the lock longer
+  than the `lock_timeout` of the application role (5 s) fails with a 500.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
   - the creation of an organization: the organization does not exist before it and PostgreSQL
     assigns its id on insert, so no tenant transaction can hold it; it writes the rows of the new
@@ -233,10 +286,31 @@ Any failure rolls back the business rows and the outbox rows together
 - The outcome lists return the addresses trimmed and lowercased, the form every comparison uses.
 - A member whose directory entry lacks a name, never expected, shows its address as its name; the
   sender of an invitation likewise, cut to the 120 characters of `inviter.name`.
-- The kit's `pagination.cursor-invalid` is answered as `400 request.invalid`, the code the contract
-  declares; reported to cadenway-api-contracts and cadenway-service-kit.
-- A malformed `If-Match` answers `400 request.invalid` (the kit's parser, mapped to the code of the
-  contract).
+- A malformed cursor or `If-Match` answers `400 request.invalid` from the kit itself since
+  `@cadenway/nest-common` 0.6.0 (decision 5 of the P2b security follow-ups); this module no longer
+  maps the former kit codes. The generated query validators of `@cadenway/contracts` 0.6.0 read
+  `limit` from its text, so the module keeps only its splitting of `role`.
+- The invitation email limits, decision 1 of the P2b security follow-ups, as
+  `openapi/internal/organization-service.yaml` of `@cadenway/contracts` 0.6.0 describes them (the
+  user may revise them): one email an hour per invitation, counted from its `sentAt`; 100 per
+  organization in any 24 hours, issues, creation invitations and resends together; a batch over
+  what remains refused as a whole. Choices made here:
+  - the ledger `invitation_emails` counts the emails, since `sentAt` is overwritten by a resend;
+    it holds no address, and its rows are purged by the next batch or resend of their
+    organization rather than by a job;
+  - the check is serialized per organization by a row lock on the organization, not an advisory
+    lock (no shared key space to coordinate) nor a constraint (a count over a window is no
+    constraint);
+  - the order of the refusals of a resend follows the contract: found, pending, the hour, then
+    the allowance;
+  - `Retry-After` is computed when the refusal is answered, from the instant of the details, as
+    identity-service does.
+  - Known limit, as the contract defines the hour per invitation: revoking an invitation and
+    inviting the address again sends a new email at once, within the daily allowance, and each new
+    organization starts with its own 100. A per-address hour and a limit on creations need the
+    contract first; reported to cadenway-api-contracts and the gateway.
 - `tests/organizations.int-spec.ts` proves every route, the isolation, the role rules, the
-  invitation lifecycle, the events in the stream, the directory projection from events published
-  before the service started and their redelivery, and the rollback, on real PostgreSQL and NATS.
+  invitation lifecycle, the invitation email limits (with two concurrent batches), the events in
+  the stream, the directory projection from events published before the service started and their
+  redelivery, and the rollback, on real PostgreSQL and NATS. `tests/directory-redelivery.int-spec.ts`
+  proves the redelivery schedule of the directory consumers with a short schedule.

@@ -67,6 +67,32 @@ describe('CreateOrganization', () => {
     });
   });
 
+  it('counts each address it invites against the daily allowance of the new organization, never refusing', async () => {
+    const created: CreateOrganizationOutput = await create.execute({
+      actorUserId: CAMILLE_ID,
+      name: 'Atelier Nord',
+      slug: null,
+      teamSize: '21-100',
+      primaryUse: 'product-engineering',
+      inviteEmails: [
+        'Camille.Martin@ateliernord.fr',
+        ...Array.from({ length: 49 }, (_: unknown, index: number) => {
+          return `equipe.${String(index)}@ateliernord.fr`;
+        }),
+      ],
+    });
+
+    expect(created.invitations.filter((outcome) => outcome.outcome === 'invited')).toHaveLength(49);
+    expect(store.tables.invitationEmails).toHaveLength(49);
+    expect(
+      store.tables.invitationEmails.every(
+        (entry) =>
+          entry.organizationId === created.organization.id &&
+          entry.sentAt.getTime() === Date.parse('2026-03-02T09:00:00Z'),
+      ),
+    ).toBe(true);
+  });
+
   it('creates nothing for an account the directory does not know yet', async () => {
     await expect(
       create.execute({

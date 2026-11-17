@@ -1,6 +1,8 @@
 import { InvalidEmailAddressError } from '../../../domain/errors/directory/invalid-email-address.error.js';
 import { InvitationAnsweredError } from '../../../domain/errors/invitations/invitation-answered.error.js';
+import { InvitationDailyLimitReachedError } from '../../../domain/errors/invitations/invitation-daily-limit-reached.error.js';
 import { InvitationExpiredError } from '../../../domain/errors/invitations/invitation-expired.error.js';
+import { InvitationResendThrottledError } from '../../../domain/errors/invitations/invitation-resend-throttled.error.js';
 import { InvitationRevokedError } from '../../../domain/errors/invitations/invitation-revoked.error.js';
 import { MemberRemovedError } from '../../../domain/errors/members/member-removed.error.js';
 import { OwnerProtectedError } from '../../../domain/errors/members/owner-protected.error.js';
@@ -58,6 +60,16 @@ function refusalOf(error: unknown): Refusal | null {
   }
   if (error instanceof InvitationExpiredError) {
     return { reason: 'invitation-expired', expiresAt: error.expiresAt };
+  }
+  if (error instanceof InvitationResendThrottledError) {
+    return { reason: 'invitation-resend-throttled', resendAvailableAt: error.resendAvailableAt };
+  }
+  if (error instanceof InvitationDailyLimitReachedError) {
+    return {
+      reason: 'invitation-daily-limit-reached',
+      remaining: error.remaining,
+      nextAvailableAt: error.nextAvailableAt,
+    };
   }
   return null;
 }

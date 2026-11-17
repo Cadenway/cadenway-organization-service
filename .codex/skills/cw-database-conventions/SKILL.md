@@ -65,7 +65,7 @@ The two roles exist in cadenway-ops (`docs/database.md` there) and in `compose.d
 `tests/service-wiring.int-spec.ts` proves that every table with an organization has its policy
 forced, that one organization cannot read or write another's rows of the kit tables, and that the
 application role runs no DDL and cannot touch the migration journal;
-`tests/organizations.int-spec.ts` proves the same isolation on `organizations`, `members` and
-`invitations`. `organizations` carries its policy on `id`, the organization itself; the user
-directory (`directory_users`) belongs to no organization and carries none. The linting of
-migrations is not there yet: these conventions are also applied by review.
+`tests/organizations.int-spec.ts` proves the same isolation on `organizations`, `members`,
+`invitations` and `invitation_emails`. `organizations` carries its policy on `id`, the
+organization itself; the user directory (`directory_users`) belongs to no organization and carries
+none. The linting of migrations is not there yet: these conventions are also applied by review.

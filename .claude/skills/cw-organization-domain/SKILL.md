@@ -26,6 +26,7 @@ Organizations and who belongs to them.
 - Roles (decision 1 of P2b): `owner` (the creator, one per organization), `admin`, `member`, `guest`. The owner and the admins update the organization, invite, see the pending invitations, change roles and remove members; members read the member list; guests do not. Nobody changes the role of the owner or removes them, and nobody becomes owner by a change of role. This service decides it from its own members, never from the token.
 - Guests take no seat: `memberCount` counts owner, admins and members. Inviting as a guest is explicit in P2b; making any address outside the verified domains (ateliernord.fr, lumen.coop in fixtures) a guest arrives with the verified domains, in a later phase.
 - An invitation is valid 7 days; a resend starts them again; it is accepted only by the account whose verified address is the invited one (decision 5).
+- An invitation email goes out at most once an hour (a resend sooner answers `429 invitation.resend-throttled`), and an organization causes at most 100 invitation emails in any 24 hours, issues, creation invitations and resends together (`429 invitation.daily-limit-reached`; a batch over what remains is refused as a whole). Decision 1 of the P2b security follow-ups.
 - A resource of another organization answers 404, never 403 (decision 9). The address slug is unique across organizations (decision 10).
 - Transferring ownership requires choosing a member (later phase).
 - Deleting the organization requires typing its exact name.

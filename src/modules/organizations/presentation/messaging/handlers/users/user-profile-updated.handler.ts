@@ -4,6 +4,7 @@ import { EventConsumers } from '@cadenway/nest-messaging';
 import { Injectable } from '@nestjs/common';
 import type { OnApplicationBootstrap } from '@nestjs/common';
 
+import { DIRECTORY_REDELIVERY } from '../../../../application/models/directory/directory-redelivery.model.js';
 import { ProjectProfileUpdate } from '../../../../application/use-cases/commands/directory/project-profile-update/project-profile-update.use-case.js';
 
 /**
@@ -12,7 +13,8 @@ import { ProjectProfileUpdate } from '../../../../application/use-cases/commands
  * @description
  * Consumes `user.profile-updated.v1` of identity-service into the user directory, through the
  * durable consumer `organization-service__project-user-profile-updated`, from what the stream
- * still holds, deduplicated by the kit and applied by version, as `UserSignedUpHandler`.
+ * still holds, deduplicated by the kit, applied by version and retried on `DIRECTORY_REDELIVERY`,
+ * as `UserSignedUpHandler`.
  */
 @Injectable()
 export class UserProfileUpdatedHandler implements OnApplicationBootstrap {
@@ -71,6 +73,7 @@ export class UserProfileUpdatedHandler implements OnApplicationBootstrap {
       handler: 'project-user-profile-updated',
       schemas: eventSchemas,
       event: 'user.profile-updated.v1',
+      redelivery: DIRECTORY_REDELIVERY,
       handle: (payload: UserProfileUpdatedV1): Promise<void> =>
         this.projectProfileUpdate.execute({
           userId: payload.userId,

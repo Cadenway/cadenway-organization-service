@@ -3,6 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
+import { eventSchemas as identityEvents } from '@cadenway/contracts/events/identity-service';
 import {
   createApplication,
   InternalTokenSigner,
@@ -15,6 +16,7 @@ import type {
   OrganizationContext,
 } from '@cadenway/nest-common';
 import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest-common/database';
+import { EventConsumers } from '@cadenway/nest-messaging';
 import { Controller, Get, Injectable, Module } from '@nestjs/common';
 import type { BeforeApplicationShutdown } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -62,13 +64,22 @@ const platformTables = [
 ] as const;
 
 /** The tables of the organizations module, as its schemas name them. */
-const businessTables = ['directory_users', 'invitations', 'members', 'organizations'] as const;
+const businessTables = [
+  'directory_users',
+  'invitation_emails',
+  'invitations',
+  'members',
+  'organizations',
+] as const;
 
 /** Every table of `public`, in the order PostgreSQL sorts their names. */
 const allTables = [...platformTables, ...businessTables].sort();
 
-/** Migrations of `migrations/`: the platform tables, then the organizations module. */
-const migrationCount = 2;
+/**
+ * Migrations of `migrations/`: the platform tables, the organizations module, then the ledger of
+ * invitation emails.
+ */
+const migrationCount = 3;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -353,6 +364,7 @@ describe('organization-service wiring', () => {
       { relname: 'directory_users', relrowsecurity: false, relforcerowsecurity: false },
       { relname: 'event_versions', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'invitation_emails', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'members', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'organizations', relrowsecurity: true, relforcerowsecurity: true },
@@ -362,6 +374,7 @@ describe('organization-service wiring', () => {
     expect(policies.rows).toEqual([
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
+      { tablename: 'invitation_emails', policyname: 'invitation_emails_organization_isolation' },
       { tablename: 'invitations', policyname: 'invitations_organization_isolation' },
       { tablename: 'members', policyname: 'members_organization_isolation' },
       { tablename: 'organizations', policyname: 'organizations_organization_isolation' },
@@ -607,6 +620,67 @@ describe('organization-service wiring', () => {
     expect(
       brokerAccepts({ NATS_USER: '', NATS_PASSWORD: '' }, 'pub', 'evt.organization.x', 'x'),
     ).toBe(false);
+  });
+
+  it('lets the organization user use its own durable consumers only, each by its exact name', async () => {
+    const organization = { NATS_USER: 'organization', NATS_PASSWORD: 'organization' };
+    const inbox = ['--inbox-prefix', '_INBOX.organization'] as const;
+
+    for (const handler of [
+      'project-user-signed-up',
+      'project-user-email-verified',
+      'project-user-profile-updated',
+    ]) {
+      expect(
+        brokerAccepts(
+          organization,
+          ...inbox,
+          'consumer',
+          'info',
+          'EVENTS',
+          `organization-service__${handler}`,
+        ),
+      ).toBe(true);
+    }
+    expect(
+      brokerAccepts(
+        organization,
+        ...inbox,
+        'consumer',
+        'info',
+        'EVENTS',
+        'identity-service__project-member-joined',
+      ),
+    ).toBe(false);
+    expect(
+      brokerAccepts(
+        organization,
+        ...inbox,
+        'consumer',
+        'add',
+        'EVENTS',
+        'organization-service__wiring-probe',
+        '--filter',
+        'evt.user.signed-up.v1',
+        '--pull',
+        '--defaults',
+      ),
+    ).toBe(false);
+    expect(
+      brokerAccepts({}, 'consumer', 'info', 'EVENTS', 'organization-service__wiring-probe'),
+    ).toBe(false);
+
+    // A handler whose consumer cadenway-ops does not grant cannot start.
+    await expect(
+      service()
+        .get(EventConsumers)
+        .subscribe({
+          handler: 'wiring-probe',
+          schemas: identityEvents,
+          event: 'user.signed-up.v1',
+          handle: (): Promise<void> => Promise.resolve(),
+        }),
+    ).rejects.toThrow();
   });
 
   it('stops being ready while NATS is down, and is ready again once it is back', async () => {

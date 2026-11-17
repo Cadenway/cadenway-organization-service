@@ -17,9 +17,9 @@ const UUID_FORMAT: RegExp = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
  * Function invalidCursor
  *
  * @description
- * The refusal of a cursor this service did not issue for the same list: `400 request.invalid`, the
- * one code `openapi/internal/organization-service.yaml` declares for a request that does not match
- * it (the kit's own code, `pagination.cursor-invalid`, is not part of the contract).
+ * The refusal of a decoded position that is not one of this list: `400 request.invalid`, the one
+ * code `openapi/internal/organization-service.yaml` declares for a request that does not match it,
+ * with the issue the kit gives a malformed cursor.
  *
  * @returns {ProblemException} The problem.
  */
@@ -46,8 +46,9 @@ function invalidCursor(): ProblemException {
  *
  * @description
  * Reads the opaque `cursor` of a list: the position of the last item of the previous page, issued
- * for the same filters. A cursor is not signed, so its id must be a UUID and its key pass the check
- * of the list before either reaches a query.
+ * for the same filters. The kit answers a malformed cursor, or one issued for other filters, with
+ * `400 request.invalid`. A cursor is not signed, so its id must be a UUID and its key pass the
+ * check of the list before either reaches a query, with the same answer otherwise.
  *
  * @param {string | undefined} cursor - The `cursor` query parameter.
  * @param {unknown} filters - Everything that defines the list.
@@ -63,12 +64,7 @@ export function toPagePosition(
   if (cursor === undefined) {
     return null;
   }
-  let position: CursorPosition;
-  try {
-    position = decodeCursor(cursor, filters);
-  } catch {
-    throw invalidCursor();
-  }
+  const position: CursorPosition = decodeCursor(cursor, filters);
   const [key] = position.sort;
   if (
     position.sort.length !== 1 ||

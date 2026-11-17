@@ -1,5 +1,6 @@
 import { InvitationAnsweredError } from '../../errors/invitations/invitation-answered.error.js';
 import { InvitationExpiredError } from '../../errors/invitations/invitation-expired.error.js';
+import { InvitationResendThrottledError } from '../../errors/invitations/invitation-resend-throttled.error.js';
 import { InvitationRevokedError } from '../../errors/invitations/invitation-revoked.error.js';
 import { InvalidStoredStateError } from '../../errors/organizations/invalid-stored-state.error.js';
 import { EmailAddress } from '../../value-objects/email/email-address.value-object.js';
@@ -19,6 +20,8 @@ import type { AssignableRole } from '../../value-objects/members/assignable-role
  * - an invitation is valid 7 days from its last sending ("Elles expirent dans 7 jours.");
  * - a resend sends the email again and starts the 7 days again, expired or not; a revoked or
  *   answered invitation is never sent again;
+ * - its email goes out at most once an hour: a resend less than an hour after its last sending is
+ *   refused (decision 1 of the P2b security follow-ups);
  * - an expired invitation stays pending until it is resent or revoked;
  * - revoking a revoked invitation changes nothing; an answered one cannot be revoked;
  * - the invitee accepts or refuses a pending invitation before its expiry, once.
@@ -35,6 +38,17 @@ export class Invitation {
    * @readonly
    */
   public static readonly VALIDITY_MS: number = 7 * 24 * 60 * 60_000;
+
+  /**
+   * Property RESEND_INTERVAL_MS
+   *
+   * @description
+   * Time between two sendings of an invitation: one hour, in milliseconds.
+   *
+   * @type {number}
+   * @readonly
+   */
+  public static readonly RESEND_INTERVAL_MS: number = 60 * 60_000;
 
   /**
    * Property state
@@ -172,15 +186,23 @@ export class Invitation {
    *
    * @description
    * Sends a pending invitation again, expired or not ("Renvoyer"): its 7 days start again at `now`
-   * and its version goes up by one.
+   * and its version goes up by one. The checks run in the order of the contract: pending first,
+   * then one hour at least since its last sending, the invitation itself or the previous resend.
    *
    * @param {Date} now - When it is sent again.
    * @returns {Invitation} The invitation after the resend.
    * @throws {InvitationRevokedError} When it was revoked.
    * @throws {InvitationAnsweredError} When it was accepted or refused.
+   * @throws {InvitationResendThrottledError} When it was sent less than an hour before `now`.
    */
   public resend(now: Date): Invitation {
     this.assertPending();
+    const resendAvailableAt: Date = new Date(
+      this.state.sentAt.getTime() + Invitation.RESEND_INTERVAL_MS,
+    );
+    if (now.getTime() < resendAvailableAt.getTime()) {
+      throw new InvitationResendThrottledError(resendAvailableAt);
+    }
     return new Invitation({
       ...this.state,
       sentAt: now,

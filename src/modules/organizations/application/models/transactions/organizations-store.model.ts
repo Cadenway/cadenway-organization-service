@@ -1,5 +1,6 @@
 import type { OrganizationEvents } from '../../ports/outbound/messaging/organizations/organization-events.port.js';
 import type { DirectoryRepository } from '../../ports/outbound/persistence/directory/directory-repository.port.js';
+import type { InvitationEmailRepository } from '../../ports/outbound/persistence/invitations/invitation-email-repository.port.js';
 import type { InvitationRepository } from '../../ports/outbound/persistence/invitations/invitation-repository.port.js';
 import type { MemberRepository } from '../../ports/outbound/persistence/members/member-repository.port.js';
 import type { OrganizationRepository } from '../../ports/outbound/persistence/organizations/organization-repository.port.js';
@@ -44,6 +45,17 @@ export interface OrganizationsStore {
    * @readonly
    */
   readonly invitations: InvitationRepository;
+
+  /**
+   * Property invitationEmails
+   *
+   * @description
+   * The ledger of the invitation emails, for the daily allowance.
+   *
+   * @type {InvitationEmailRepository}
+   * @readonly
+   */
+  readonly invitationEmails: InvitationEmailRepository;
 
   /**
    * Property directory

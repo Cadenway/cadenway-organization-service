@@ -46,6 +46,17 @@ interface ProblemShape {
    * @readonly
    */
   readonly details?: Readonly<Record<string, unknown>>;
+
+  /**
+   * Property retryAt
+   *
+   * @description
+   * When the request can succeed, for the `Retry-After` header of a 429.
+   *
+   * @type {Date | undefined}
+   * @readonly
+   */
+  readonly retryAt?: Date;
   // #endregion
 }
 
@@ -103,6 +114,23 @@ function shapeOf(refusal: Refusal): ProblemShape {
         code: 'invitation.expired',
         details: { expiresAt: refusal.expiresAt.toISOString() },
       };
+    case 'invitation-resend-throttled':
+      return {
+        status: 429,
+        code: 'invitation.resend-throttled',
+        details: { resendAvailableAt: refusal.resendAvailableAt.toISOString() },
+        retryAt: refusal.resendAvailableAt,
+      };
+    case 'invitation-daily-limit-reached':
+      return {
+        status: 429,
+        code: 'invitation.daily-limit-reached',
+        details: {
+          remaining: refusal.remaining,
+          nextAvailableAt: refusal.nextAvailableAt.toISOString(),
+        },
+        retryAt: refusal.nextAvailableAt,
+      };
     case 'user-not-found':
       return { status: 404, code: 'user.not-found' };
     case 'user-not-synchronized':
@@ -115,13 +143,21 @@ function shapeOf(refusal: Refusal): ProblemShape {
  *
  * @description
  * Runs a use case and turns its `OrganizationRefusal` into the problem of the contract; any other
- * error passes through to the `ProblemFilter` of the kit.
+ * error passes through to the `ProblemFilter` of the kit. A 429 also sets `Retry-After` on the
+ * response, the seconds until the request can succeed, rounded up and 1 at least, as the contract
+ * declares on `InvitationBatchLimited` and `InvitationResendLimited`: the routes that can answer
+ * one pass their response.
  *
  * @param {() => Promise<TResult>} work - The call of the use case.
+ * @param {{ readonly setHeader: (name: string, value: string) => unknown } | undefined} response -
+ * The response, for `Retry-After`.
  * @returns {Promise<TResult>} What the use case resolved with.
  * @throws {ProblemException} For a refusal of the use case.
  */
-export async function answerRefusals<TResult>(work: () => Promise<TResult>): Promise<TResult> {
+export async function answerRefusals<TResult>(
+  work: () => Promise<TResult>,
+  response?: { readonly setHeader: (name: string, value: string) => unknown },
+): Promise<TResult> {
   try {
     return await work();
   } catch (error) {
@@ -129,6 +165,10 @@ export async function answerRefusals<TResult>(work: () => Promise<TResult>): Pro
       throw error;
     }
     const shape: ProblemShape = shapeOf(error.refusal);
+    if (shape.retryAt !== undefined && response !== undefined) {
+      const seconds: number = Math.ceil((shape.retryAt.getTime() - Date.now()) / 1000);
+      response.setHeader('Retry-After', String(Math.max(1, seconds)));
+    }
     throw new ProblemException({
       status: shape.status,
       code: shape.code,

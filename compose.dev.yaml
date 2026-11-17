@@ -13,10 +13,14 @@
 # NATS runs with the authorization of the broker of cadenway-ops (docs/messaging.md and
 # compose/nats/nats-server.conf there): a connection without a user is refused, and the
 # `organization` user has the same permissions as there. It publishes the subjects of the entities
-# this service owns, uses the JetStream API of a consumer of EVENTS, and subscribes to its own inbox
-# prefix `_INBOX.organization.>` and to `rebuild.organization.>` only. When cadenway-ops changes
-# those permissions, change them here too. `admin` stands for the user of the `nats-streams`
-# container of cadenway-ops.
+# this service owns, uses the four JetStream subjects of each of its three durable consumers of
+# EVENTS by their exact names and filters (create, info, next, acknowledgement; no
+# `DURABLE.CREATE`, no wildcard for a stream, a consumer or a filter), and subscribes to its own
+# inbox prefix `_INBOX.organization.>` and to `rebuild.organization.>` only. A handler whose
+# consumer is not granted here fails to start, in the integration tests as in an environment: a new
+# handler gets its grant in cadenway-ops first, then here. When cadenway-ops changes those
+# permissions, change them here too. `admin` stands for the user of the `nats-streams` container of
+# cadenway-ops.
 #
 # The streams: `nats-streams` runs compose/nats/ensure-streams.sh of cadenway-ops, copied below, as
 # `admin`, the way the `nats-streams` container of cadenway-ops does. It creates EVENTS,
@@ -132,9 +136,21 @@ configs:
                   "rebuild.*.organization", "rebuild.*.member", "rebuild.*.invitation",
                   "rebuild.*.domain",
                   "$$JS.API.INFO", "$$JS.API.STREAM.NAMES", "$$JS.API.STREAM.INFO.EVENTS",
-                  "$$JS.API.CONSUMER.CREATE.EVENTS.>", "$$JS.API.CONSUMER.DURABLE.CREATE.EVENTS.*",
-                  "$$JS.API.CONSUMER.INFO.EVENTS.*", "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.*",
-                  "$$JS.ACK.EVENTS.>"
+
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__project-user-signed-up.evt.user.signed-up.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__project-user-signed-up",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__project-user-signed-up",
+                  "$$JS.ACK.EVENTS.organization-service__project-user-signed-up.>",
+
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__project-user-email-verified.evt.user.email-verified.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__project-user-email-verified",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__project-user-email-verified",
+                  "$$JS.ACK.EVENTS.organization-service__project-user-email-verified.>",
+
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__project-user-profile-updated.evt.user.profile-updated.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__project-user-profile-updated",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__project-user-profile-updated",
+                  "$$JS.ACK.EVENTS.organization-service__project-user-profile-updated.>"
                 ]
               }
               subscribe: { allow: ["_INBOX.organization.>", "rebuild.organization.>"] }

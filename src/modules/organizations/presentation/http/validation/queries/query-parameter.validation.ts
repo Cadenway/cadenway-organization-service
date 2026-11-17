@@ -1,27 +1,6 @@
 import { z } from 'zod';
 
 /**
- * Function integerParameter
- *
- * @description
- * Reads a query parameter declared as an integer by the contract: the query string carries text, so
- * a run of digits becomes a number before the schema of the contract validates it; anything else
- * reaches the schema as is and is refused by it.
- *
- * @param {TSchema} schema - The schema of the parameter, from `@cadenway/contracts`.
- * @returns {z.ZodType<z.output<TSchema>>} The schema of the raw parameter.
- */
-export function integerParameter<TSchema extends z.ZodType>(
-  schema: TSchema,
-): z.ZodType<z.output<TSchema>> {
-  return z.preprocess(
-    (value: unknown): unknown =>
-      typeof value === 'string' && /^\d{1,9}$/u.test(value) ? Number(value) : value,
-    schema,
-  );
-}
-
-/**
  * Function listParameter
  *
  * @description

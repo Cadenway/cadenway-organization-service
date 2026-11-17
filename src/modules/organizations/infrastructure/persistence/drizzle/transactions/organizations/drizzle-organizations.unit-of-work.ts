@@ -13,6 +13,7 @@ import type { OrganizationsUnitOfWork } from '../../../../../application/ports/o
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import { OutboxOrganizationEvents } from '../../../../messaging/outbox/organizations/outbox-organization-events.adapter.js';
 import { DrizzleDirectoryRepository } from '../../repositories/directory/drizzle-directory.repository.js';
+import { DrizzleInvitationEmailRepository } from '../../repositories/invitations/drizzle-invitation-email.repository.js';
 import { DrizzleInvitationRepository } from '../../repositories/invitations/drizzle-invitation.repository.js';
 import { DrizzleMemberRepository } from '../../repositories/members/drizzle-member.repository.js';
 import { DrizzleOrganizationRepository } from '../../repositories/organizations/drizzle-organization.repository.js';
@@ -222,6 +223,7 @@ export class DrizzleOrganizationsUnitOfWork implements OrganizationsUnitOfWork {
           organizations: new DrizzleOrganizationRepository(transaction.db),
           members: new DrizzleMemberRepository(transaction.db),
           invitations: new DrizzleInvitationRepository(transaction.db),
+          invitationEmails: new DrizzleInvitationEmailRepository(transaction.db),
           directory: new DrizzleDirectoryRepository(transaction.db),
           events: new OutboxOrganizationEvents(transaction, this.outbox, (): void => {
             appends.count += 1;

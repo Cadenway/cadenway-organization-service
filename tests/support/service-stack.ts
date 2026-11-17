@@ -29,6 +29,13 @@ export interface ConsumerState {
   readonly num_pending: number;
   /** Messages delivered and not acknowledged yet. */
   readonly num_ack_pending: number;
+  /** The settings of the consumer. */
+  readonly config: {
+    /** Deliveries of a message, the first included, before its dead letter. */
+    readonly max_deliver: number;
+    /** Time the server waits for an acknowledgement before it delivers again, in nanoseconds. */
+    readonly ack_wait: number;
+  };
 }
 
 /**

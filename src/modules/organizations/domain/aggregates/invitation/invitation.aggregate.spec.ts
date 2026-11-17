@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { InvitationAnsweredError } from '../../errors/invitations/invitation-answered.error.js';
 import { InvitationExpiredError } from '../../errors/invitations/invitation-expired.error.js';
+import { InvitationResendThrottledError } from '../../errors/invitations/invitation-resend-throttled.error.js';
 import { InvitationRevokedError } from '../../errors/invitations/invitation-revoked.error.js';
 import { InvalidStoredStateError } from '../../errors/organizations/invalid-stored-state.error.js';
 import { EmailAddress } from '../../value-objects/email/email-address.value-object.js';
@@ -71,6 +72,32 @@ describe('Invitation', () => {
       version: 2,
     });
     expect(resent.accept(after(16)).snapshot.status).toBe('accepted');
+  });
+
+  it('sends its email at most once an hour, counted from its last sending', () => {
+    const hour: number = 60 * 60_000;
+    const justBefore: Date = new Date(SENT_AT.getTime() + hour - 1);
+    const onTheHour: Date = new Date(SENT_AT.getTime() + hour);
+
+    expect(() => marcRoux().resend(justBefore)).toThrow(InvitationResendThrottledError);
+    try {
+      marcRoux().resend(justBefore);
+    } catch (error) {
+      expect(error).toMatchObject({ resendAvailableAt: onTheHour });
+    }
+    const resent: Invitation = marcRoux().resend(onTheHour);
+    expect(resent.snapshot).toMatchObject({ sentAt: onTheHour, version: 2 });
+    expect(() => resent.resend(new Date(onTheHour.getTime() + hour - 1))).toThrow(
+      InvitationResendThrottledError,
+    );
+    expect(resent.resend(new Date(onTheHour.getTime() + hour)).snapshot.version).toBe(3);
+  });
+
+  it('answers a revoked or answered invitation before the hour of its last sending', () => {
+    const soon: Date = new Date(SENT_AT.getTime() + 60_000);
+
+    expect(() => marcRoux().revoke(soon).resend(soon)).toThrow(InvitationRevokedError);
+    expect(() => marcRoux().refuse(soon).resend(soon)).toThrow(InvitationAnsweredError);
   });
 
   it('is accepted or refused once, before its expiry', () => {
