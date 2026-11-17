@@ -66,6 +66,27 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
   }
 
   /**
+   * Method findForShare
+   *
+   * @description
+   * Loads the entry of an account with `select … for share`, which waits for a projection that
+   * holds it (`for update`) and keeps the next one waiting until the end of the transaction.
+   *
+   * @param {string} userId - The account.
+   * @returns {Promise<DirectoryUser | null>} The entry, or `null`.
+   */
+  public async findForShare(userId: string): Promise<DirectoryUser | null> {
+    const rows: DirectoryUserRow[] = await this.db
+      .select()
+      .from(directoryUsers)
+      .where(eq(directoryUsers.userId, userId))
+      .limit(1)
+      .for('share');
+    const row: DirectoryUserRow | undefined = rows[0];
+    return row === undefined ? null : toDirectoryUser(row);
+  }
+
+  /**
    * Method lock
    *
    * @description

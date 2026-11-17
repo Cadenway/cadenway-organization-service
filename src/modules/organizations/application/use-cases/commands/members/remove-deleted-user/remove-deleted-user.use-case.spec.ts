@@ -8,6 +8,7 @@ import type { ListInvitationsOutput } from '../../../queries/invitations/list-in
 import { ListInvitations } from '../../../queries/invitations/list-invitations/list-invitations.use-case.js';
 import type { InviteMembersOutput } from '../../invitations/invite-members/invite-members.output.js';
 import { InviteMembers } from '../../invitations/invite-members/invite-members.use-case.js';
+import { ResendInvitation } from '../../invitations/resend-invitation/resend-invitation.use-case.js';
 import { RemoveDeletedUser } from './remove-deleted-user.use-case.js';
 
 describe('RemoveDeletedUser', () => {
@@ -82,6 +83,34 @@ describe('RemoveDeletedUser', () => {
       status: 'pending',
       invitedBy: { userId: INES.id, name: 'Ancien membre' },
     });
+  });
+
+  it('lets an owner resend an invitation the deleted account sent, in the name of the owner', async () => {
+    await remove.execute({ userId: INES.id, version: 7 });
+    scenario.clock.advance(60 * 60_000);
+
+    const resent: InvitationView = await new ResendInvitation(
+      scenario.store,
+      scenario.clock,
+    ).execute({
+      actorUserId: CAMILLE.id,
+      organizationId: scenario.organizationId,
+      invitationId: marcInvitationId,
+    });
+
+    expect(resent).toMatchObject({
+      version: 2,
+      invitedBy: { userId: INES.id, name: 'Ancien membre' },
+    });
+    expect(scenario.store.eventsNamed('invitation.issued.v1')).toEqual([
+      {
+        name: 'invitation.issued.v1',
+        payload: expect.objectContaining({
+          inviterUserId: CAMILLE.id,
+          inviterName: 'Camille Martin',
+        }) as unknown,
+      },
+    ]);
   });
 
   it('changes nothing when the deletion is applied again', async () => {

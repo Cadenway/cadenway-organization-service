@@ -48,10 +48,11 @@ providers of the module; no other module imports it.
 Created by `migrations/0001_organizations_members_invitations.sql` and
 `migrations/0002_invitation_emails.sql`, with the `FORCE ROW LEVEL SECURITY` statements added by
 hand; `migrations/0003_directory_former_members.sql` adds `directory_users.deleted` (default
-`false`) and the check that a deleted entry keeps no name, search key nor address. One owner at most per organization (partial unique index). `user_id` and
-`invited_by_user_id` name accounts of identity-service without a foreign key; the foreign keys stay
-inside the module. `name_key` columns hold `searchKeyOf` of the names, the sort and search key. The
-application role `organization_app` reads and writes the rows and runs no DDL.
+`false`) and the check that a deleted entry keeps no name, search key nor address. One owner at
+most per organization (partial unique index). `user_id` and `invited_by_user_id` name accounts of
+identity-service without a foreign key; the foreign keys stay inside the module. `name_key`
+columns hold `searchKeyOf` of the names, the sort and search key. The application role
+`organization_app` reads and writes the rows and runs no DDL.
 
 `invitation_emails` is the ledger of the daily allowance of invitation emails: one row per issue
 (batch or creation) and per resend, with the organization, the invitation and the instant, never
@@ -142,15 +143,21 @@ the seven days the stream holds when it starts; a consumer that needs the member
   applied again, under another event id, changes nothing; no later event of the account applies,
   whatever its version, so a late event never brings it back.
 - The entry is locked (`select … for update` after an `insert … on conflict do nothing`), so two
-  events of one account apply one after the other.
+  events of one account apply one after the other. The acceptance of an invitation and the
+  creation of an organization hold the entry of their actor in share mode (`select … for share`)
+  until they commit, before they write a membership: a deletion under way is waited for, then
+  leaves no verified address (`invitation.not-found`) nor synchronized account
+  (`user.not-synchronized`), and a deletion that comes later waits for them and finds the new
+  membership (the owner of a new organization refuses it).
 - The directory decides which account accepts an invitation, so a failing event is not given up
-  before 24 hours (decision 3 of the P2b security follow-ups): the three consumers retry on
-  `DIRECTORY_REDELIVERY` (`application/models/directory/`), 1 s, 5 s, 30 s, 2 min, 10 min, 30 min,
-  then every hour, 32 deliveries, about 25 h 43 min before the dead letter, the schedule the README
-  of `@cadenway/nest-messaging` gives for security projections. The two consumers of P2c use the
-  same schedule: the address decides which account accepts an invitation, and the deletion stops
-  the access of the account to its organizations (identity-service stops it on `member.removed.v1`). The kit applies it with
-  `nak(delay)` and sets `max_deliver` to 32 on each consumer when the service starts, in place.
+  before 24 hours (decision 3 of the P2b security follow-ups): the three directory consumers retry
+  on `DIRECTORY_REDELIVERY` (`application/models/directory/`), 1 s, 5 s, 30 s, 2 min, 10 min,
+  30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter, the schedule
+  the README of `@cadenway/nest-messaging` gives for security projections. The two consumers of P2c
+  use the same schedule: the address decides which account accepts an invitation, and the
+  deletion stops the access of the account to its organizations (identity-service stops it on
+  `member.removed.v1`). The kit applies it with `nak(delay)` and sets `max_deliver` to 32 on each
+  consumer when the service starts, in place.
   **A rollout of this schedule, or of any change to it, must replace every replica**: a replica
   still on the previous limit (5 deliveries) treats its own last delivery as final and can use up
   the remaining deliveries at once, and sets `max_deliver` back when it restarts.
@@ -259,7 +266,8 @@ acceptance and the refusal in two (a read-only check, then the write):
   - the creation of an organization: the organization does not exist before it and PostgreSQL
     assigns its id on insert, so no tenant transaction can hold it; it writes the rows of the new
     organization only (its owner, its invitations, its outbox rows, which the kit accepts in a
-    system transaction) and reads the directory entry of the actor;
+    system transaction) and reads the directory entry of the actor, held in share mode until it
+    commits;
   - the list of the organizations of the actor: a read-only query filtered on `members.user_id`;
   - the invitations addressed to the actor: a read-only query filtered on the verified address
     of the actor's directory entry;
@@ -274,8 +282,9 @@ acceptance and the refusal in two (a read-only check, then the write):
     one.
 - Tenant transaction of the organization of an invitation (`runInOrganizationOf`, which takes the
   stored invitation, never an id): the acceptance and the refusal lock the invitation and check its
-  address and state again there, as the contract requires; the acceptance writes the membership and
-  `member.joined.v1` with it.
+  address and state again there, as the contract requires; the acceptance first holds the directory
+  entry of the actor in share mode (no row-level security on it), then writes the membership and
+  `member.joined.v1`.
 
 Any failure rolls back the business rows and the outbox rows together
 (`tests/organizations.int-spec.ts` proves it on the creation).
@@ -357,6 +366,16 @@ Any failure rolls back the business rows and the outbox rows together
     withdrawing invitations is not part of it; a revocation emits nothing, so the organization
     would see them disappear without a trace; the open question of the contracts was what
     `inviter.name` shows, answered « Ancien membre »;
+  - a deleted account is forgotten by the directory only: a removed membership keeps the id of the
+    invitation it accepted, and that invitation keeps the address it was sent to, the record of the
+    organization; the contract promises the forgetting of the directory, not of the invitations;
+  - a verified address moves between accounts with `user.email-changed.v1` and comes free again
+    with `user.deleted.v1`. The versions order the events of one account only, so while the change
+    of the account that leaves an address is not applied yet (retried, or a dead letter), the
+    account that takes it and the one that left it can both hold it verified, and both list and
+    answer its invitations. identity-service never lets two accounts verify one address, so the
+    window lasts as long as the event of the leaving account waits; a unique address would turn it
+    into a projection that fails until then, which this module does not do;
   - the deletion of an owner is refused and becomes a dead letter rather than applied without the
     owner membership: the event contradicts the contract, so identity-service and this service
     disagree on who owns the organization; applying it in part would hide that and leave an
@@ -369,6 +388,7 @@ Any failure rolls back the business rows and the outbox rows together
   the stream, the directory projection from events published before the service started and their
   redelivery, and the rollback, on real PostgreSQL and NATS. `tests/account-changes.int-spec.ts`
   proves the change of address in the member list and the deletion of an account (memberships,
-  events from the system, pending invitations, redeliveries). `tests/directory-redelivery.int-spec.ts`
-  proves the redelivery schedule of the directory consumers with a short schedule, and the deletion
-  of an owner refused until its dead letter.
+  events from the system, pending invitations and their resend, an acceptance during a deletion,
+  redeliveries). `tests/directory-redelivery.int-spec.ts` proves the redelivery schedule of the
+  directory consumers with a short schedule, and the deletion of an owner refused until its dead
+  letter.

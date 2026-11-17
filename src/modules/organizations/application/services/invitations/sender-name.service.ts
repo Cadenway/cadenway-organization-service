@@ -1,4 +1,5 @@
 import type { DirectoryUser } from '../../../domain/aggregates/directory-user/directory-user.aggregate.js';
+import { FORMER_MEMBER_NAME } from '../../../domain/value-objects/directory/former-member-name.value-object.js';
 import type { OrganizationsStore } from '../../models/transactions/organizations-store.model.js';
 
 /**
@@ -19,7 +20,9 @@ const SENDER_NAME_MAX_LENGTH: number = 120;
  * The name the email of an invitation shows for its sender ("{inviter.name} vous invite…"): the
  * full name of the account in the user directory. A sender is an owner or an admin, who could only
  * create or join the organization once the directory knew their name and verified address, so the
- * address is the fallback of a profile event not applied yet, and a missing entry is a defect.
+ * address is the fallback of a profile event not applied yet, and a missing entry is a defect. The
+ * first sender of a pending invitation may since have been deleted by identity-service: it shows
+ * as « Ancien membre », as the invitation lists show it, so a resend still answers its invitation.
  *
  * @param {OrganizationsStore} store - The store of the transaction.
  * @param {string} userId - The sender.
@@ -28,6 +31,9 @@ const SENDER_NAME_MAX_LENGTH: number = 120;
  */
 export async function senderNameOf(store: OrganizationsStore, userId: string): Promise<string> {
   const sender: DirectoryUser | null = await store.directory.find(userId);
+  if (sender?.isDeleted === true) {
+    return FORMER_MEMBER_NAME;
+  }
   const name: string | null = sender?.name ?? sender?.email?.value ?? null;
   if (name === null) {
     throw new Error('The sender of an invitation is not in the user directory.');

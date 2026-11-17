@@ -4,8 +4,10 @@ import {
   ListInvitationsInternalResponse,
   ListMembersInternalResponse,
   ListReceivedInvitationsInternalResponse,
+  ResendInvitationInternalResponse,
 } from '@cadenway/contracts/validators/internal/organization-service';
 import type {
+  Invitation,
   InvitationBatchResult,
   InvitationPage,
   MemberPage,
@@ -24,7 +26,7 @@ import { newId, ServiceStack } from './support/service-stack.js';
 // `member.removed.v1` from the system, while the invitations it sent stay pending, from « Ancien
 // membre ». The people of the mockup: Camille Martin owns Atelier Nord, Inès Robert owns
 // Coopérative Lumen, Hugo Dubois is an admin of Atelier Nord and a member of Coopérative Lumen,
-// Léa Petit a member of Atelier Nord, and Marc Roux is invited by Hugo.
+// Léa Petit a member of Atelier Nord, Marc Roux is invited by Hugo and Nadia Garnier by Camille.
 
 /** An account of identity-service, as its events describe it. */
 interface Account {
@@ -42,6 +44,7 @@ const ines: Account = { id: newId(), name: 'Inès Robert', email: 'ines.robert@l
 const hugo: Account = { id: newId(), name: 'Hugo Dubois', email: 'hugo.dubois@ateliernord.fr' };
 const lea: Account = { id: newId(), name: 'Léa Petit', email: 'lea.petit@ateliernord.fr' };
 const marc: Account = { id: newId(), name: 'Marc Roux', email: 'marc.roux@ateliernord.fr' };
+const nadia: Account = { id: newId(), name: 'Nadia Garnier', email: 'nadia@cabinet-garnier.fr' };
 
 /** The address Léa Petit moves to. */
 const LEA_NEW_EMAIL = 'lea@ateliernord.fr';
@@ -153,6 +156,7 @@ describe('account changes of identity-service', () => {
   let atelierNordId = '';
   let lumenId = '';
   let marcInvitationId = '';
+  let nadiaInvitationId = '';
 
   /**
    * Sends a request as the gateway would, for a user and the organization of their session.
@@ -307,14 +311,14 @@ describe('account changes of identity-service', () => {
 
   beforeAll(async () => {
     stack = await ServiceStack.start('accounts');
-    for (const account of [camille, ines, hugo, lea, marc]) {
+    for (const account of [camille, ines, hugo, lea, marc, nadia]) {
       stack.publish('user.signed-up.v1', signedUp(account));
       stack.publish('user.email-verified.v1', emailVerified(account, 2));
     }
     app = await stack.startApplication();
     await vi.waitFor(
       async () => {
-        for (const account of [camille, ines, hugo, lea, marc]) {
+        for (const account of [camille, ines, hugo, lea, marc, nadia]) {
           expect(await directoryOf(account)).toMatchObject({ email_verified: true });
         }
       },
@@ -332,6 +336,12 @@ describe('account changes of identity-service', () => {
     });
     expect(invited.status).toBe(200);
     marcInvitationId = (invited.body as InvitationBatchResult).invitations[0]?.invitationId ?? '';
+    const guest = await call('post', '/internal/v1/invitations', camille, atelierNordId, {
+      emails: [nadia.email],
+      role: 'guest',
+    });
+    expect(guest.status).toBe(200);
+    nadiaInvitationId = (guest.body as InvitationBatchResult).invitations[0]?.invitationId ?? '';
   });
 
   afterAll(async () => {
@@ -485,6 +495,38 @@ describe('account changes of identity-service', () => {
           invitedBy: { userId: hugo.id, name: 'Ancien membre' },
         }),
       ]);
+
+      // An owner resends it in their own name; the invitation keeps its first sender.
+      await stack.system(
+        `update invitations set sent_at = sent_at - interval '2 hours' where id = $1`,
+        [marcInvitationId],
+      );
+      const resent = await call(
+        'post',
+        `/internal/v1/invitations/${marcInvitationId}/resend`,
+        camille,
+        atelierNordId,
+        {},
+      );
+      expect(resent.status).toBe(200);
+      conforms(ResendInvitationInternalResponse, resent);
+      expect(resent.body as Invitation).toMatchObject({
+        version: 2,
+        invitedBy: { userId: hugo.id, name: 'Ancien membre' },
+      });
+      const issued = await vi.waitFor(
+        () => {
+          const event = stack.lastEvent('invitation.issued.v1');
+          expect(event).toMatchObject({ invitationId: marcInvitationId, version: 2 });
+          return event;
+        },
+        { timeout: 15_000, interval: 250 },
+      );
+      expect(issued).toMatchObject({
+        actor: { type: 'user', id: camille.id },
+        inviter: { userId: camille.id, name: 'Camille Martin' },
+      });
+
       const accepted = await call(
         'post',
         `/internal/v1/users/${marc.id}/invitations/${marcInvitationId}/accept`,
@@ -513,6 +555,45 @@ describe('account changes of identity-service', () => {
         max_deliver: 32,
         ack_wait: 30_000_000_000,
       });
+    });
+  });
+
+  describe('a deletion under way', () => {
+    it('makes an acceptance wait for it, then find no verified address to accept with', async () => {
+      // A deletion of Nadia's account holds her directory entry, as `RemoveDeletedUser` does.
+      const deletion = await stack.migrator.connect();
+      try {
+        await deletion.query('begin');
+        await deletion.query('select 1 from directory_users where user_id = $1 for update', [
+          nadia.id,
+        ]);
+        const acceptance: Promise<Response> = call(
+          'post',
+          `/internal/v1/users/${nadia.id}/invitations/${nadiaInvitationId}/accept`,
+          nadia,
+          null,
+          {},
+        );
+        // Under the 5 s `lock_timeout` of the application role.
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 1_500);
+        });
+        await deletion.query(
+          `update directory_users
+              set name = null, name_key = null, email = null, email_verified = false,
+                  deleted = true
+            where user_id = $1`,
+          [nadia.id],
+        );
+        await deletion.query('commit');
+
+        const accepted: Response = await acceptance;
+        expect(accepted.status).toBe(404);
+        expect(accepted.body).toMatchObject({ code: 'invitation.not-found' });
+      } finally {
+        deletion.release();
+      }
+      expect(await activeMembershipsOf(nadia)).toEqual([]);
     });
   });
 

@@ -504,6 +504,10 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
           const state: DirectoryUserState | undefined = tables.directory.get(userId);
           return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
         },
+        findForShare: (userId: string): Promise<DirectoryUser | null> => {
+          const state: DirectoryUserState | undefined = tables.directory.get(userId);
+          return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
+        },
         lock: (userId: string): Promise<DirectoryUser> => {
           const state: DirectoryUserState | undefined = tables.directory.get(userId);
           return Promise.resolve(

@@ -53,8 +53,8 @@ export interface OrganizationsUnitOfWork {
    *
    * @description
    * Runs `work` in a system transaction, joining the current one when called inside it: the
-   * creation of an organization, the reads across organizations of an actor, and the projection of
-   * the user directory.
+   * creation of an organization, the reads across organizations of an actor, the projection of
+   * the user directory and the removal of the memberships of a deleted account.
    *
    * @param {(store: OrganizationsStore) => Promise<TResult>} work - The unit of work.
    * @param {UnitOfWorkOptions} options - How the transaction is opened.
