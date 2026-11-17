@@ -7,6 +7,7 @@ import { takesSeat } from '../../domain/policies/members/seat.policy.js';
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
+import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
 import type { MemberDraft } from '../../domain/value-objects/members/member-draft.value-object.js';
 import type { MemberState } from '../../domain/value-objects/members/member-state.value-object.js';
@@ -38,6 +39,20 @@ export interface RecordedEvent {
   // #endregion
 }
 
+/** An entry of the fake ledger of invitation emails. */
+export interface RecordedEmail {
+  // #region Properties
+  /** The organization that caused it. */
+  readonly organizationId: string;
+
+  /** The invitation sent. */
+  readonly invitationId: string;
+
+  /** When it went out. */
+  readonly sentAt: Date;
+  // #endregion
+}
+
 /** The data of the fake database. */
 interface Tables {
   // #region Properties
@@ -52,6 +67,9 @@ interface Tables {
 
   /** Directory entries by account. */
   directory: Map<string, DirectoryUserState>;
+
+  /** The fake ledger of invitation emails. */
+  invitationEmails: RecordedEmail[];
 
   /** The fake outbox. */
   events: RecordedEvent[];
@@ -93,6 +111,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
     members: new Map(),
     invitations: new Map(),
     directory: new Map(),
+    invitationEmails: [],
     events: [],
   };
 
@@ -157,6 +176,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       members: new Map(this.tables.members),
       invitations: new Map(this.tables.invitations),
       directory: new Map(this.tables.directory),
+      invitationEmails: [...this.tables.invitationEmails],
       events: [...this.tables.events],
     };
     const result: TResult = await work(this.storeOf(tables));
@@ -440,6 +460,33 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
                   ];
             });
           return Promise.resolve(pageOf(items, after, limit));
+        },
+      },
+      invitationEmails: {
+        lockUsage: (organizationId: string, windowStart: Date): Promise<InvitationEmailUsage> => {
+          tables.invitationEmails = tables.invitationEmails.filter(
+            (entry: RecordedEmail) =>
+              entry.organizationId !== organizationId ||
+              entry.sentAt.getTime() > windowStart.getTime(),
+          );
+          const counted: RecordedEmail[] = tables.invitationEmails.filter(
+            (entry: RecordedEmail) => entry.organizationId === organizationId,
+          );
+          const oldest: number = Math.min(
+            ...counted.map((entry: RecordedEmail) => entry.sentAt.getTime()),
+          );
+          return Promise.resolve({
+            count: counted.length,
+            oldestSentAt: counted.length === 0 ? null : new Date(oldest),
+          });
+        },
+        record: (invitation: Invitation): Promise<void> => {
+          tables.invitationEmails.push({
+            organizationId: invitation.snapshot.organizationId,
+            invitationId: invitation.id,
+            sentAt: invitation.snapshot.sentAt,
+          });
+          return Promise.resolve();
         },
       },
       directory: {

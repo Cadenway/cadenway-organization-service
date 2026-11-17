@@ -26,6 +26,11 @@ import type { CreateOrganizationOutput } from './create-organization.output.js';
  * `organization.created.v1`, `member.joined.v1` and one `invitation.issued.v1` per invited address;
  * any failure rolls all of it back. An actor the user directory does not know yet answers
  * `user-not-synchronized` and creates nothing.
+ *
+ * Each invited address takes one email of the daily allowance of the new organization: its entry
+ * in the ledger of invitation emails commits with the invitation. The creation is never refused for
+ * the allowance: it invites 50 addresses at most, out of 100, and no other transaction can write
+ * the ledger of an organization before it exists (decision 1 of the P2b security follow-ups).
  */
 export class CreateOrganization {
   // #region Properties
@@ -131,8 +136,9 @@ export class CreateOrganization {
    * Method invite
    *
    * @description
-   * Invites one address of the creation form as `member`. The organization is new, so the address
-   * has no pending invitation in it unless the form repeats it, which `distinctAddresses` removed.
+   * Invites one address of the creation form as `member` and records its email in the ledger. The
+   * organization is new, so the address has no pending invitation in it unless the form repeats it,
+   * which `distinctAddresses` removed.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {Organization} organization - The new organization.
@@ -164,6 +170,7 @@ export class CreateOrganization {
         invitationId: pending?.id ?? null,
       };
     }
+    await store.invitationEmails.record(invitation);
     await store.events.invitationIssued(invitation, {
       inviterUserId: input.actorUserId,
       inviterName: creatorName,

@@ -246,6 +246,20 @@ describe('organizations, members and invitations', () => {
   }
 
   /**
+   * Reads the ledger of invitation emails of an organization, by invitation.
+   *
+   * @param organizationId - The organization.
+   * @returns One row per email, sorted by invitation.
+   */
+  async function ledgerOf(organizationId: string): Promise<{ readonly invitation_id: string }[]> {
+    return stack.system<{ readonly invitation_id: string }>(
+      `select invitation_id from invitation_emails where organization_id = $1
+        order by invitation_id, sent_at`,
+      [organizationId],
+    );
+  }
+
+  /**
    * Waits until a consumer has handled everything the stream holds for it.
    *
    * @param handler - The name of the handler.
@@ -343,6 +357,19 @@ describe('organizations, members and invitations', () => {
         email_version: 1,
       });
     });
+
+    it('keeps trying a failing directory event for 32 deliveries, the schedule of decision 3', () => {
+      for (const handler of [
+        'project-user-signed-up',
+        'project-user-email-verified',
+        'project-user-profile-updated',
+      ]) {
+        expect(stack.consumer(`organization-service__${handler}`).config).toMatchObject({
+          max_deliver: 32,
+          ack_wait: 30_000_000_000,
+        });
+      }
+    });
   });
 
   describe('organizations', () => {
@@ -433,6 +460,11 @@ describe('organizations, members and invitations', () => {
       expect(expiresIn).toBeGreaterThan(WEEK - 60_000);
       expect(expiresIn).toBeLessThanOrEqual(WEEK);
       expect(await outboxCount('invitation.issued.v1', 'organizationId', atelierNordId)).toBe(2);
+      expect(await ledgerOf(atelierNordId)).toEqual(
+        [inesInvitationId, hugoInvitationId].sort().map((invitationId: string) => ({
+          invitation_id: invitationId,
+        })),
+      );
     });
 
     it('refuses an address taken, too short or not valid, and a blank name', async () => {
@@ -572,7 +604,10 @@ describe('organizations, members and invitations', () => {
       expect(taken.body).toMatchObject({ code: 'organization.slug-taken' });
       expect(blank.status).toBe(400);
       expect(malformed.status).toBe(400);
-      expect(malformed.body).toMatchObject({ code: 'request.invalid' });
+      expect(malformed.body).toMatchObject({
+        code: 'request.invalid',
+        details: { issues: [{ in: 'header', path: 'If-Match', code: 'invalid_format' }] },
+      });
       expect(await outboxCount('organization.updated.v1', 'organizationId', atelierNordId)).toBe(1);
 
       const cleared = await call('patch', '/internal/v1/organization', camille, atelierNordId, {
@@ -1169,6 +1204,8 @@ describe('organizations, members and invitations', () => {
       );
       const unknown = await call('get', '/internal/v1/members?sort=name', camille, atelierNordId);
       const tooSmall = await call('get', '/internal/v1/members?limit=0', camille, atelierNordId);
+      const garbage = await call('get', '/internal/v1/members?cursor=abc', camille, atelierNordId);
+      const asText = await call('get', '/internal/v1/members?limit=1e1', camille, atelierNordId);
 
       const names = (response: Response): string[] =>
         (response.body as MemberPage).items.map((member: Member) => member.name);
@@ -1185,6 +1222,17 @@ describe('organizations, members and invitations', () => {
       expect(unknown.status).toBe(400);
       expect(unknown.body).toMatchObject({ code: 'request.invalid' });
       expect(tooSmall.status).toBe(400);
+      expect(tooSmall.body).toMatchObject({
+        code: 'request.invalid',
+        details: { issues: [{ in: 'query', path: 'limit' }] },
+      });
+      expect(garbage.status).toBe(400);
+      expect(garbage.body).toMatchObject({
+        code: 'request.invalid',
+        details: { issues: [{ in: 'query', path: 'cursor', code: 'invalid_cursor' }] },
+      });
+      // The validator of the contract reads limit with Number(), so 1e1 is 10.
+      expect(names(asText)).toHaveLength(5);
     });
 
     it('applies the role rules from its own members', async () => {
@@ -1391,18 +1439,27 @@ describe('organizations, members and invitations', () => {
             `select (select count(*)::int from organizations) as organizations,
                     (select count(*)::int from members) as members,
                     (select count(*)::int from invitations) as invitations,
+                    (select count(*)::int from invitation_emails) as invitation_emails,
                     (select count(*)::int from organizations where id = $1) as atelier`,
             [atelierNordId],
           );
           return counts.rows[0];
         }),
       );
-      expect(visible).toEqual({ organizations: 1, members: 1, invitations: 0, atelier: 0 });
+      expect(visible).toEqual({
+        organizations: 1,
+        members: 1,
+        invitations: 0,
+        invitation_emails: 0,
+        atelier: 0,
+      });
 
       for (const statement of [
         `insert into members (organization_id, user_id, role, joined_at) values ($1, '${hugo.id}', 'admin', now())`,
         `insert into invitations (organization_id, email, role, invited_by_user_id, sent_at, expires_at)
            values ($1, 'intrus@exemple.fr', 'admin', '${ines.id}', now(), now() + interval '7 days')`,
+        `insert into invitation_emails (organization_id, invitation_id, sent_at)
+           values ($1, '${marcInvitationId}', now())`,
       ]) {
         await expect(
           runWithOrganizationContext(context, () =>
@@ -1445,6 +1502,9 @@ describe('organizations, members and invitations', () => {
       const before = await stack.system<{ count: number }>(
         'select count(*)::int as count from outbox_events',
       );
+      const emailsBefore = await stack.system<{ count: number }>(
+        'select count(*)::int as count from invitation_emails',
+      );
       try {
         const response = await call('post', '/internal/v1/organizations', camille, null, {
           name: 'Atelier Sud',
@@ -1467,9 +1527,13 @@ describe('organizations, members and invitations', () => {
       const after = await stack.system<{ count: number }>(
         'select count(*)::int as count from outbox_events',
       );
+      const emailsAfter = await stack.system<{ count: number }>(
+        'select count(*)::int as count from invitation_emails',
+      );
       expect(organizations).toEqual([{ count: 0 }]);
       expect(owners).toEqual([{ count: 1 }]);
       expect(after).toEqual(before);
+      expect(emailsAfter).toEqual(emailsBefore);
 
       const retried = await call('post', '/internal/v1/organizations', camille, null, {
         name: 'Atelier Sud',
@@ -1478,6 +1542,306 @@ describe('organizations, members and invitations', () => {
       expect((retried.body as { organization: Organization }).organization.slug).toBe(
         'atelier-sud',
       );
+    });
+  });
+
+  describe('invitation email limits', () => {
+    // Decision 1 of the P2b security follow-ups: an invitation email goes out at most once an
+    // hour, and an organization causes at most 100 of them in any 24 hours.
+
+    let lyonId = '';
+    let lilleId = '';
+    let lucieInvitationId = '';
+
+    /**
+     * Addresses nobody was invited with yet.
+     *
+     * @param prefix - What tells this run of addresses from the others.
+     * @param count - How many.
+     * @returns The addresses.
+     */
+    function newcomers(prefix: string, count: number): string[] {
+      return Array.from(
+        { length: count },
+        (_: unknown, index: number) => `${prefix}.${String(index)}@ateliernord.fr`,
+      );
+    }
+
+    /**
+     * Counts the rows of an organization in a table.
+     *
+     * @param table - `invitations` or `invitation_emails`.
+     * @param organizationId - The organization.
+     * @returns The count.
+     */
+    async function rowsOf(
+      table: 'invitations' | 'invitation_emails',
+      organizationId: string,
+    ): Promise<number> {
+      const rows = await stack.system<{ count: number }>(
+        `select count(*)::int as count from ${table} where organization_id = $1`,
+        [organizationId],
+      );
+      return rows[0]?.count ?? 0;
+    }
+
+    /**
+     * Invites addresses to an organization of Camille as `member`.
+     *
+     * @param organizationId - The organization.
+     * @param emails - The addresses.
+     * @returns The response.
+     */
+    function invite(organizationId: string, emails: readonly string[]): Promise<Response> {
+      return call('post', '/internal/v1/invitations', camille, organizationId, {
+        emails,
+        role: 'member',
+      });
+    }
+
+    /**
+     * Reads the `Retry-After` header of a response.
+     *
+     * @param response - The response.
+     * @returns The seconds it asks to wait.
+     */
+    function retryAfter(response: Response): number {
+      return Number(response.headers['retry-after']);
+    }
+
+    it('counts the addresses a creation invites against the allowance of the new organization', async () => {
+      const created = await call('post', '/internal/v1/organizations', camille, null, {
+        name: 'Atelier Nord Lyon',
+        inviteEmails: newcomers('lyon', 50),
+      });
+
+      expect(created.status).toBe(201);
+      lyonId = (created.body as OrganizationCreated).organization.id;
+      expect(await rowsOf('invitation_emails', lyonId)).toBe(50);
+
+      const batch = await invite(lyonId, ['lyon.0@ateliernord.fr', ...newcomers('lyon-b', 49)]);
+      const full = await invite(lyonId, newcomers('lyon-c', 2));
+
+      expect(batch.status).toBe(200);
+      expect(full.status).toBe(429);
+      expect(full.body).toMatchObject({
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 1 },
+      });
+    });
+
+    it('refuses the 101st email of 24 hours, with what remains and when the allowance grows', async () => {
+      const last = await invite(lyonId, newcomers('lyon-c', 1));
+      const invitations: number = await rowsOf('invitations', lyonId);
+      const issued: number = await outboxCount('invitation.issued.v1', 'organizationId', lyonId);
+      const oldest = await stack.system<{ sent_at: Date }>(
+        'select min(sent_at) as sent_at from invitation_emails where organization_id = $1',
+        [lyonId],
+      );
+
+      const refused = await invite(lyonId, ['lucie.bernard@ateliernord.fr']);
+
+      expect(last.status).toBe(200);
+      expect(refused.status).toBe(429);
+      const nextAvailableAt: number = (oldest[0]?.sent_at.getTime() ?? 0) + 24 * 60 * 60_000;
+      expect(refused.body).toEqual({
+        type: 'about:blank',
+        title: 'Too Many Requests',
+        status: 429,
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 0, nextAvailableAt: new Date(nextAvailableAt).toISOString() },
+      });
+      expect(retryAfter(refused)).toBeGreaterThan(86_000);
+      expect(retryAfter(refused)).toBeLessThanOrEqual(86_400);
+      expect(await rowsOf('invitations', lyonId)).toBe(invitations);
+      expect(await rowsOf('invitation_emails', lyonId)).toBe(100);
+      expect(await outboxCount('invitation.issued.v1', 'organizationId', lyonId)).toBe(issued);
+    });
+
+    it('never refuses a batch of members and pending invitations, which sends nothing', async () => {
+      const batch = await invite(lyonId, [camille.email, 'lyon.1@ateliernord.fr']);
+
+      expect(batch.status).toBe(200);
+      expect((batch.body as InvitationBatchResult).invitations.map((item) => item.outcome)).toEqual(
+        ['already-member', 'already-invited'],
+      );
+    });
+
+    it('takes one email of the allowance for a resend, refused with none left', async () => {
+      const invitation = (await invite(lyonId, ['lyon.2@ateliernord.fr']))
+        .body as InvitationBatchResult;
+      const invitationId: string = invitation.invitations[0]?.invitationId ?? '';
+      await stack.system(
+        `update invitations set sent_at = sent_at - interval '2 hours' where id = $1`,
+        [invitationId],
+      );
+
+      const resent = await call(
+        'post',
+        `/internal/v1/invitations/${invitationId}/resend`,
+        camille,
+        lyonId,
+        {},
+      );
+
+      expect(resent.status).toBe(429);
+      expect(resent.body).toMatchObject({
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 0 },
+      });
+      expect(retryAfter(resent)).toBeGreaterThan(86_000);
+      expect(await outboxCount('invitation.issued.v1', 'invitationId', invitationId)).toBe(1);
+      expect(await rowsOf('invitation_emails', lyonId)).toBe(100);
+      const stored = await stack.system<{ version: number }>(
+        'select version from invitations where id = $1',
+        [invitationId],
+      );
+      expect(stored).toEqual([{ version: 1 }]);
+    });
+
+    it('grows the allowance again once the oldest emails leave the 24 hours, and forgets them', async () => {
+      await stack.system(
+        `update invitation_emails set sent_at = sent_at - interval '1 day 1 minute'
+          where organization_id = $1
+            and sent_at = (select min(sent_at) from invitation_emails where organization_id = $1)`,
+        [lyonId],
+      );
+
+      const batch = await invite(lyonId, ['lucie.bernard@ateliernord.fr']);
+
+      expect(batch.status).toBe(200);
+      expect(await rowsOf('invitation_emails', lyonId)).toBe(51);
+      const stale = await stack.system<{ count: number }>(
+        `select count(*)::int as count from invitation_emails
+          where organization_id = $1 and sent_at <= now() - interval '1 day'`,
+        [lyonId],
+      );
+      expect(stale).toEqual([{ count: 0 }]);
+    });
+
+    it('refuses a resend within the hour of the last sending, with when it becomes possible', async () => {
+      const created = await call('post', '/internal/v1/organizations', camille, null, {
+        name: 'Atelier Nord Lille',
+      });
+      lilleId = (created.body as OrganizationCreated).organization.id;
+      const batch = await invite(lilleId, ['lucie.bernard@ateliernord.fr']);
+      lucieInvitationId = (batch.body as InvitationBatchResult).invitations[0]?.invitationId ?? '';
+      const sent = await stack.system<{ sent_at: Date }>(
+        'select sent_at from invitations where id = $1',
+        [lucieInvitationId],
+      );
+
+      const resent = await call(
+        'post',
+        `/internal/v1/invitations/${lucieInvitationId}/resend`,
+        camille,
+        lilleId,
+        {},
+      );
+
+      expect(resent.status).toBe(429);
+      const resendAvailableAt: number = (sent[0]?.sent_at.getTime() ?? 0) + 60 * 60_000;
+      expect(resent.body).toEqual({
+        type: 'about:blank',
+        title: 'Too Many Requests',
+        status: 429,
+        code: 'invitation.resend-throttled',
+        details: { resendAvailableAt: new Date(resendAvailableAt).toISOString() },
+      });
+      expect(retryAfter(resent)).toBeGreaterThan(3_500);
+      expect(retryAfter(resent)).toBeLessThanOrEqual(3_600);
+      const listed = await call('get', '/internal/v1/invitations', camille, lilleId);
+      expect((listed.body as InvitationPage).items[0]).toMatchObject({
+        id: lucieInvitationId,
+        version: 1,
+      });
+      expect(await rowsOf('invitation_emails', lilleId)).toBe(1);
+      expect(await outboxCount('invitation.issued.v1', 'invitationId', lucieInvitationId)).toBe(1);
+    });
+
+    it('resends once the hour of the last sending is over, and counts that email', async () => {
+      await stack.system(
+        `update invitations set sent_at = sent_at - interval '61 minutes' where id = $1`,
+        [lucieInvitationId],
+      );
+
+      const resent = await call(
+        'post',
+        `/internal/v1/invitations/${lucieInvitationId}/resend`,
+        camille,
+        lilleId,
+        {},
+      );
+      const again = await call(
+        'post',
+        `/internal/v1/invitations/${lucieInvitationId}/resend`,
+        camille,
+        lilleId,
+        {},
+      );
+
+      expect(resent.status).toBe(200);
+      expect(resent.body).toMatchObject({ id: lucieInvitationId, version: 2 });
+      expect(again.status).toBe(429);
+      expect(again.body).toMatchObject({
+        code: 'invitation.resend-throttled',
+        details: { resendAvailableAt: expect.any(String) as string },
+      });
+      expect(await rowsOf('invitation_emails', lilleId)).toBe(2);
+      await published(
+        'invitation.issued.v1',
+        (event) => event.invitationId === lucieInvitationId && event.version === 2,
+      );
+    });
+
+    it('lets exactly one of two concurrent batches through when together they exceed the allowance', async () => {
+      await invite(lilleId, newcomers('lille', 50));
+      await invite(lilleId, newcomers('lille-b', 8));
+      expect(await rowsOf('invitation_emails', lilleId)).toBe(60);
+
+      const [first, second] = await Promise.all([
+        invite(lilleId, newcomers('lille-c', 30)),
+        invite(lilleId, newcomers('lille-d', 30)),
+      ]);
+
+      expect([first.status, second.status].sort()).toEqual([200, 429]);
+      const refused: Response = first.status === 429 ? first : second;
+      expect(refused.body).toMatchObject({
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 10 },
+      });
+      expect(await rowsOf('invitation_emails', lilleId)).toBe(90);
+      expect(await rowsOf('invitations', lilleId)).toBe(89);
+    });
+
+    it('refuses as a whole a batch that needs more emails than remain, writing nothing', async () => {
+      await invite(lilleId, newcomers('lille-e', 5));
+      const invitations: number = await rowsOf('invitations', lilleId);
+      const issued: number = await outboxCount('invitation.issued.v1', 'organizationId', lilleId);
+
+      const refused = await invite(lilleId, [
+        'lucie.bernard@ateliernord.fr',
+        ...newcomers('lille-f', 6),
+      ]);
+      const fits = await invite(lilleId, [
+        'lucie.bernard@ateliernord.fr',
+        ...newcomers('lille-f', 5),
+      ]);
+
+      expect(refused.status).toBe(429);
+      expect(refused.body).toMatchObject({
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 5 },
+      });
+      expect(fits.status).toBe(200);
+      expect(
+        (fits.body as InvitationBatchResult).invitations.filter(
+          (item) => item.outcome === 'invited',
+        ),
+      ).toHaveLength(5);
+      expect(await rowsOf('invitations', lilleId)).toBe(invitations + 5);
+      expect(await rowsOf('invitation_emails', lilleId)).toBe(100);
+      expect(await outboxCount('invitation.issued.v1', 'organizationId', lilleId)).toBe(issued + 5);
     });
   });
 

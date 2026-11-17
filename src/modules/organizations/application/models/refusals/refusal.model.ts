@@ -22,5 +22,11 @@ export type Refusal =
   | { readonly reason: 'invitation-revoked' }
   | { readonly reason: 'invitation-answered'; readonly status: 'accepted' | 'refused' }
   | { readonly reason: 'invitation-expired'; readonly expiresAt: Date }
+  | { readonly reason: 'invitation-resend-throttled'; readonly resendAvailableAt: Date }
+  | {
+      readonly reason: 'invitation-daily-limit-reached';
+      readonly remaining: number;
+      readonly nextAvailableAt: Date;
+    }
   | { readonly reason: 'user-not-found' }
   | { readonly reason: 'user-not-synchronized' };

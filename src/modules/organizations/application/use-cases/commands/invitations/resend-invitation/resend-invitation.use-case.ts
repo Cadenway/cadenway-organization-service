@@ -1,7 +1,12 @@
 import { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import {
+  assertInvitationEmailsAvailable,
+  invitationEmailWindowStart,
+} from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
+import type { InvitationEmailUsage } from '../../../../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../../../../domain/value-objects/invitations/invitation-state.value-object.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
@@ -24,6 +29,13 @@ import type { ResendInvitationInput } from './resend-invitation.input.js';
  * organization, answers `invitation-not-found`; a revoked or answered one `invitation-revoked` or
  * `invitation-answered`. The email names the one who resends it as its sender; the pending list
  * keeps naming who invited first ("Invité par {nom}").
+ *
+ * Once the invitation is found and pending, two limits apply in the order of the contract
+ * (decision 1 of the P2b security follow-ups): a resend less than an hour after its last sending
+ * answers `invitation-resend-throttled`, and a resend takes one invitation email of the daily
+ * allowance of the organization, `invitation-daily-limit-reached` with none left. The ledger of the
+ * organization is locked before the invitation, the order every writer of the ledger follows. A
+ * refused resend changes, records and emits nothing.
  */
 export class ResendInvitation {
   // #region Properties
@@ -77,7 +89,8 @@ export class ResendInvitation {
    * @param {ResendInvitationInput} input - The actor, the organization and the invitation.
    * @returns {Promise<InvitationView>} The invitation with its new expiry.
    * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden`,
-   * `invitation-not-found`, `invitation-revoked` or `invitation-answered`.
+   * `invitation-not-found`, `invitation-revoked`, `invitation-answered`,
+   * `invitation-resend-throttled` or `invitation-daily-limit-reached`.
    */
   public async execute(input: ResendInvitationInput): Promise<InvitationView> {
     const now: Date = this.clock.now();
@@ -90,6 +103,10 @@ export class ResendInvitation {
             input.actorUserId,
           );
           assertManagesOrganization(actor.role);
+          const usage: InvitationEmailUsage = await store.invitationEmails.lockUsage(
+            input.organizationId,
+            invitationEmailWindowStart(now),
+          );
           const invitation: Invitation | null = await store.invitations.findForUpdate(
             input.organizationId,
             input.invitationId,
@@ -101,7 +118,9 @@ export class ResendInvitation {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
           const resent: Invitation = invitation.resend(now);
+          assertInvitationEmailsAvailable(usage, 1, now);
           await store.invitations.update(resent);
+          await store.invitationEmails.record(resent);
           await store.events.invitationIssued(resent, {
             inviterUserId: input.actorUserId,
             inviterName: await senderNameOf(store, input.actorUserId),
