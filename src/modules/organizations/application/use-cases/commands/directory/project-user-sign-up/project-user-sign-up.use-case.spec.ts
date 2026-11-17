@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { InMemoryOrganizations } from '../../../organizations.fixture.js';
+import { ProjectEmailChange } from '../project-email-change/project-email-change.use-case.js';
 import { ProjectEmailVerification } from '../project-email-verification/project-email-verification.use-case.js';
 import { ProjectProfileUpdate } from '../project-profile-update/project-profile-update.use-case.js';
 import { ProjectUserSignUp } from './project-user-sign-up.use-case.js';
@@ -37,6 +38,29 @@ describe('the projection of the user directory', () => {
       email: 'lea.petit@ateliernord.fr',
       emailVerified: true,
       emailVersion: 2,
+      deleted: false,
+    });
+  });
+
+  it('applies a change of address by version, over a late verification of the previous one', async () => {
+    const signUp: ProjectUserSignUp = new ProjectUserSignUp(store);
+    const verify: ProjectEmailVerification = new ProjectEmailVerification(store);
+    const change: ProjectEmailChange = new ProjectEmailChange(store);
+
+    await signUp.execute({
+      userId: LEA_ID,
+      version: 1,
+      email: 'lea.petit@ateliernord.fr',
+      name: 'Léa Petit',
+    });
+    await change.execute({ userId: LEA_ID, version: 4, email: 'Lea@AtelierNord.fr' });
+    await verify.execute({ userId: LEA_ID, version: 2, email: 'lea.petit@ateliernord.fr' });
+    await change.execute({ userId: LEA_ID, version: 4, email: 'lea@ateliernord.fr' });
+
+    expect(store.tables.directory.get(LEA_ID)).toMatchObject({
+      email: 'lea@ateliernord.fr',
+      emailVerified: true,
+      emailVersion: 4,
     });
   });
 });

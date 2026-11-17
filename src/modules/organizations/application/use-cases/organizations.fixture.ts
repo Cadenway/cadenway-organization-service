@@ -6,6 +6,7 @@ import { SlugTakenError } from '../../domain/errors/organizations/slug-taken.err
 import { takesSeat } from '../../domain/policies/members/seat.policy.js';
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
+import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
@@ -152,6 +153,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       email,
       emailVerified: verified,
       emailVersion: verified ? 2 : 1,
+      deleted: false,
     });
     return this;
   }
@@ -193,7 +195,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       );
     const nameOf = (userId: string): string => {
       const entry: DirectoryUserState | undefined = tables.directory.get(userId);
-      return entry?.name ?? entry?.email ?? '';
+      return entry?.deleted === true ? FORMER_MEMBER_NAME : (entry?.name ?? entry?.email ?? '');
     };
     const memberView = (member: MemberState): MemberView => ({
       id: member.id,
@@ -294,6 +296,14 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
           );
           return Promise.resolve(state === undefined ? null : Member.restore(state));
         },
+        findActiveOfAccountForUpdate: (userId: string): Promise<readonly Member[]> =>
+          Promise.resolve(
+            [...tables.members.values()]
+              .filter(
+                (member: MemberState) => member.userId === userId && member.removedAt === null,
+              )
+              .map((member: MemberState) => Member.restore(member)),
+          ),
         update: (member: Member): Promise<void> => {
           tables.members.set(member.id, member.snapshot);
           return Promise.resolve();
@@ -494,6 +504,10 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
           const state: DirectoryUserState | undefined = tables.directory.get(userId);
           return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
         },
+        findForShare: (userId: string): Promise<DirectoryUser | null> => {
+          const state: DirectoryUserState | undefined = tables.directory.get(userId);
+          return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
+        },
         lock: (userId: string): Promise<DirectoryUser> => {
           const state: DirectoryUserState | undefined = tables.directory.get(userId);
           return Promise.resolve(
@@ -543,6 +557,13 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
           tables.events.push({
             name: 'member.removed.v1',
             payload: { ...member.snapshot, actorUserId },
+          });
+          return Promise.resolve();
+        },
+        memberRemovedBySystem: (member: Member): Promise<void> => {
+          tables.events.push({
+            name: 'member.removed.v1',
+            payload: { ...member.snapshot, actor: 'system' },
           });
           return Promise.resolve();
         },

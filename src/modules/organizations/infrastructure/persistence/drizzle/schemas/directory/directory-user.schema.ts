@@ -12,12 +12,14 @@ import {
 
 /**
  * Table `directory_users`: the user directory, a projection of `user.signed-up.v1`,
- * `user.email-verified.v1` and `user.profile-updated.v1` of identity-service (decision 4 of P2b).
- * Keyed by the id of the account in identity-service, which assigned it: the one table of the
- * module without a `uuidv7()` id and without a `version`, since each part carries the version of
- * the account that set it (`name_version`, `email_version`). `name_key` is the search key of the
- * name. An account belongs to no organization: no `organization_id`, no policy; every query names
- * its account or its address.
+ * `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and
+ * `user.deleted.v1` of identity-service (decision 4 of P2b). Keyed by the id of the account in
+ * identity-service, which assigned it: the one table of the module without a `uuidv7()` id and
+ * without a `version`, since each part carries the version of the account that set it
+ * (`name_version`, `email_version`). `name_key` is the search key of the name. `deleted` marks a
+ * former member, whose name, search key and address are forgotten (checked by a constraint). An
+ * account belongs to no organization: no `organization_id`, no policy; every query names its
+ * account or its address.
  */
 export const directoryUsers = pgTable(
   'directory_users',
@@ -29,6 +31,7 @@ export const directoryUsers = pgTable(
     email: text('email'),
     emailVerified: boolean('email_verified').notNull().default(false),
     emailVersion: integer('email_version').notNull().default(0),
+    deleted: boolean('deleted').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -41,6 +44,10 @@ export const directoryUsers = pgTable(
     check(
       'directory_users_verified_email_check',
       sql`not ${table.emailVerified} or ${table.email} is not null`,
+    ),
+    check(
+      'directory_users_deleted_check',
+      sql`not ${table.deleted} or (${table.name} is null and ${table.nameKey} is null and ${table.email} is null)`,
     ),
   ],
 );

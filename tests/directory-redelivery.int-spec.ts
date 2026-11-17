@@ -1,4 +1,7 @@
 import { eventSchemas as identityEvents } from '@cadenway/contracts/events/identity-service';
+import type { OrganizationCreated } from '@cadenway/contracts/types/internal/organization-service';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { newId, ServiceStack } from './support/service-stack.js';
@@ -6,8 +9,9 @@ import { newId, ServiceStack } from './support/service-stack.js';
 // The redelivery of a directory event whose handling fails, on real PostgreSQL and NATS. The
 // production schedule (`DIRECTORY_REDELIVERY`: 1 s, 5 s, 30 s, then up to an hour, 32 deliveries)
 // is too long to watch, and its first delays are those of the default schedule of the kit; this
-// run gives the three directory consumers a short schedule that differs from the default at every
-// step: 3 s, then 0.5 s, four deliveries. `directory-redelivery.model.spec.ts` checks the
+// run gives the directory consumers a short schedule that differs from the default at every step:
+// 3 s, then 0.5 s, four deliveries. The consumer of `user.deleted.v1` shares it, which lets the
+// refused deletion of an owner be watched until its dead letter. `directory-redelivery.model.spec.ts` checks the
 // production schedule, and `tests/organizations.int-spec.ts` that the broker applies it.
 vi.mock(
   '../src/modules/organizations/application/models/directory/directory-redelivery.model.js',
@@ -26,6 +30,13 @@ const lea: Account = { id: newId(), name: 'Léa Petit', email: 'lea.petit@atelie
 
 /** Hugo Dubois: the first two deliveries of his sign-up fail, the third applies it. */
 const hugo: Account = { id: newId(), name: 'Hugo Dubois', email: 'hugo.dubois@ateliernord.fr' };
+
+/** Camille Martin, owner of Atelier Nord: a deletion of her account contradicts the contract. */
+const camille: Account = {
+  id: newId(),
+  name: 'Camille Martin',
+  email: 'camille.martin@ateliernord.fr',
+};
 
 /**
  * `user.signed-up.v1` of an account, validated against the contract.
@@ -47,8 +58,44 @@ function signedUp(account: Account): { readonly id: string } {
   });
 }
 
+/**
+ * `user.email-verified.v1` of an account, validated against the contract.
+ *
+ * @param account - The account.
+ * @returns The payload.
+ */
+function emailVerified(account: Account): { readonly id: string } {
+  return identityEvents['user.email-verified.v1'].parse({
+    id: newId(),
+    occurredAt: new Date().toISOString(),
+    organizationId: null,
+    actor: { type: 'user', id: account.id },
+    version: 2,
+    userId: account.id,
+    email: account.email,
+  });
+}
+
+/**
+ * `user.deleted.v1` of an account, validated against the contract.
+ *
+ * @param account - The account.
+ * @returns The payload.
+ */
+function deleted(account: Account): { readonly id: string } {
+  return identityEvents['user.deleted.v1'].parse({
+    id: newId(),
+    occurredAt: new Date().toISOString(),
+    organizationId: null,
+    actor: { type: 'system', id: 'identity-service' },
+    version: 5,
+    userId: account.id,
+  });
+}
+
 describe('redelivery of the directory events', () => {
   let stack: ServiceStack;
+  let app: NestExpressApplication;
 
   /**
    * Reads how many deliveries reached the insert of the directory entry of an account, from a
@@ -84,7 +131,7 @@ describe('redelivery of the directory events', () => {
     await stack.migrator.query(`
       create trigger directory_users_probe before insert on directory_users
       for each row execute function refuse_directory_probe()`);
-    await stack.startApplication();
+    app = await stack.startApplication();
   });
 
   afterAll(async () => {
@@ -144,5 +191,68 @@ describe('redelivery of the directory events', () => {
       { timeout: 20_000, interval: 100 },
     );
     expect(await attempts('directory_probe_hugo')).toBe(3);
+  });
+
+  it('refuses the deletion of an owner at every delivery, then gives it up, changing nothing', async () => {
+    stack.publish('user.signed-up.v1', signedUp(camille));
+    stack.publish('user.email-verified.v1', emailVerified(camille));
+    await vi.waitFor(
+      async () => {
+        const entry = await stack.migrator.query(
+          'select 1 from directory_users where user_id = $1 and email_verified',
+          [camille.id],
+        );
+        expect(entry.rows).toHaveLength(1);
+      },
+      { timeout: 20_000, interval: 100 },
+    );
+    const created = await request(app.getHttpServer())
+      .post('/internal/v1/organizations')
+      .set('Authorization', await stack.bearer(camille.id, null))
+      .send({
+        name: 'Atelier Nord',
+        teamSize: '6-20',
+        primaryUse: 'product-engineering',
+        inviteEmails: [],
+      });
+    expect(created.status).toBe(201);
+    const atelierNordId: string = (created.body as OrganizationCreated).organization.id;
+    const refused: { readonly id: string } = deleted(camille);
+
+    stack.publish('user.deleted.v1', refused);
+
+    // Four deliveries, each refused, then the dead letter: nothing left to deliver.
+    await vi.waitFor(
+      () => {
+        const consumer = stack.consumer('organization-service__remove-deleted-user');
+        expect(consumer.config.max_deliver).toBe(4);
+        expect(consumer.delivered.consumer_seq).toBe(4);
+        expect(consumer.num_pending).toBe(0);
+        expect(consumer.num_ack_pending).toBe(0);
+      },
+      { timeout: 20_000, interval: 100 },
+    );
+    const owners = await stack.system<{ readonly organization_id: string }>(
+      `select organization_id from members
+        where user_id = $1 and role = 'owner' and removed_at is null`,
+      [camille.id],
+    );
+    expect(owners).toEqual([{ organization_id: atelierNordId }]);
+    const removals = await stack.system(
+      `select 1 from outbox_events
+        where event_name = 'member.removed.v1' and payload ->> 'userId' = $1`,
+      [camille.id],
+    );
+    expect(removals).toHaveLength(0);
+    const entry = await stack.migrator.query<{ name: string; deleted: boolean }>(
+      'select name, deleted from directory_users where user_id = $1',
+      [camille.id],
+    );
+    expect(entry.rows).toEqual([{ name: 'Camille Martin', deleted: false }]);
+    const processed = await stack.migrator.query(
+      'select 1 from processed_events where event_id = $1',
+      [refused.id],
+    );
+    expect(processed.rows).toHaveLength(0);
   });
 });

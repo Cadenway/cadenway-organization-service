@@ -11,8 +11,9 @@ import type { RoleCounts } from '../../../../projections/members/role-counts.pro
  * Interface MemberRepository
  *
  * @description
- * The memberships, bound to the transaction of a unit of work. Every method names its organization;
- * only active memberships are read, a removed one is kept for its version only.
+ * The memberships, bound to the transaction of a unit of work. Every method names its organization,
+ * but `findActiveOfAccountForUpdate`, which names its account in a system transaction; only active
+ * memberships are read, a removed one is kept for its version only.
  */
 export interface MemberRepository {
   // #region Methods
@@ -52,10 +53,25 @@ export interface MemberRepository {
   findActiveForUpdate(organizationId: string, memberId: string): Promise<Member | null>;
 
   /**
+   * Method findActiveOfAccountForUpdate
+   *
+   * @description
+   * Loads the active memberships of an account in every organization and locks them until the end
+   * of the transaction, by organization then id. A read across organizations, for the removal of a
+   * deleted account in a system transaction: a bounded exception of `MODULE.md`, filtered on the
+   * account.
+   *
+   * @param {string} userId - The account.
+   * @returns {Promise<readonly Member[]>} The memberships, none when the account belongs nowhere.
+   */
+  findActiveOfAccountForUpdate(userId: string): Promise<readonly Member[]>;
+
+  /**
    * Method update
    *
    * @description
-   * Writes the role, the removal and the version of a membership locked by `findActiveForUpdate`.
+   * Writes the role, the removal and the version of a membership locked by `findActiveForUpdate` or
+   * `findActiveOfAccountForUpdate`.
    *
    * @param {Member} member - The membership after the change.
    * @returns {Promise<void>} Resolves once written.

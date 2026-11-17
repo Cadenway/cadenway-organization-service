@@ -80,6 +80,19 @@ export interface OrganizationEvents {
   memberRemoved(member: Member, actorUserId: string): Promise<void>;
 
   /**
+   * Method memberRemovedBySystem
+   *
+   * @description
+   * Appends `member.removed.v1` for a membership of an account identity-service deleted
+   * (`user.deleted.v1`), the last event of the membership; its actor is the system,
+   * `{ type: 'system', id: 'organization-service' }`, as the contract says.
+   *
+   * @param {Member} member - The removed membership.
+   * @returns {Promise<void>} Resolves once appended.
+   */
+  memberRemovedBySystem(member: Member): Promise<void>;
+
+  /**
    * Method invitationIssued
    *
    * @description

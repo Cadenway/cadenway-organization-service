@@ -363,6 +363,8 @@ describe('organizations, members and invitations', () => {
         'project-user-signed-up',
         'project-user-email-verified',
         'project-user-profile-updated',
+        'project-user-email-changed',
+        'remove-deleted-user',
       ]) {
         expect(stack.consumer(`organization-service__${handler}`).config).toMatchObject({
           max_deliver: 32,

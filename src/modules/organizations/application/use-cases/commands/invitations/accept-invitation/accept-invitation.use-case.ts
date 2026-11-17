@@ -90,6 +90,10 @@ export class AcceptInvitation {
         addressed,
         input.actorUserId,
         async (store: OrganizationsStore): Promise<MyOrganizationView> => {
+          // The directory entry of the actor is held until the commit, before the invitation: a
+          // deletion of the account under way is waited for, then leaves no verified address, and
+          // a later one finds the new membership (`RemoveDeletedUser`).
+          await store.directory.findForShare(input.actorUserId);
           const invitation: Invitation = await assertAddressedToActor(
             store,
             await store.invitations.findForUpdate(organizationId, input.invitationId),

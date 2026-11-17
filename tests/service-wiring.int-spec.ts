@@ -76,10 +76,10 @@ const businessTables = [
 const allTables = [...platformTables, ...businessTables].sort();
 
 /**
- * Migrations of `migrations/`: the platform tables, the organizations module, then the ledger of
- * invitation emails.
+ * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
+ * invitation emails, then the former members of the user directory.
  */
-const migrationCount = 3;
+const migrationCount = 4;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -630,6 +630,8 @@ describe('organization-service wiring', () => {
       'project-user-signed-up',
       'project-user-email-verified',
       'project-user-profile-updated',
+      'project-user-email-changed',
+      'remove-deleted-user',
     ]) {
       expect(
         brokerAccepts(

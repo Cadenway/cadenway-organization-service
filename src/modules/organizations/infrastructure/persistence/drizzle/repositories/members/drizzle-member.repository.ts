@@ -229,6 +229,27 @@ export class DrizzleMemberRepository implements MemberRepository {
   }
 
   /**
+   * Method findActiveOfAccountForUpdate
+   *
+   * @description
+   * Loads and locks the active memberships of an account in every organization, by organization
+   * then id, so two transactions lock them in the same order. A system query filtered on the
+   * account, served by `members_user_active_index`.
+   *
+   * @param {string} userId - The account.
+   * @returns {Promise<readonly Member[]>} The memberships.
+   */
+  public async findActiveOfAccountForUpdate(userId: string): Promise<readonly Member[]> {
+    const rows: MemberRow[] = await this.db
+      .select()
+      .from(members)
+      .where(and(eq(members.userId, userId), isNull(members.removedAt)))
+      .orderBy(asc(members.organizationId), asc(members.id))
+      .for('update');
+    return rows.map(toMember);
+  }
+
+  /**
    * Method update
    *
    * @description

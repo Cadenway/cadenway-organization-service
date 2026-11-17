@@ -102,7 +102,11 @@ export class CreateOrganization {
       const addresses: EmailAddress[] = distinctAddresses(input.inviteEmails);
       return await this.unitOfWork.runAcrossOrganizations(
         async (store: OrganizationsStore): Promise<CreateOrganizationOutput> => {
-          const creator: DirectoryUser | null = await store.directory.find(input.actorUserId);
+          // Held until the commit: a deletion of the account under way is waited for and then
+          // refuses the creation, a later one sees the new owner (`RemoveDeletedUser`).
+          const creator: DirectoryUser | null = await store.directory.findForShare(
+            input.actorUserId,
+          );
           const creatorName: string | null = creator?.name ?? null;
           if (creator === null || creatorName === null || !creator.isSynchronized) {
             throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
