@@ -128,8 +128,9 @@ configs:
             permissions: {
               publish: {
                 allow: [
-                  "evt.organization.>", "evt.member.>", "evt.domain.>",
-                  "rebuild.*.organization", "rebuild.*.member", "rebuild.*.domain",
+                  "evt.organization.>", "evt.member.>", "evt.invitation.>", "evt.domain.>",
+                  "rebuild.*.organization", "rebuild.*.member", "rebuild.*.invitation",
+                  "rebuild.*.domain",
                   "$$JS.API.INFO", "$$JS.API.STREAM.NAMES", "$$JS.API.STREAM.INFO.EVENTS",
                   "$$JS.API.CONSUMER.CREATE.EVENTS.>", "$$JS.API.CONSUMER.DURABLE.CREATE.EVENTS.*",
                   "$$JS.API.CONSUMER.INFO.EVENTS.*", "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.*",

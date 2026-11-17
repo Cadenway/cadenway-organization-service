@@ -11,6 +11,7 @@ import { Module } from '@nestjs/common';
 
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
+import { OrganizationsModule } from './modules/organizations/organizations.module.js';
 import { PlatformModule } from './modules/platform/platform.module.js';
 
 /**
@@ -31,9 +32,8 @@ import { PlatformModule } from './modules/platform/platform.module.js';
  * - `MessagingModule`: the NATS connection of the `organization` user, with the inbox prefix
  *   `_INBOX.organization` the broker requires. The creation waits for the first connection, then
  *   checks that the `EVENTS` stream exists: cadenway-ops creates the streams
- *   (`manageStreams: false`), and only notification-service runs the dead-letter worker. The
- *   service publishes and consumes nothing yet, since `@cadenway/contracts` defines no event of its
- *   own.
+ *   (`manageStreams: false`), and only notification-service runs the dead-letter worker. None of
+ *   the events this service publishes or consumes is restricted.
  * - `OutboxModule`: the outbox writer, the PostgreSQL deduplicator and the relay, which polls
  *   `outbox_events` every second in a system transaction and publishes the pending rows. It runs in
  *   every replica; `for update skip locked` keeps two of them from publishing the same row.
@@ -47,8 +47,9 @@ import { PlatformModule } from './modules/platform/platform.module.js';
  *   lengthen every stop, under the 10 second default grace period of Docker, without moving any
  *   request away; set it above the probe interval of a proxy if one ever routes on readiness.
  * - `PlatformModule`: the owner of the kit tables in the migrations of the service.
- *
- * Business modules under `src/modules/` are registered here as they are created.
+ * - `OrganizationsModule`: organizations, members, invitations and the user directory, with the
+ *   internal routes of `openapi/internal/organization-service.yaml` and the consumers of the
+ *   account events of identity-service.
  */
 @Module({
   imports: [
@@ -81,6 +82,7 @@ import { PlatformModule } from './modules/platform/platform.module.js';
       }),
     }),
     PlatformModule,
+    OrganizationsModule,
   ],
 })
 export class AppModule {}

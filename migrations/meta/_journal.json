@@ -8,6 +8,13 @@
       "when": 1794752679899,
       "tag": "0000_platform_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794905718388,
+      "tag": "0001_organizations_members_invitations",
+      "breakpoints": true
     }
   ]
 }
