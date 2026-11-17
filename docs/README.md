@@ -4,7 +4,7 @@ Planned role: cadenway-organization-service owns organizations and who belongs t
 
 ## Current status
 
-The NestJS application under `src/` runs on `@cadenway/nest-common` and `@cadenway/nest-messaging`: configuration validated at start-up, JSON logs, OpenTelemetry preloaded, the internal token required on every route but the health probes, the NATS connection of the `organization` user with the outbox relay, and a readiness route that checks PostgreSQL and NATS. The only migration creates the tables of the service kit (outbox, processed ids, versions, `Idempotency-Key`), owned by the platform module. No business code, route or event exists yet; the target architecture in this guide is what they must follow.
+The NestJS application under `src/` runs on `@cadenway/nest-common` and `@cadenway/nest-messaging`: configuration validated at start-up, JSON logs, OpenTelemetry preloaded, the internal token required on every route but the health probes, the NATS connection of the `organization` user with the outbox relay, and a readiness route that checks PostgreSQL and NATS. The migrations create the tables of the service kit (outbox, processed ids, versions, `Idempotency-Key`), owned by the platform module, and those of the organizations module: organizations, members, invitations and the user directory projected from the events of identity-service, with the internal routes of `openapi/internal/organization-service.yaml` and the events of `asyncapi/organization-service.yaml` (P2b of the plan). The later capabilities follow the target architecture in this guide.
 
 ## Read the guides
 

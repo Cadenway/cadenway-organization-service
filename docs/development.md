@@ -8,11 +8,13 @@ The application under `src/` runs on `@cadenway/nest-common` and `@cadenway/nest
 configuration is validated when the application is created, a failed start-up is one JSON line on
 the standard error, it writes JSON log lines, starts OpenTelemetry before the application, requires
 the internal token on every route but the health probes, connects to NATS as the `organization`
-user, runs the outbox relay, and its readiness checks PostgreSQL and NATS. The one migration creates
-the tables of the service kit, owned by the platform module (`src/modules/platform/MODULE.md`). No
-business code, route or event exists yet: `@cadenway/contracts` defines no event of this service,
-so nothing is published or consumed. The target architecture in this guide is what they must
-follow.
+user, runs the outbox relay, and its readiness checks PostgreSQL and NATS. The migrations create
+the tables of the service kit, owned by the platform module (`src/modules/platform/MODULE.md`), and
+those of the organizations module (`src/modules/organizations/MODULE.md`): organizations, members,
+invitations and the user directory. The service serves the internal routes of
+`openapi/internal/organization-service.yaml`, publishes the events of
+`asyncapi/organization-service.yaml` through its outbox and consumes the account events of
+identity-service. Later capabilities follow the target architecture in this guide.
 
 The commands below are the documented workflow. Inspect the repository's actual manifests and files before running them, and report unavailable checks rather than inventing replacements. Run Git, pnpm, build, and test commands with this repository as the working directory, never from the parent workspace.
 
@@ -59,8 +61,9 @@ Requirements: Node.js LTS and pnpm (versions in `package.json`), and Docker.
 
    Its NATS has the authorization of the broker of cadenway-ops (`docs/messaging.md` there): a
    connection without a user is refused, and the `organization` user may publish the subjects of the
-   entities this service owns and subscribe to `_INBOX.organization.>` and `rebuild.organization.>`
-   only.
+   entities this service owns (`evt.organization.>`, `evt.member.>`, `evt.invitation.>`,
+   `evt.domain.>`), consume `EVENTS` through its durable consumers and subscribe to
+   `_INBOX.organization.>` and `rebuild.organization.>` only.
    `nats-streams` runs the stream script of cadenway-ops with the `admin` user: it creates
    `EVENTS`, `EVENTS_RESTRICTED` and `EVENTS_DLQ` once NATS is healthy, checks them every minute
    and is healthy while they exist. The service never creates a stream and refuses to start
@@ -152,8 +155,13 @@ application role reads and writes the rows of its organization only, runs no DDL
 the migration journal of the `drizzle` schema, that the relay runs against an empty outbox, that
 the broker enforces the permissions of cadenway-ops, the health routes (readiness 503 while NATS or
 PostgreSQL is down and from the start of a shutdown, back to 200 once NATS returns) and the
-internal token. It moves to the fixtures of `@cadenway/nest-testing` once that package exports
-them.
+internal token. `tests/organizations.int-spec.ts` starts its own throwaway project the same way
+(`tests/support/service-stack.ts`), publishes account events of identity-service with the NATS
+command line before the service starts, and drives every internal route as the gateway would: the
+role rules, the isolation between organizations and the forced row-level security of the business
+tables, the invitation lifecycle, the events in `EVENTS`, the directory projection with its
+redeliveries, and the rollback of a failed creation. Both move to the fixtures of
+`@cadenway/nest-testing` once that package exports them.
 
 ## Minimum checks by change
 
