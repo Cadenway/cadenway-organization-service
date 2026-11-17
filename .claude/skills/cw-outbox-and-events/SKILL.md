@@ -13,87 +13,18 @@ the events of `asyncapi/organization-service.yaml` and consumes the account even
 identity-service (its `MODULE.md`); any other event is published or consumed only once its AsyncAPI
 spec is released (`cw-contract-first`).
 
-## Publishing
+- Publish through the outbox inside the use case transaction. Match the transaction runner to the
+  event's tenant scope. The relay publishes after commit.
+- Consume through the kit. Deduplicate in the handler transaction, apply aggregate versions
+  independently of arrival order and make external effects idempotent.
 
-1. The use case appends the event inside its own transaction, with the schemas of the contract
-   (`eventSchemas` of `@cadenway/contracts/events/<spec>`) and the injected `OutboxWriter`.
-   PostgreSQL assigns the event id (`uuidv7()`) and the instant; the payload is validated before
-   the row is written:
+Read only the sections that your change needs:
 
-   ```ts
-   await this.outbox.append(tx, eventSchemas, 'member.role-changed.v1', {
-     organizationId,
-     actor: { type: 'user', id: userId },
-     version,
-     memberId,
-     role,
-   });
-   ```
-2. An event with an organization is appended in a tenant transaction of that organization; one
-   without (`organizationId: null`) in a system transaction only: row-level security refuses it in
-   a tenant one. The one exception is the creation of an organization: it has no tenant transaction
-   yet (PostgreSQL assigns its id on insert), so it appends its events in its system transaction,
-   which the kit accepts (`src/modules/organizations/MODULE.md`).
-3. The relay publishes the row after the commit, on `evt.<event-name>` with `Nats-Msg-Id` set to the
-   event id and the `traceparent` of the use case. `relay.wake()` after the commit publishes now
-   instead of at the next poll (one second).
-4. Never publish directly: a crash between commit and publish would lose the event. `EventPublisher`
-   is for an application without a database (the API gateway).
-
-## Consuming
-
-1. Register the handler from `onApplicationBootstrap` of a provider of
-   `presentation/messaging/handlers/<event-family>/`, with the injected `EventConsumers`. It gets
-   the durable consumer `organization-service__<handler>`, filtered on the one subject of its event
-   (`src/modules/organizations/presentation/messaging/handlers/users/`):
-
-   ```ts
-   await this.consumers.subscribe({
-     handler: 'project-user-signed-up',
-     schemas: eventSchemas,
-     event: 'user.signed-up.v1',
-     handle: (payload) => this.projectUserSignUp.execute({ ... }),
-   });
-   ```
-2. The deduplicator of `OutboxModule` records `(consumer, event id)` in `processed_events` in the
-   handler's transaction (tenant runner for an event with an organization): a redelivery of a
-   handled event is skipped. A `run` of the same runner inside the handler joins that transaction.
-3. Call a use case; it is idempotent for anything outside the database (an e-mail, a call).
-4. A rejection is retried after 1 s, 5 s, 30 s and 2 min; the fifth failure, or a payload that does
-   not match its schema, becomes a dead letter in `EVENTS_DLQ`, copied by notification-service.
-   Document in MODULE.md what an operator does with it.
-5. A handler with outside effects registers with `deliverPolicy: 'new'`; the default `all` delivers
-   up to seven days of events to a new consumer.
-
-## Changing an event
-
-- Additive field: minor change in cadenway-api-contracts; consumers ignore unknown fields.
-- Any other change: a new name `.v2`, emitted alongside `.v1` until every consumer moved.
-
-## Version and order
-
-- Every event carries `version`, the version of the aggregate after the change, and `actor`
-  (`{ type: 'user' | 'automation' | 'git' | 'system', id }`).
-- Delivery is at least once and order is not guaranteed: `claimVersion(aggregateKey)` in the handler
-  context (a key such as `member:<id>`) resolves to `false` for a version already applied to that
-  aggregate in that organization.
-- Never derive order from arrival time.
-
-## What the kit and the broker own
-
-Subjects (`evt.<name>`), durable pull consumers (`<service>__<handler>`), `Nats-Msg-Id`
-deduplication, the retry schedule, the dead-letter copy and `traceparent` propagation belong to
-`@cadenway/nest-messaging`. The three streams (`EVENTS`, `EVENTS_RESTRICTED`, `EVENTS_DLQ`) and the
-permissions of the `organization` user (publish `evt.organization.>`, `evt.member.>`,
-`evt.invitation.>` and `evt.domain.>`, subscribe `_INBOX.organization.>` and
-`rebuild.organization.>`) belong to
-cadenway-ops (`docs/messaging.md`). This service runs with `manageStreams: false` and
-`deadLetterWorker: false`: never declare a stream, a consumer or a subject here. An event of a new
-entity needs its `evt.<entity>.>` in cadenway-ops first.
-
-## Rebuilding a consumer
-
-Outbox rows are kept 7 days. A consumer that fell further behind is rebuilt: the owning service
-re-emits the current state of its entities with `RebuildEmitter` on `rebuild.<consumer>.<entity>`
-(`rebuild.task.member`), unacknowledged, the only mode the permissions allow. A service that emits
-events documents that use case in MODULE.md.
+- Append an event or change its contract: [publishing](references/messaging.md#publishing),
+  [changing an event](references/messaging.md#changing-an-event) and
+  [version and order](references/messaging.md#version-and-order).
+- Subscribe or change a handler: [consuming](references/messaging.md#consuming) and
+  [version and order](references/messaging.md#version-and-order).
+- Change runtime wiring, subjects or permissions:
+  [kit and broker ownership](references/messaging.md#what-the-kit-and-the-broker-own).
+- Recover a lagging consumer: [rebuild](references/messaging.md#rebuilding-a-consumer).
