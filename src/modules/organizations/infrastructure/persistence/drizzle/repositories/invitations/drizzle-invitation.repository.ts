@@ -12,6 +12,7 @@ import type { EmailAddress } from '../../../../../domain/value-objects/email/ema
 import type { InvitationDraft } from '../../../../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationState } from '../../../../../domain/value-objects/invitations/invitation-state.value-object.js';
 import type { AssignableRole } from '../../../../../domain/value-objects/members/assignable-role.value-object.js';
+import { FORMER_MEMBER_NAME } from '../../../../../domain/value-objects/directory/former-member-name.value-object.js';
 import { toInvitation } from '../../mappers/invitations/invitation.mapper.js';
 import type { InvitationRow } from '../../mappers/invitations/invitation.mapper.js';
 import { toSeatCount } from '../../mappers/members/seat-count.mapper.js';
@@ -25,11 +26,12 @@ import { organizations } from '../../schemas/organizations/organization.schema.j
  *
  * @description
  * Name of the sender of an invitation, from the user directory; its address stands in for a name
- * not applied yet.
+ * not applied yet, and « Ancien membre » for an account identity-service deleted, whose pending
+ * invitations stay.
  *
  * @type {SQL<string>}
  */
-const INVITER_NAME: SQL<string> = sql<string>`coalesce(${directoryUsers.name}, ${directoryUsers.email}, '')`;
+const INVITER_NAME: SQL<string> = sql<string>`case when ${directoryUsers.deleted} then ${FORMER_MEMBER_NAME}::text else coalesce(${directoryUsers.name}, ${directoryUsers.email}, '') end`;
 
 /**
  * Interface PendingRow

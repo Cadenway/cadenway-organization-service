@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
+import { projectEmailChangeProvider } from './composition/providers/use-cases/directory/project-email-change.provider.js';
 import { projectEmailVerificationProvider } from './composition/providers/use-cases/directory/project-email-verification.provider.js';
 import { projectProfileUpdateProvider } from './composition/providers/use-cases/directory/project-profile-update.provider.js';
 import { projectUserSignUpProvider } from './composition/providers/use-cases/directory/project-user-sign-up.provider.js';
@@ -15,6 +16,7 @@ import { revokeInvitationProvider } from './composition/providers/use-cases/invi
 import { changeMemberRoleProvider } from './composition/providers/use-cases/members/change-member-role.provider.js';
 import { getMemberProvider } from './composition/providers/use-cases/members/get-member.provider.js';
 import { listMembersProvider } from './composition/providers/use-cases/members/list-members.provider.js';
+import { removeDeletedUserProvider } from './composition/providers/use-cases/members/remove-deleted-user.provider.js';
 import { removeMemberProvider } from './composition/providers/use-cases/members/remove-member.provider.js';
 import { createOrganizationProvider } from './composition/providers/use-cases/organizations/create-organization.provider.js';
 import { getCurrentOrganizationProvider } from './composition/providers/use-cases/organizations/get-current-organization.provider.js';
@@ -24,6 +26,8 @@ import { InvitationsController } from './presentation/http/controllers/invitatio
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { MembersController } from './presentation/http/controllers/members/members.controller.js';
 import { OrganizationsController } from './presentation/http/controllers/organizations/organizations.controller.js';
+import { UserDeletedHandler } from './presentation/messaging/handlers/users/user-deleted.handler.js';
+import { UserEmailChangedHandler } from './presentation/messaging/handlers/users/user-email-changed.handler.js';
 import { UserEmailVerifiedHandler } from './presentation/messaging/handlers/users/user-email-verified.handler.js';
 import { UserProfileUpdatedHandler } from './presentation/messaging/handlers/users/user-profile-updated.handler.js';
 import { UserSignedUpHandler } from './presentation/messaging/handlers/users/user-signed-up.handler.js';
@@ -65,9 +69,13 @@ import { UserSignedUpHandler } from './presentation/messaging/handlers/users/use
     projectUserSignUpProvider,
     projectEmailVerificationProvider,
     projectProfileUpdateProvider,
+    projectEmailChangeProvider,
+    removeDeletedUserProvider,
     UserSignedUpHandler,
     UserEmailVerifiedHandler,
     UserProfileUpdatedHandler,
+    UserEmailChangedHandler,
+    UserDeletedHandler,
   ],
 })
 export class OrganizationsModule {}

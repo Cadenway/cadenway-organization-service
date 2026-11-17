@@ -14,6 +14,20 @@ import type { OrganizationField } from '../../../../domain/value-objects/organiz
 import type { OrganizationState } from '../../../../domain/value-objects/organizations/organization-state.value-object.js';
 
 /**
+ * Constant SYSTEM_ACTOR
+ *
+ * @description
+ * The actor of the events this service emits on its own, without a person acting: the removals of
+ * the memberships of a deleted account (`member.removed.v1` in `asyncapi/organization-service.yaml`).
+ *
+ * @type {{ readonly type: 'system'; readonly id: string }}
+ */
+const SYSTEM_ACTOR: { readonly type: 'system'; readonly id: string } = {
+  type: 'system',
+  id: 'organization-service',
+};
+
+/**
  * Class OutboxOrganizationEvents
  *
  * @description
@@ -203,6 +217,30 @@ export class OutboxOrganizationEvents implements OrganizationEvents {
     await this.outbox.append(this.transaction, eventSchemas, 'member.removed.v1', {
       organizationId: state.organizationId,
       actor: { type: 'user', id: actorUserId },
+      version: state.version,
+      memberId: state.id,
+      userId: state.userId,
+      role: state.role,
+    });
+    this.onAppend();
+  }
+
+  /**
+   * Method memberRemovedBySystem
+   *
+   * @description
+   * Appends `member.removed.v1` for a membership of an account identity-service deleted, with the
+   * system as its actor; appended in the system transaction of the removal, which the outbox
+   * accepts for an event of any organization.
+   *
+   * @param {Member} member - The removed membership.
+   * @returns {Promise<void>} Resolves once appended.
+   */
+  public async memberRemovedBySystem(member: Member): Promise<void> {
+    const state: MemberState = member.snapshot;
+    await this.outbox.append(this.transaction, eventSchemas, 'member.removed.v1', {
+      organizationId: state.organizationId,
+      actor: SYSTEM_ACTOR,
       version: state.version,
       memberId: state.id,
       userId: state.userId,

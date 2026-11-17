@@ -95,7 +95,7 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
    * Method save
    *
    * @description
-   * Writes a locked entry, with the search key of its name.
+   * Writes a locked entry, with the search key of its name; a deleted account keeps neither.
    *
    * @param {DirectoryUser} user - The entry after the event.
    * @returns {Promise<void>} Resolves once written.
@@ -111,6 +111,7 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
         email: state.email,
         emailVerified: state.emailVerified,
         emailVersion: state.emailVersion,
+        deleted: state.deleted,
         updatedAt: sql`now()`,
       })
       .where(eq(directoryUsers.userId, state.userId));

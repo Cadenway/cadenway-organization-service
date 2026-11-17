@@ -3,9 +3,11 @@
  *
  * @description
  * What this service knows of an account of identity-service, from `user.signed-up.v1`,
- * `user.email-verified.v1` and `user.profile-updated.v1` (decision 4 of P2b). The three events
- * travel on separate subjects and may arrive in any order, so each part keeps the version of the
- * account that last set it, and an older event never overwrites a newer one.
+ * `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and
+ * `user.deleted.v1` (decision 4 of P2b, `asyncapi/identity-service.yaml`). The events travel on
+ * separate subjects and may arrive in any order, so each part keeps the version of the account
+ * that last set it, and an older event never overwrites a newer one. A deleted account keeps its
+ * entry as a former member, without name or address.
  */
 export interface DirectoryUserState {
   // #region Properties
@@ -75,5 +77,17 @@ export interface DirectoryUserState {
    * @readonly
    */
   readonly emailVersion: number;
+
+  /**
+   * Property deleted
+   *
+   * @description
+   * Whether identity-service deleted the account (`user.deleted.v1`): its name and address are
+   * forgotten, and no later event of it applies.
+   *
+   * @type {boolean}
+   * @readonly
+   */
+  readonly deleted: boolean;
   // #endregion
 }

@@ -13,7 +13,7 @@
 # NATS runs with the authorization of the broker of cadenway-ops (docs/messaging.md and
 # compose/nats/nats-server.conf there): a connection without a user is refused, and the
 # `organization` user has the same permissions as there. It publishes the subjects of the entities
-# this service owns, uses the four JetStream subjects of each of its three durable consumers of
+# this service owns, uses the four JetStream subjects of each of its five durable consumers of
 # EVENTS by their exact names and filters (create, info, next, acknowledgement; no
 # `DURABLE.CREATE`, no wildcard for a stream, a consumer or a filter), and subscribes to its own
 # inbox prefix `_INBOX.organization.>` and to `rebuild.organization.>` only. A handler whose
@@ -150,7 +150,17 @@ configs:
                   "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__project-user-profile-updated.evt.user.profile-updated.v1",
                   "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__project-user-profile-updated",
                   "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__project-user-profile-updated",
-                  "$$JS.ACK.EVENTS.organization-service__project-user-profile-updated.>"
+                  "$$JS.ACK.EVENTS.organization-service__project-user-profile-updated.>",
+
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__project-user-email-changed.evt.user.email-changed.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__project-user-email-changed",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__project-user-email-changed",
+                  "$$JS.ACK.EVENTS.organization-service__project-user-email-changed.>",
+
+                  "$$JS.API.CONSUMER.CREATE.EVENTS.organization-service__remove-deleted-user.evt.user.deleted.v1",
+                  "$$JS.API.CONSUMER.INFO.EVENTS.organization-service__remove-deleted-user",
+                  "$$JS.API.CONSUMER.MSG.NEXT.EVENTS.organization-service__remove-deleted-user",
+                  "$$JS.ACK.EVENTS.organization-service__remove-deleted-user.>"
                 ]
               }
               subscribe: { allow: ["_INBOX.organization.>", "rebuild.organization.>"] }

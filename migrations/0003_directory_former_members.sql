@@ -1,0 +1,2 @@
+ALTER TABLE "directory_users" ADD COLUMN "deleted" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "directory_users" ADD CONSTRAINT "directory_users_deleted_check" CHECK (not "directory_users"."deleted" or ("directory_users"."name" is null and "directory_users"."name_key" is null and "directory_users"."email" is null));

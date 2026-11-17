@@ -12,8 +12,11 @@ import type { DirectoryUserState } from '../../value-objects/directory/directory
  * - each event applies by the `version` of the account: a part (the name, the address and its
  *   verification) changes only for a version above the one that last set it, so a late
  *   `user.signed-up.v1` never overwrites a newer profile, and a redelivered event changes nothing;
- * - `user.signed-up.v1` sets the name and the unverified address; `user.email-verified.v1` sets
- *   the verified address; `user.profile-updated.v1` sets the name;
+ * - `user.signed-up.v1` sets the name and the unverified address; `user.email-verified.v1` and
+ *   `user.email-changed.v1` set the verified address; `user.profile-updated.v1` sets the name;
+ * - `user.deleted.v1`, the last event of the account, forgets its name and address and keeps the
+ *   entry as a former member: no later event of it applies, whatever its version, so a late event
+ *   never brings the account back (`asyncapi/identity-service.yaml`);
  * - the account is known (`isSynchronized`) once its name and its address are; an invitation is
  *   matched with its verified address only (decision 5).
  */
@@ -96,6 +99,19 @@ export class DirectoryUser {
   }
 
   /**
+   * Property isDeleted
+   *
+   * @description
+   * Whether identity-service deleted the account: a former member, without name or address.
+   *
+   * @type {boolean}
+   * @readonly
+   */
+  public get isDeleted(): boolean {
+    return this.state.deleted;
+  }
+
+  /**
    * Property snapshot
    *
    * @description
@@ -142,6 +158,7 @@ export class DirectoryUser {
       email: null,
       emailVerified: false,
       emailVersion: 0,
+      deleted: false,
     });
   }
 
@@ -153,7 +170,8 @@ export class DirectoryUser {
    *
    * @param {DirectoryUserState} state - The stored state.
    * @returns {DirectoryUser} The entry.
-   * @throws {InvalidStoredStateError} When a version is negative or a verified address is missing.
+   * @throws {InvalidStoredStateError} When a version is negative, a verified address is missing or
+   * a deleted account kept a name or an address.
    */
   public static restore(state: DirectoryUserState): DirectoryUser {
     if (state.nameVersion < 0 || state.emailVersion < 0) {
@@ -161,6 +179,12 @@ export class DirectoryUser {
     }
     if (state.emailVerified && state.email === null) {
       throw new InvalidStoredStateError('directory entry', 'a verified address is known');
+    }
+    if (state.deleted && (state.name !== null || state.email !== null)) {
+      throw new InvalidStoredStateError(
+        'directory entry',
+        'a deleted account has no name nor address',
+      );
     }
     return new DirectoryUser(state);
   }
@@ -211,6 +235,48 @@ export class DirectoryUser {
   }
 
   /**
+   * Method applyEmailChange
+   *
+   * @description
+   * Applies `user.email-changed.v1`: the new address, verified by the code sent to it, when the
+   * version is newer, as `user.email-verified.v1` is applied. From then on an invitation of the new
+   * address can be answered by the account, and one of the previous address no longer.
+   *
+   * @param {number} version - Version of the account after the change.
+   * @param {EmailAddress} email - The new address, verified.
+   * @returns {DirectoryUser} The entry after the event.
+   */
+  public applyEmailChange(version: number, email: EmailAddress): DirectoryUser {
+    return this.withEmail(version, email, true);
+  }
+
+  /**
+   * Method applyDeletion
+   *
+   * @description
+   * Applies `user.deleted.v1`: forgets the name and the address and keeps the entry as a former
+   * member. Both parts take the version of the deletion when it is newer, so a version check that
+   * knows nothing of the deletion still refuses every earlier event of the account.
+   *
+   * @param {number} version - Version of the account after the deletion, its last.
+   * @returns {DirectoryUser} The former member, or this entry when the deletion is applied already.
+   */
+  public applyDeletion(version: number): DirectoryUser {
+    if (this.state.deleted) {
+      return this;
+    }
+    return new DirectoryUser({
+      userId: this.state.userId,
+      name: null,
+      nameVersion: Math.max(this.state.nameVersion, version),
+      email: null,
+      emailVerified: false,
+      emailVersion: Math.max(this.state.emailVersion, version),
+      deleted: true,
+    });
+  }
+
+  /**
    * Method withName
    *
    * @description
@@ -218,10 +284,11 @@ export class DirectoryUser {
    *
    * @param {number} version - Version of the account that carries it.
    * @param {string} name - The name.
-   * @returns {DirectoryUser} The entry, or this one for a version already applied.
+   * @returns {DirectoryUser} The entry, or this one for a version already applied or a deleted
+   * account.
    */
   private withName(version: number, name: string): DirectoryUser {
-    if (version <= this.state.nameVersion) {
+    if (this.state.deleted || version <= this.state.nameVersion) {
       return this;
     }
     return new DirectoryUser({ ...this.state, name, nameVersion: version });
@@ -236,10 +303,11 @@ export class DirectoryUser {
    * @param {number} version - Version of the account that carries it.
    * @param {EmailAddress} email - The address.
    * @param {boolean} verified - Whether a code proved it.
-   * @returns {DirectoryUser} The entry, or this one for a version already applied.
+   * @returns {DirectoryUser} The entry, or this one for a version already applied or a deleted
+   * account.
    */
   private withEmail(version: number, email: EmailAddress, verified: boolean): DirectoryUser {
-    if (version <= this.state.emailVersion) {
+    if (this.state.deleted || version <= this.state.emailVersion) {
       return this;
     }
     return new DirectoryUser({

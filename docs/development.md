@@ -153,7 +153,7 @@ role, and assembles the application as `main.ts` does, as `organization_app` and
 `organization`. It checks the ownership and forced row-level security of the kit tables, that the
 application role reads and writes the rows of its organization only, runs no DDL and cannot touch
 the migration journal of the `drizzle` schema, that the relay runs against an empty outbox, that
-the broker enforces the permissions of cadenway-ops (the `organization` user reaches its own three
+the broker enforces the permissions of cadenway-ops (the `organization` user reaches its own five
 durable consumers only, by their exact names, so a handler without its grant cannot start), the
 health routes (readiness 503 while NATS or PostgreSQL is down and from the start of a shutdown,
 back to 200 once NATS returns) and the internal token. `tests/organizations.int-spec.ts` starts its own throwaway project the same way
@@ -163,8 +163,11 @@ role rules, the isolation between organizations and the forced row-level securit
 tables, the invitation lifecycle, the invitation email limits (the hour between two sendings, the
 100 emails of 24 hours, two concurrent batches), the events in `EVENTS`, the directory projection
 with its redeliveries and the schedule of its consumers, and the rollback of a failed creation.
-`tests/directory-redelivery.int-spec.ts` gives the directory consumers a short schedule and
-watches a failing event delivered again after each delay, then given up. They move to the
+`tests/account-changes.int-spec.ts` follows the changes of address and the deletions of accounts
+of identity-service to the member list, the memberships, `member.removed.v1` and the pending
+invitations. `tests/directory-redelivery.int-spec.ts` gives the directory consumers a short
+schedule and watches a failing event delivered again after each delay, then given up, and the
+deletion of an owner refused until its dead letter. They move to the
 fixtures of `@cadenway/nest-testing` once that package exports them.
 
 ## Minimum checks by change
