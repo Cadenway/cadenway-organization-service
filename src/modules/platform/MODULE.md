@@ -40,13 +40,15 @@ the response of a route marked `@Idempotent()` in `idempotency_keys`; no route e
 ## Events emitted
 
 None. The outbox relay of `OutboxModule` publishes the rows the use cases of the business modules
-append with `OutboxWriter.append`; `@cadenway/contracts` defines no event of this service yet, so
-nothing is appended.
+append with `OutboxWriter.append`: the events of the organizations module
+(`src/modules/organizations/MODULE.md`).
 
 ## Events consumed
 
-None. `processed_events` and `event_versions` record what the handlers of the business modules
-consumed, through the PostgreSQL deduplicator of `OutboxModule`; no handler exists yet.
+None of its own. `processed_events` records what the handlers of the business modules consumed,
+through the PostgreSQL deduplicator of `OutboxModule`: the three consumers of the organizations
+module. `event_versions` stays unused: the user directory keeps the versions of each account in
+its own rows.
 
 ## Invariants
 

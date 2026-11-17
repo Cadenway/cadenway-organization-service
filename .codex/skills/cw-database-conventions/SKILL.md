@@ -59,11 +59,13 @@ on a table that declares a policy but never forces it: every migration that crea
 of a business module or of the kit, adds `ALTER TABLE "<table>" FORCE ROW LEVEL SECURITY;` by hand,
 as `migrations/0000_platform_tables.sql` does.
 
-## Not there yet
+## Proven by tests
 
-No business table exists yet. The two roles exist in cadenway-ops (`docs/database.md` there) and in
-`compose.dev.yaml`; `tests/service-wiring.int-spec.ts` proves on the kit tables that the policies are
-forced, that one organization cannot read or write another's rows, and that the application role
-runs no DDL and cannot touch the migration journal. The same test for each business table, and the
-linting of migrations, arrive with the first business module. Until then these conventions are
-applied by review.
+The two roles exist in cadenway-ops (`docs/database.md` there) and in `compose.dev.yaml`.
+`tests/service-wiring.int-spec.ts` proves that every table with an organization has its policy
+forced, that one organization cannot read or write another's rows of the kit tables, and that the
+application role runs no DDL and cannot touch the migration journal;
+`tests/organizations.int-spec.ts` proves the same isolation on `organizations`, `members` and
+`invitations`. `organizations` carries its policy on `id`, the organization itself; the user
+directory (`directory_users`) belongs to no organization and carries none. The linting of
+migrations is not there yet: these conventions are also applied by review.

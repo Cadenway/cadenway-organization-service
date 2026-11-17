@@ -22,14 +22,14 @@ The structure and workflows below describe the bootstrap target. Check the check
 
 cadenway-organization-service owns organizations and who belongs to them. NestJS, its own PostgreSQL database (one database with a migrator role and an application role in the shared PostgreSQL of the VPS), events over NATS JetStream through `@cadenway/nest-messaging`, internal REST for the API gateway. Local port 3011.
 
-|            |                                                                                                                                                                           |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Data       | Organizations (name, address slug, logo, language), members and roles, invitations and invite link, guests, verified domains, security policies, the audit log (90 days). |
-| API        | Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export.                                                              |
-| Emits      | `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified`                             |
-| Listens to | events relevant to the audit log, `subscription.changed` (updates seat count)                                                                                             |
-| External   | DNS lookups for domain verification (TXT record).                                                                                                                         |
-| Phase      | First version                                                                                                                                                             |
+|            |                                                                                                                                                                                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data       | Organizations (name, address slug, logo, language), members and roles, invitations and invite link, guests, verified domains, security policies, the audit log (90 days).                                                                                                                   |
+| API        | Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export.                                                                                                                                                                                |
+| Emits      | `organization.created.v1`, `organization.updated.v1`, `member.joined.v1`, `member.role-changed.v1`, `member.removed.v1`, `invitation.issued.v1` (`asyncapi/organization-service.yaml`); later phases add their own versioned events (deletion, verified domains) once the contract has them |
+| Listens to | `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1` of identity-service, for the user directory; later phases add the seat count of billing-service and the audit log once the contract has their events                                                               |
+| External   | DNS lookups for domain verification (TXT record).                                                                                                                                                                                                                                           |
+| Phase      | First version                                                                                                                                                                                                                                                                               |
 
 Built in this repository from the start: it never lives as a module of another service.
 

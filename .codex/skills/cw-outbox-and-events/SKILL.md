@@ -8,9 +8,10 @@ description: "How to publish and consume events reliably with @cadenway/nest-mes
 The wiring is in place (`src/app.module.ts`): `MessagingModule` connects as the NATS user
 `organization`, `OutboxModule` provides the writer, the relay and the deduplicator, and the platform
 module (`src/modules/platform`) brings their tables into the migrations. The README of
-`@cadenway/nest-messaging` is the reference for every call below. No event of this service exists
-in `@cadenway/contracts` yet: an event is published or consumed only once its AsyncAPI spec is
-released (`cw-contract-first`).
+`@cadenway/nest-messaging` is the reference for every call below. The organizations module publishes
+the events of `asyncapi/organization-service.yaml` and consumes the account events of
+identity-service (its `MODULE.md`); any other event is published or consumed only once its AsyncAPI
+spec is released (`cw-contract-first`).
 
 ## Publishing
 
@@ -30,7 +31,9 @@ released (`cw-contract-first`).
    ```
 2. An event with an organization is appended in a tenant transaction of that organization; one
    without (`organizationId: null`) in a system transaction only: row-level security refuses it in
-   a tenant one.
+   a tenant one. The one exception is the creation of an organization: it has no tenant transaction
+   yet (PostgreSQL assigns its id on insert), so it appends its events in its system transaction,
+   which the kit accepts (`src/modules/organizations/MODULE.md`).
 3. The relay publishes the row after the commit, on `evt.<event-name>` with `Nats-Msg-Id` set to the
    event id and the `traceparent` of the use case. `relay.wake()` after the commit publishes now
    instead of at the next poll (one second).
@@ -39,18 +42,17 @@ released (`cw-contract-first`).
 
 ## Consuming
 
-1. Register the handler from `onApplicationBootstrap` of a provider of the `api/messaging/` layer,
-   with the injected `EventConsumers`. It gets the durable consumer
-   `organization-service__<handler>`, filtered on the one subject of its event:
+1. Register the handler from `onApplicationBootstrap` of a provider of
+   `presentation/messaging/handlers/<event-family>/`, with the injected `EventConsumers`. It gets
+   the durable consumer `organization-service__<handler>`, filtered on the one subject of its event
+   (`src/modules/organizations/presentation/messaging/handlers/users/`):
 
    ```ts
    await this.consumers.subscribe({
-     handler: 'update-seat-count',
+     handler: 'project-user-signed-up',
      schemas: eventSchemas,
-     event: 'subscription.changed.v1',
-     handle: async (payload, { claimVersion }) => {
-       /* call the use case */
-     },
+     event: 'user.signed-up.v1',
+     handle: (payload) => this.projectUserSignUp.execute({ ... }),
    });
    ```
 2. The deduplicator of `OutboxModule` records `(consumer, event id)` in `processed_events` in the
@@ -82,8 +84,9 @@ released (`cw-contract-first`).
 Subjects (`evt.<name>`), durable pull consumers (`<service>__<handler>`), `Nats-Msg-Id`
 deduplication, the retry schedule, the dead-letter copy and `traceparent` propagation belong to
 `@cadenway/nest-messaging`. The three streams (`EVENTS`, `EVENTS_RESTRICTED`, `EVENTS_DLQ`) and the
-permissions of the `organization` user (publish `evt.organization.>`, `evt.member.>` and
-`evt.domain.>`, subscribe `_INBOX.organization.>` and `rebuild.organization.>`) belong to
+permissions of the `organization` user (publish `evt.organization.>`, `evt.member.>`,
+`evt.invitation.>` and `evt.domain.>`, subscribe `_INBOX.organization.>` and
+`rebuild.organization.>`) belong to
 cadenway-ops (`docs/messaging.md`). This service runs with `manageStreams: false` and
 `deadLetterWorker: false`: never declare a stream, a consumer or a subject here. An event of a new
 entity needs its `evt.<entity>.>` in cadenway-ops first.

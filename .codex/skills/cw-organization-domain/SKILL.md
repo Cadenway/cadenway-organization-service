@@ -13,9 +13,9 @@ Organizations and who belongs to them.
 
 **API**: Organizations, members, roles, invitations, domains, ownership transfer, deletion, audit log and CSV export.
 
-**Events emitted**: `organization.created`, `organization.deleted`, `member.invited`, `member.joined`, `member.role-changed`, `member.removed`, `domain.verified`.
+**Events emitted**: `organization.created.v1`, `organization.updated.v1`, `member.joined.v1`, `member.role-changed.v1`, `member.removed.v1`, `invitation.issued.v1` (`asyncapi/organization-service.yaml`; none restricted). Later phases (deletion, verified domains) add their own versioned events once `cadenway-api-contracts` publishes them.
 
-**Events consumed**: events relevant to the audit log, `subscription.changed` (updates seat count).
+**Events consumed**: `user.signed-up.v1`, `user.email-verified.v1` and `user.profile-updated.v1` of identity-service, into the user directory (names and addresses of the members, the verified address that accepts an invitation). Later phases add the seat count of billing-service and the audit log once their events exist in the contract.
 
 **External systems**: DNS lookups for domain verification (TXT record).
 
@@ -23,8 +23,11 @@ Organizations and who belongs to them.
 
 ## Rules this service guards
 
-- Any address outside the verified domains (ateliernord.fr, lumen.coop in fixtures) is a guest; guests take no seat.
-- The owner role cannot be removed; transferring ownership requires choosing a member.
+- Roles (decision 1 of P2b): `owner` (the creator, one per organization), `admin`, `member`, `guest`. The owner and the admins update the organization, invite, see the pending invitations, change roles and remove members; members read the member list; guests do not. Nobody changes the role of the owner or removes them, and nobody becomes owner by a change of role. This service decides it from its own members, never from the token.
+- Guests take no seat: `memberCount` counts owner, admins and members. Inviting as a guest is explicit in P2b; making any address outside the verified domains (ateliernord.fr, lumen.coop in fixtures) a guest arrives with the verified domains, in a later phase.
+- An invitation is valid 7 days; a resend starts them again; it is accepted only by the account whose verified address is the invited one (decision 5).
+- A resource of another organization answers 404, never 403 (decision 9). The address slug is unique across organizations (decision 10).
+- Transferring ownership requires choosing a member (later phase).
 - Deleting the organization requires typing its exact name.
 - Audit entries are kept 90 days.
 
@@ -32,7 +35,7 @@ Organizations and who belongs to them.
 
 Built in this repository from the start: it never lives as a module of another service.
 
-Decided: the authentication policies (required MFA, session lifetime, allowed sign-in methods) and the SAML connections belong to cadenway-identity-service, which enforces them: the "security policies" of the data above are not stored here. For the Share dialog this service supplies the directory of members and guests; access grants on spaces and lists, access requests and favorites belong to cadenway-task-service. It keeps a projection of user profiles from `user.profile-updated` and `user.deleted`.
+Decided: the authentication policies (required MFA, session lifetime, allowed sign-in methods) and the SAML connections belong to cadenway-identity-service, which enforces them: the "security policies" of the data above are not stored here. For the Share dialog this service supplies the directory of members and guests; access grants on spaces and lists, access requests and favorites belong to cadenway-task-service. It keeps a user directory projected from `user.signed-up.v1`, `user.email-verified.v1` and `user.profile-updated.v1`; the contract has no account deletion event yet (P2c).
 
 Everything above comes from the [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N) and the
 [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et). When the mockup and this skill disagree, the mockup wins and

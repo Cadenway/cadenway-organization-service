@@ -1,0 +1,46 @@
+import type { DirectoryUser } from '../../../../../domain/aggregates/directory-user/directory-user.aggregate.js';
+
+/**
+ * Interface DirectoryRepository
+ *
+ * @description
+ * The user directory, bound to the transaction of a unit of work. An entry belongs to no
+ * organization: every method names its account.
+ */
+export interface DirectoryRepository {
+  // #region Methods
+  /**
+   * Method find
+   *
+   * @description
+   * Loads the entry of an account without a lock.
+   *
+   * @param {string} userId - The account.
+   * @returns {Promise<DirectoryUser | null>} The entry, or `null` when no event of it was applied.
+   */
+  find(userId: string): Promise<DirectoryUser | null>;
+
+  /**
+   * Method lock
+   *
+   * @description
+   * Loads the entry of an account and locks it until the end of the transaction, creating an empty
+   * one first when none exists, so that two events of one account apply one after the other.
+   *
+   * @param {string} userId - The account.
+   * @returns {Promise<DirectoryUser>} The locked entry.
+   */
+  lock(userId: string): Promise<DirectoryUser>;
+
+  /**
+   * Method save
+   *
+   * @description
+   * Writes an entry locked by `lock`.
+   *
+   * @param {DirectoryUser} user - The entry after the event.
+   * @returns {Promise<void>} Resolves once written.
+   */
+  save(user: DirectoryUser): Promise<void>;
+  // #endregion
+}
