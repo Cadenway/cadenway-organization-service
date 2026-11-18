@@ -36,7 +36,13 @@ describe('ChangeMemberRole and RemoveMember', () => {
       expectedVersion: [1],
     });
 
-    expect(changed).toMatchObject({ name: 'Hugo Dubois', role: 'guest', version: 2 });
+    // The admin who changes it sees the two-step verification of the member, as in the list.
+    expect(changed).toMatchObject({
+      name: 'Hugo Dubois',
+      role: 'guest',
+      version: 2,
+      twoStepVerificationEnabled: false,
+    });
     expect(scenario.store.eventsNamed('member.role-changed.v1')[0]?.payload).toMatchObject({
       role: 'guest',
       previousRole: 'member',

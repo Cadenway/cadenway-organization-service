@@ -5,6 +5,7 @@ import { unitOfWorkProvider } from './composition/providers/adapters/organizatio
 import { projectEmailChangeProvider } from './composition/providers/use-cases/directory/project-email-change.provider.js';
 import { projectEmailVerificationProvider } from './composition/providers/use-cases/directory/project-email-verification.provider.js';
 import { projectProfileUpdateProvider } from './composition/providers/use-cases/directory/project-profile-update.provider.js';
+import { projectTwoStepVerificationChangeProvider } from './composition/providers/use-cases/directory/project-two-step-verification-change.provider.js';
 import { projectUserSignUpProvider } from './composition/providers/use-cases/directory/project-user-sign-up.provider.js';
 import { acceptInvitationProvider } from './composition/providers/use-cases/invitations/accept-invitation.provider.js';
 import { inviteMembersProvider } from './composition/providers/use-cases/invitations/invite-members.provider.js';
@@ -31,6 +32,7 @@ import { UserEmailChangedHandler } from './presentation/messaging/handlers/users
 import { UserEmailVerifiedHandler } from './presentation/messaging/handlers/users/user-email-verified.handler.js';
 import { UserProfileUpdatedHandler } from './presentation/messaging/handlers/users/user-profile-updated.handler.js';
 import { UserSignedUpHandler } from './presentation/messaging/handlers/users/user-signed-up.handler.js';
+import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/handlers/users/user-two-step-verification-changed.handler.js';
 
 /**
  * Class OrganizationsModule
@@ -70,11 +72,13 @@ import { UserSignedUpHandler } from './presentation/messaging/handlers/users/use
     projectEmailVerificationProvider,
     projectProfileUpdateProvider,
     projectEmailChangeProvider,
+    projectTwoStepVerificationChangeProvider,
     removeDeletedUserProvider,
     UserSignedUpHandler,
     UserEmailVerifiedHandler,
     UserProfileUpdatedHandler,
     UserEmailChangedHandler,
+    UserTwoStepVerificationChangedHandler,
     UserDeletedHandler,
   ],
 })

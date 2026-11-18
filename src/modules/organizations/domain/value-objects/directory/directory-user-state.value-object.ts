@@ -3,11 +3,12 @@
  *
  * @description
  * What this service knows of an account of identity-service, from `user.signed-up.v1`,
- * `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and
- * `user.deleted.v1` (decision 4 of P2b, `asyncapi/identity-service.yaml`). The events travel on
- * separate subjects and may arrive in any order, so each part keeps the version of the account
- * that last set it, and an older event never overwrites a newer one. A deleted account keeps its
- * entry as a former member, without name or address.
+ * `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1`,
+ * `user.two-step-verification-changed.v1` and `user.deleted.v1` (decision 4 of P2b,
+ * `asyncapi/identity-service.yaml`). The events travel on separate subjects and may arrive in any
+ * order, so each part keeps the version of the account that last set it, and an older event never
+ * overwrites a newer one. A deleted account keeps its entry as a former member, without name,
+ * address or two-step verification.
  */
 export interface DirectoryUserState {
   // #region Properties
@@ -77,6 +78,30 @@ export interface DirectoryUserState {
    * @readonly
    */
   readonly emailVersion: number;
+
+  /**
+   * Property twoStepVerificationEnabled
+   *
+   * @description
+   * Whether the account has two-step verification, the `enabled` of
+   * `user.two-step-verification-changed.v1`; `false` until an event says otherwise. The only part
+   * of that event the directory keeps.
+   *
+   * @type {boolean}
+   * @readonly
+   */
+  readonly twoStepVerificationEnabled: boolean;
+
+  /**
+   * Property twoStepVerificationVersion
+   *
+   * @description
+   * Version of the account that set `twoStepVerificationEnabled`; 0 before any.
+   *
+   * @type {number}
+   * @readonly
+   */
+  readonly twoStepVerificationVersion: number;
 
   /**
    * Property deleted

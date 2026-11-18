@@ -36,9 +36,10 @@ export interface DirectoryRedelivery {
  * Constant DIRECTORY_REDELIVERY
  *
  * @description
- * The schedule of the three consumers of the directory (decision 3 of the P2b security
- * follow-ups): the directory decides which account accepts an invitation, so an event of
- * identity-service is not given up before 24 hours. 1 s, 5 s, 30 s, 2 min, 10 min, 30 min, then
+ * The schedule of every consumer of the directory (decision 3 of the P2b security follow-ups): the
+ * directory decides which account accepts an invitation and tells the owner and the admins who has
+ * two-step verification, so an event of identity-service is not given up before 24 hours. 1 s,
+ * 5 s, 30 s, 2 min, 10 min, 30 min, then
  * every hour, 32 deliveries: the 31 redeliveries wait 92,556 s, about 25 h 43 min, before the dead
  * letter, the schedule the README of `@cadenway/nest-messaging` gives for security projections.
  *

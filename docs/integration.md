@@ -16,7 +16,7 @@ Organizations and who belongs to them.
 
 **Events emitted**: `organization.created.v1`, `organization.updated.v1`, `member.joined.v1`, `member.role-changed.v1`, `member.removed.v1`, `invitation.issued.v1` (`asyncapi/organization-service.yaml`; none restricted). Later phases (deletion, verified domains) add their own versioned events once `cadenway-api-contracts` publishes them.
 
-**Events consumed**: `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1` and `user.email-changed.v1` of identity-service, into the user directory (names and addresses of the members, the verified address that accepts an invitation), and `user.deleted.v1`, which removes the memberships of a deleted account and keeps it in the directory as « Ancien membre ». Later phases add the seat count of billing-service and the audit log once their events exist in the contract.
+**Events consumed**: `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and `user.two-step-verification-changed.v1` of identity-service, into the user directory (names and addresses of the members, the verified address that accepts an invitation, whether each account has two-step verification, which only the owner and the admins see), and `user.deleted.v1`, which removes the memberships of a deleted account and keeps it in the directory as « Ancien membre ». Later phases add the seat count of billing-service and the audit log once their events exist in the contract.
 
 **External systems**: DNS lookups for domain verification (TXT record).
 
@@ -37,7 +37,7 @@ Organizations and who belongs to them.
 
 Built in this repository from the start: it never lives as a module of another service.
 
-Decided: the authentication policies (required MFA, session lifetime, allowed sign-in methods) and the SAML connections belong to cadenway-identity-service, which enforces them: the "security policies" of the data above are not stored here. For the Share dialog this service supplies the directory of members and guests; access grants on spaces and lists, access requests and favorites belong to cadenway-task-service. It keeps a user directory projected from `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1` and `user.email-changed.v1`; on `user.deleted.v1` it removes the memberships of the account and forgets its name and address (P2c).
+Decided: the authentication policies (required MFA, session lifetime, allowed sign-in methods) and the SAML connections belong to cadenway-identity-service, which enforces them: the "security policies" of the data above are not stored here. For the Share dialog this service supplies the directory of members and guests; access grants on spaces and lists, access requests and favorites belong to cadenway-task-service. It keeps a user directory projected from `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and `user.two-step-verification-changed.v1` (only its `enabled`, P2c-2); on `user.deleted.v1` it removes the memberships of the account and forgets its name and address (P2c).
 
 Everything above comes from the [repositories document](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N) and the
 [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et). If the mockup disagrees with this guide, update the guide and its source skill for both assistants.

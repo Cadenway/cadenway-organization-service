@@ -20,7 +20,8 @@ paths:
 - Events emitted by this service: `organization.created.v1`, `organization.updated.v1`,
   `member.joined.v1`, `member.role-changed.v1`, `member.removed.v1`, `invitation.issued.v1`.
 - Events consumed by this service: `user.signed-up.v1`, `user.email-verified.v1`,
-  `user.profile-updated.v1`, `user.email-changed.v1`, `user.deleted.v1`.
+  `user.profile-updated.v1`, `user.email-changed.v1`, `user.two-step-verification-changed.v1`,
+  `user.deleted.v1`.
 - A new event starts in `asyncapi/` of cadenway-api-contracts.
 
 ## Review example

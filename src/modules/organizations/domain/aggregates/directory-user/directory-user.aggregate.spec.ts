@@ -14,12 +14,18 @@ const SHORTER: EmailAddress = EmailAddress.parse('camille@ateliernord.fr');
 /** An event of the account of Camille Martin, as the directory applies it. */
 type AccountEvent = (user: DirectoryUser) => DirectoryUser;
 
-/** The events of a sign-up replaced once, verified, then renamed, in the order of identity. */
+/**
+ * The events of a sign-up replaced once, verified, renamed, then two-step verification turned on,
+ * off and on again, in the order of identity.
+ */
 const HISTORY: readonly AccountEvent[] = [
   (user) => user.applySignUp(1, CAMILLE, 'Camille M.'),
   (user) => user.applySignUp(2, CAMILLE, 'Camille Martin'),
   (user) => user.applyEmailVerification(3, CAMILLE),
   (user) => user.applyProfileUpdate(4, 'Camille Martin-Durand'),
+  (user) => user.applyTwoStepVerificationChange(5, true),
+  (user) => user.applyTwoStepVerificationChange(6, false),
+  (user) => user.applyTwoStepVerificationChange(7, true),
 ];
 
 describe('DirectoryUser', () => {
@@ -58,11 +64,13 @@ describe('DirectoryUser', () => {
       email: CAMILLE.value,
       emailVerified: true,
       emailVersion: 3,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 0,
       deleted: false,
     });
   });
 
-  test.prop([fc.shuffledSubarray([0, 1, 2, 3], { minLength: 4, maxLength: 4 })])(
+  test.prop([fc.shuffledSubarray([0, 1, 2, 3, 4, 5, 6], { minLength: 7, maxLength: 7 })])(
     'reaches the same entry whatever the order the events arrive in',
     (order: number[]) => {
       let user: DirectoryUser = DirectoryUser.unknown('camille');
@@ -76,10 +84,37 @@ describe('DirectoryUser', () => {
         email: CAMILLE.value,
         emailVerified: true,
         emailVersion: 3,
+        twoStepVerificationEnabled: true,
+        twoStepVerificationVersion: 7,
         deleted: false,
       });
     },
   );
+
+  it('applies the two-step verification by version, whatever the change, and each one once', () => {
+    const enabled: DirectoryUser = DirectoryUser.unknown('camille')
+      .applySignUp(1, CAMILLE, 'Camille Martin')
+      .applyTwoStepVerificationChange(8, true);
+
+    expect(DirectoryUser.unknown('camille').twoStepVerificationEnabled).toBe(false);
+    expect(enabled.twoStepVerificationEnabled).toBe(true);
+    expect(enabled.snapshot).toMatchObject({
+      twoStepVerificationEnabled: true,
+      twoStepVerificationVersion: 8,
+      nameVersion: 1,
+      emailVersion: 1,
+    });
+    // A redelivery and an older event change nothing; a newer one applies.
+    expect(enabled.applyTwoStepVerificationChange(8, true)).toBe(enabled);
+    expect(enabled.applyTwoStepVerificationChange(7, false)).toBe(enabled);
+    expect(enabled.applyTwoStepVerificationChange(10, false).twoStepVerificationEnabled).toBe(
+      false,
+    );
+    // The other parts keep their own versions: a newer two-step event leaves the name alone.
+    expect(enabled.applyProfileUpdate(2, 'Camille Martin-Durand').name).toBe(
+      'Camille Martin-Durand',
+    );
+  });
 
   it('trusts a changed address at once, by version, as a verified one', () => {
     const verified: DirectoryUser = DirectoryUser.unknown('camille')
@@ -95,10 +130,11 @@ describe('DirectoryUser', () => {
     expect(verified.applyEmailChange(2, SHORTER)).toBe(verified);
   });
 
-  it('forgets the name and the address of a deleted account, and applies nothing after it', () => {
+  it('forgets the name, the address and the two-step verification of a deleted account, and applies nothing after it', () => {
     const deleted: DirectoryUser = DirectoryUser.unknown('camille')
       .applySignUp(1, CAMILLE, 'Camille Martin')
       .applyEmailVerification(2, CAMILLE)
+      .applyTwoStepVerificationChange(3, true)
       .applyDeletion(7);
 
     expect(deleted.snapshot).toEqual({
@@ -108,8 +144,11 @@ describe('DirectoryUser', () => {
       email: null,
       emailVerified: false,
       emailVersion: 7,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 7,
       deleted: true,
     });
+    expect(deleted.applyTwoStepVerificationChange(8, true)).toBe(deleted);
     expect(deleted.isDeleted).toBe(true);
     expect(deleted.isSynchronized).toBe(false);
     expect(deleted.verifiedEmail).toBeNull();
@@ -136,6 +175,9 @@ describe('DirectoryUser', () => {
       InvalidStoredStateError,
     );
     expect(() => DirectoryUser.restore({ ...state, nameVersion: -1 })).toThrow(
+      InvalidStoredStateError,
+    );
+    expect(() => DirectoryUser.restore({ ...state, twoStepVerificationVersion: -1 })).toThrow(
       InvalidStoredStateError,
     );
   });

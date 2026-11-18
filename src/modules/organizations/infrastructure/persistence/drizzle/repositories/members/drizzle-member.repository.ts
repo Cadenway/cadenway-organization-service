@@ -24,7 +24,8 @@ import { members } from '../../schemas/members/member.schema.js';
  * Interface MemberListRow
  *
  * @description
- * A row of the member list: the membership, the name and address of its account, and its sort key.
+ * A row of the member list: the membership, the name, address and two-step verification of its
+ * account, and its sort key.
  */
 interface MemberListRow extends MemberView {
   // #region Properties
@@ -69,6 +70,7 @@ const MEMBER_COLUMNS: {
   readonly role: typeof members.role;
   readonly joinedAt: typeof members.joinedAt;
   readonly version: typeof members.version;
+  readonly twoStepVerificationEnabled: SQL<boolean>;
   readonly sortKey: SQL<string>;
 } = {
   id: members.id,
@@ -78,6 +80,7 @@ const MEMBER_COLUMNS: {
   role: members.role,
   joinedAt: members.joinedAt,
   version: members.version,
+  twoStepVerificationEnabled: sql<boolean>`coalesce(${directoryUsers.twoStepVerificationEnabled}, false)`,
   sortKey: SORT_KEY,
 };
 
@@ -113,6 +116,7 @@ function toMemberView(row: MemberListRow): MemberView {
     role: row.role,
     joinedAt: row.joinedAt,
     version: row.version,
+    twoStepVerificationEnabled: row.twoStepVerificationEnabled,
   };
 }
 
@@ -365,7 +369,7 @@ export class DrizzleMemberRepository implements MemberRepository {
    * Method view
    *
    * @description
-   * Reads an active member with the name and address of its account.
+   * Reads an active member with the name, address and two-step verification of its account.
    *
    * @param {string} organizationId - The organization.
    * @param {string} memberId - Id of the membership.

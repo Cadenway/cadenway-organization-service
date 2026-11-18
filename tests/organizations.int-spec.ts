@@ -364,6 +364,7 @@ describe('organizations, members and invitations', () => {
         'project-user-email-verified',
         'project-user-profile-updated',
         'project-user-email-changed',
+        'project-user-two-step',
         'remove-deleted-user',
       ]) {
         expect(stack.consumer(`organization-service__${handler}`).config).toMatchObject({
@@ -782,6 +783,7 @@ describe('organizations, members and invitations', () => {
         role: 'admin',
         joinedAt: expect.any(String) as string,
         version: 2,
+        twoStepVerificationEnabled: false,
       });
       const event = await published(
         'member.role-changed.v1',
@@ -1138,6 +1140,7 @@ describe('organizations, members and invitations', () => {
         role: 'owner',
         joinedAt: expect.any(String) as string,
         version: 1,
+        twoStepVerificationEnabled: false,
       });
       expect(page.total).toBe(5);
       expect(page.counts).toEqual({ owner: 1, admin: 1, member: 2, guest: 1 });

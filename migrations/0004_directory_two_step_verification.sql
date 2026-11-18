@@ -1,0 +1,3 @@
+ALTER TABLE "directory_users" ADD COLUMN "two_step_verification_enabled" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "directory_users" ADD COLUMN "two_step_verification_version" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "directory_users" ADD CONSTRAINT "directory_users_two_step_verification_version_check" CHECK ("directory_users"."two_step_verification_version" >= 0);

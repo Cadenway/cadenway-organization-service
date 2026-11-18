@@ -77,9 +77,9 @@ const allTables = [...platformTables, ...businessTables].sort();
 
 /**
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
- * invitation emails, then the former members of the user directory.
+ * invitation emails, the former members of the user directory, then its two-step verification.
  */
-const migrationCount = 4;
+const migrationCount = 5;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -631,6 +631,7 @@ describe('organization-service wiring', () => {
       'project-user-email-verified',
       'project-user-profile-updated',
       'project-user-email-changed',
+      'project-user-two-step',
       'remove-deleted-user',
     ]) {
       expect(

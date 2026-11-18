@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Organizations and who belongs to them, for P2b of the plan and the account changes of P2c:
+Organizations and who belongs to them, for P2b of the plan and the account changes of P2c and
+P2c-2:
 
 - organizations: profile ("Profil de l'organisation": name, address slug, description, website,
   default language), the plan `free` until billing exists, the answers of the creation form and
@@ -12,10 +13,11 @@ Organizations and who belongs to them, for P2b of the plan and the account chang
 - invitations: an address invited with a role, valid 7 days, resent at most once an hour, revoked,
   accepted or refused, and the ledger of the invitation emails that holds each organization to 100
   of them in any 24 hours;
-- the user directory: the name, the address and its verification of every account of
-  identity-service, projected from its events, to show the members and match the invitations; a
-  deleted account loses its memberships and stays in the directory as a former member, without
-  name or address.
+- the user directory: the name, the address and its verification, and whether two-step
+  verification is on, of every account of identity-service, projected from its events, to show the
+  members ("Deux étapes" for the owner and the admins) and match the invitations; a deleted account
+  loses its memberships and stays in the directory as a former member, without name, address or
+  two-step verification.
 
 One module, four areas: the creation writes an organization, its owner and its invitations in one
 transaction, an acceptance writes an invitation and a membership, and the member list sorts and
@@ -32,7 +34,7 @@ audit log are later phases.
 | ----------- | --------- |
 | None        | None      |
 
-`organizations.module.ts` registers the four HTTP controllers, the five event handlers and the
+`organizations.module.ts` registers the four HTTP controllers, the six event handlers and the
 providers of the module; no other module imports it.
 
 ## Owned tables
@@ -48,11 +50,15 @@ providers of the module; no other module imports it.
 Created by `migrations/0001_organizations_members_invitations.sql` and
 `migrations/0002_invitation_emails.sql`, with the `FORCE ROW LEVEL SECURITY` statements added by
 hand; `migrations/0003_directory_former_members.sql` adds `directory_users.deleted` (default
-`false`) and the check that a deleted entry keeps no name, search key nor address. One owner at
-most per organization (partial unique index). `user_id` and `invited_by_user_id` name accounts of
-identity-service without a foreign key; the foreign keys stay inside the module. `name_key`
-columns hold `searchKeyOf` of the names, the sort and search key. The application role
-`organization_app` reads and writes the rows and runs no DDL.
+`false`) and the check that a deleted entry keeps no name, search key nor address;
+`migrations/0004_directory_two_step_verification.sql` adds
+`directory_users.two_step_verification_enabled` (default `false`) and
+`two_step_verification_version` (default `0`, checked not negative). No check ties the flag to
+`deleted`: a replica of the previous release deletes an account without knowing the column, and
+must not fail on it. One owner at most per organization (partial unique index). `user_id` and
+`invited_by_user_id` name accounts of identity-service without a foreign key; the foreign keys
+stay inside the module. `name_key` columns hold `searchKeyOf` of the names, the sort and search
+key. The application role `organization_app` reads and writes the rows and runs no DDL.
 
 `invitation_emails` is the ledger of the daily allowance of invitation emails: one row per issue
 (batch or creation) and per resend, with the organization, the invitation and the instant, never
@@ -87,6 +93,11 @@ tenant transaction; "none" routes ignore it.
 | `POST /internal/v1/users/{userId}/invitations/{id}/accept` | None         | 200                     | 400, 403 `invitation.email-mismatch`, 404 `invitation.not-found`, `user.not-found`, 409 `invitation.revoked`, `invitation.answered`, `invitation.expired` |
 | `POST /internal/v1/users/{userId}/invitations/{id}/refuse` | None         | 204                     | As the acceptance                                                                                                                                         |
 
+`Member` carries `twoStepVerificationEnabled`, from the user directory, only when the actor is the
+owner or an admin: in the list, the reading of a member and the answer of a change of role (which
+only they make). For any other actor the field is absent from the answer, never `null` nor
+`false` (`openapi/internal/organization-service.yaml`, `Member`); the gateway passes it on as is.
+
 Every route also answers the 401 and 403 of the internal token guard. The titles are the English
 reason phrases; the gateway answers the French titles of the public specs. A 429 carries
 `Retry-After`, the seconds until `details.resendAvailableAt` or `details.nextAvailableAt`, rounded
@@ -119,29 +130,50 @@ the seven days the stream holds when it starts; a consumer that needs the member
 
 ## Events consumed
 
-| Event                     | Durable consumer                                     | Effect                         |
-| ------------------------- | ---------------------------------------------------- | ------------------------------ |
-| `user.signed-up.v1`       | `organization-service__project-user-signed-up`       | Name and address, not verified |
-| `user.email-verified.v1`  | `organization-service__project-user-email-verified`  | Verified address               |
-| `user.profile-updated.v1` | `organization-service__project-user-profile-updated` | Name                           |
-| `user.email-changed.v1`   | `organization-service__project-user-email-changed`   | Verified address               |
-| `user.deleted.v1`         | `organization-service__remove-deleted-user`          | Memberships removed, forgotten |
+| Event                                   | Durable consumer                                     | Effect                          |
+| --------------------------------------- | ---------------------------------------------------- | ------------------------------- |
+| `user.signed-up.v1`                     | `organization-service__project-user-signed-up`       | Name and address, not verified  |
+| `user.email-verified.v1`                | `organization-service__project-user-email-verified`  | Verified address                |
+| `user.profile-updated.v1`               | `organization-service__project-user-profile-updated` | Name                            |
+| `user.email-changed.v1`                 | `organization-service__project-user-email-changed`   | Verified address                |
+| `user.two-step-verification-changed.v1` | `organization-service__project-user-two-step`        | Two-step verification on or off |
+| `user.deleted.v1`                       | `organization-service__remove-deleted-user`          | Memberships removed, forgotten  |
 
 - Each handler starts from what `EVENTS` still holds (`deliverPolicy: 'all'`): a new deployment
   learns the accounts of the last seven days before it started, not only the next ones.
 - The deduplicator of `OutboxModule` records `(consumer, event id)` in `processed_events` in the
   system transaction of the delivery, with the effect: a redelivery is skipped. The events travel
   on separate subjects and consumers, so `claimVersion` (per consumer) cannot order them: each
-  part of an entry keeps the version of the account that set it (`name_version`, `email_version`)
-  and an older event never overwrites a newer one, whatever the order of arrival.
-  `user.email-changed.v1` sets the address, verified, by version, as `user.email-verified.v1`
-  does; its name, device and previous address are for notification-service and are not read.
+  part of an entry keeps the version of the account that set it (`name_version`, `email_version`,
+  `two_step_verification_version`) and an older event never overwrites a newer one, whatever the
+  order of arrival. `user.email-changed.v1` sets the address, verified, by version, as
+  `user.email-verified.v1` does; its name, device and previous address are for
+  notification-service and are not read.
+- `user.two-step-verification-changed.v1` sets `two_step_verification_enabled` from its `enabled`,
+  by version, whatever its `change` (a value this service does not know included, as the contract
+  asks), for the column "Deux étapes"; an account no such event reached is `false`. **Data
+  minimisation**: the handler reads `userId`, `version` and `enabled` only. The device and the IP
+  address (`client`), the address and the name (`recipient`), the language, the time zone, the
+  methods, the backup codes left and the security key are for the email of notification-service:
+  they are never passed to the use case, stored, nor logged here (the kit logs no payload). They
+  still reach this service on the wire, and a dead letter of this consumer keeps the whole message
+  in `EVENTS_DLQ` (30 days), as for every event of `EVENTS` (the kit drops the body of restricted
+  events only): an open question left to the user in P2c-2, for cadenway-api-contracts,
+  cadenway-service-kit and cadenway-ops.
+  Accounts that turned two-step verification on before the stream retention of their event and
+  before this module first consumed it stay `false` until their next change (see "Beyond the
+  retention of the stream"). **Deployment prerequisite**: this module's release runs in an
+  environment before the gateway exposes the setup routes of two-step verification there, so that
+  no such account exists; nothing here enforces it.
 - `user.deleted.v1` (decision 9 of P2c), in one system transaction: the directory entry is locked,
   every active membership of the account is locked and removed with its `member.removed.v1`, and
-  the entry forgets the name and the address and becomes a former member (`deleted`), its versions
-  raised to the one of the deletion. A deleted entry ends the work at once, so the same deletion
-  applied again, under another event id, changes nothing; no later event of the account applies,
-  whatever its version, so a late event never brings it back.
+  the entry forgets the name, the address and the two-step verification and becomes a former
+  member (`deleted`), its versions raised to the one of the deletion. A deleted entry ends the
+  work at once, so the same deletion applied again, under another event id, changes nothing; no
+  later event of the account applies, whatever its version, so a late event never brings it back.
+  A deletion a replica of the previous release applies during the rollout leaves
+  `two_step_verification_enabled` as it was: the entry has no membership left, so the flag is never
+  answered; a later release may clear such rows in batches.
 - The entry is locked (`select … for update` after an `insert … on conflict do nothing`), so two
   events of one account apply one after the other. The acceptance of an invitation and the
   creation of an organization hold the entry of their actor in share mode (`select … for share`)
@@ -156,19 +188,22 @@ the seven days the stream holds when it starts; a consumer that needs the member
   the README of `@cadenway/nest-messaging` gives for security projections. The two consumers of P2c
   use the same schedule: the address decides which account accepts an invitation, and the
   deletion stops the access of the account to its organizations (identity-service stops it on
-  `member.removed.v1`). The kit applies it with `nak(delay)` and sets `max_deliver` to 32 on each
-  consumer when the service starts, in place.
+  `member.removed.v1`). So does the consumer of P2c-2: the owner and the admins read the two-step
+  verification of their members from it, a security signal a lost event would misreport. The kit
+  applies it with `nak(delay)` and sets `max_deliver` to 32 on each consumer when the service
+  starts, in place.
   **A rollout of this schedule, or of any change to it, must replace every replica**: a replica
   still on the previous limit (5 deliveries) treats its own last delivery as final and can use up
   the remaining deliveries at once, and sets `max_deliver` back when it restarts.
 - A dead letter of these consumers is replayed by an operator once its cause is fixed; applying an
   event twice changes nothing.
-- The NATS user `organization` may create, read, pull from and acknowledge on these five consumers
+- The NATS user `organization` may create, read, pull from and acknowledge on these six consumers
   only, each by its exact name and filter (cadenway-ops, `docs/messaging.md`); `compose.dev.yaml`
   grants the same, so a handler without its grant fails to start in the integration tests. A new
   handler gets its consumer granted in cadenway-ops before the release that adds it: the grants of
   `project-user-email-changed` and `remove-deleted-user` are deployed before this module's release
-  that subscribes them.
+  that subscribes them, and the grant of `project-user-two-step` (filter
+  `evt.user.two-step-verification-changed.v1`) before the release that subscribes it.
 
 **Beyond the retention of the stream.** An account whose events left `EVENTS` (seven days) before
 this service first consumed them, or a directory lost and recreated, is not recovered by the
@@ -183,11 +218,12 @@ of received invitations.
 ## Invariants
 
 - Roles (decision 1 of P2b): the owner and the admins update the organization, invite, see and
-  manage the pending invitations, change roles and remove members; members read the member list;
-  guests do not (`403 organization.role-forbidden`). The owner is the creator and the only one;
-  nobody changes their role or removes them (`422 member.owner-protected`) and nobody becomes owner
-  (`role: owner` is refused by the contract schema). Decided from this module's members, never from
-  the role or the scopes of the token.
+  manage the pending invitations, change roles and remove members, and see which members have
+  two-step verification; members read the member list without it; guests do not read it
+  (`403 organization.role-forbidden`). The owner is the creator and the only one; nobody changes
+  their role or removes them (`422 member.owner-protected`) and nobody becomes owner
+  (`role: owner` is refused by the contract schema). Decided from this module's members, never
+  from the role or the scopes of the token.
 - An actor that is not an active member of the organization of the token answers
   `404 organization.not-found`; a member, an invitation or an organization of another organization
   is invisible to the tenant transaction and answers 404, never 403 (decision 9).
@@ -383,6 +419,20 @@ Any failure rolls back the business rows and the outbox rows together
     Retrying cannot succeed until an operator settles the ownership, then replays the dead letter;
     until then the account keeps its memberships and its directory entry here, while
     identity-service has already revoked its sessions and tokens.
+- The two-step verification of P2c-2, as `@cadenway/contracts` 0.8.0 describes it (the user may
+  revise it):
+  - the directory keeps `enabled` alone, by the version of the account like the other parts, in a
+    part of its own (`two_step_verification_version`), so a two-step event never reorders the name
+    or the address; the rest of the event is not read (data minimisation, see Events consumed);
+  - the field is decided in the use cases from the role of the actor in this module's members
+    (`seesTwoStepVerification`): the repositories always read it, and `toMemberViewFor` drops it
+    for anyone but the owner and the admins, before the answer is built. The answer of a change of
+    role carries it too, since `Member` says "present when the actor is the owner or an admin" and
+    only they change a role (the role checked is the actor's before the change). Known limit: the
+    repositories fill it for every reader, so a new use case that returns members must pass them
+    through `toMemberViewFor` too, or it answers the flag to members;
+  - a deleted account forgets its flag with its name and address: it has no membership left to
+    show it on.
 - `tests/organizations.int-spec.ts` proves every route, the isolation, the role rules, the
   invitation lifecycle, the invitation email limits (with two concurrent batches), the events in
   the stream, the directory projection from events published before the service started and their
@@ -391,4 +441,7 @@ Any failure rolls back the business rows and the outbox rows together
   events from the system, pending invitations and their resend, an acceptance during a deletion,
   redeliveries). `tests/directory-redelivery.int-spec.ts` proves the redelivery schedule of the
   directory consumers with a short schedule, and the deletion of an owner refused until its dead
-  letter.
+  letter. `tests/two-step-verification.int-spec.ts` proves the flag of the directory in the order of
+  the versions (an event published before the service started included), redeliveries and
+  re-emissions without effect, that nothing but the flag is stored, and that the owner and the
+  admins see it while a member does not and a guest reads no member.

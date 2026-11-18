@@ -46,7 +46,7 @@ append with `OutboxWriter.append`: the events of the organizations module
 ## Events consumed
 
 None of its own. `processed_events` records what the handlers of the business modules consumed,
-through the PostgreSQL deduplicator of `OutboxModule`: the three consumers of the organizations
+through the PostgreSQL deduplicator of `OutboxModule`: the consumers of the organizations
 module. `event_versions` stays unused: the user directory keeps the versions of each account in
 its own rows.
 

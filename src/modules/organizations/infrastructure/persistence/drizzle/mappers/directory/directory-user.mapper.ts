@@ -28,6 +28,8 @@ export function toDirectoryUser(row: DirectoryUserRow): DirectoryUser {
     email: row.email,
     emailVerified: row.emailVerified,
     emailVersion: row.emailVersion,
+    twoStepVerificationEnabled: row.twoStepVerificationEnabled,
+    twoStepVerificationVersion: row.twoStepVerificationVersion,
     deleted: row.deleted,
   });
 }

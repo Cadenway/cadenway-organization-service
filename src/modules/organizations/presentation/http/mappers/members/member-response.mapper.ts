@@ -7,12 +7,14 @@ import type { MemberView } from '../../../../application/projections/members/mem
  *
  * @description
  * The `Member` of the contract. Its `version` gives the `ETag` of a single member.
+ * `twoStepVerificationEnabled` is present when the use case kept it for the actor (the owner and
+ * the admins) and absent otherwise, as the contract says.
  *
- * @param {MemberView} view - The member.
+ * @param {MemberView} view - The member, as the actor may read it.
  * @returns {Member} The body.
  */
 export function toMemberResponse(view: MemberView): Member {
-  return {
+  const member: Member = {
     id: view.id,
     userId: view.userId,
     name: view.name,
@@ -21,4 +23,7 @@ export function toMemberResponse(view: MemberView): Member {
     joinedAt: view.joinedAt.toISOString(),
     version: view.version,
   };
+  return view.twoStepVerificationEnabled === null
+    ? member
+    : { ...member, twoStepVerificationEnabled: view.twoStepVerificationEnabled };
 }

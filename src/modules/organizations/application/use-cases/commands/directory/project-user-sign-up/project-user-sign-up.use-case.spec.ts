@@ -4,6 +4,7 @@ import { InMemoryOrganizations } from '../../../organizations.fixture.js';
 import { ProjectEmailChange } from '../project-email-change/project-email-change.use-case.js';
 import { ProjectEmailVerification } from '../project-email-verification/project-email-verification.use-case.js';
 import { ProjectProfileUpdate } from '../project-profile-update/project-profile-update.use-case.js';
+import { ProjectTwoStepVerificationChange } from '../project-two-step-verification-change/project-two-step-verification-change.use-case.js';
 import { ProjectUserSignUp } from './project-user-sign-up.use-case.js';
 
 /** Léa Petit, an account of identity-service. */
@@ -38,7 +39,38 @@ describe('the projection of the user directory', () => {
       email: 'lea.petit@ateliernord.fr',
       emailVerified: true,
       emailVersion: 2,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 0,
       deleted: false,
+    });
+  });
+
+  it('applies the two-step verification of an account by version, before or after its sign-up', async () => {
+    const signUp: ProjectUserSignUp = new ProjectUserSignUp(store);
+    const twoStep: ProjectTwoStepVerificationChange = new ProjectTwoStepVerificationChange(store);
+
+    await twoStep.execute({ userId: LEA_ID, version: 5, enabled: false });
+    await twoStep.execute({ userId: LEA_ID, version: 4, enabled: true });
+    await signUp.execute({
+      userId: LEA_ID,
+      version: 1,
+      email: 'lea.petit@ateliernord.fr',
+      name: 'Léa Petit',
+    });
+    await twoStep.execute({ userId: LEA_ID, version: 5, enabled: false });
+
+    expect(store.tables.directory.get(LEA_ID)).toMatchObject({
+      name: 'Léa Petit',
+      nameVersion: 1,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 5,
+    });
+
+    await twoStep.execute({ userId: LEA_ID, version: 6, enabled: true });
+
+    expect(store.tables.directory.get(LEA_ID)).toMatchObject({
+      twoStepVerificationEnabled: true,
+      twoStepVerificationVersion: 6,
     });
   });
 

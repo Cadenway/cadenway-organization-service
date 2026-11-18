@@ -10,13 +10,18 @@ import type { DirectoryUserState } from '../../value-objects/directory/directory
  * `asyncapi/identity-service.yaml`). Rules:
  *
  * - each event applies by the `version` of the account: a part (the name, the address and its
- *   verification) changes only for a version above the one that last set it, so a late
- *   `user.signed-up.v1` never overwrites a newer profile, and a redelivered event changes nothing;
+ *   verification, the two-step verification) changes only for a version above the one that last
+ *   set it, so a late `user.signed-up.v1` never overwrites a newer profile, and a redelivered event
+ *   changes nothing;
  * - `user.signed-up.v1` sets the name and the unverified address; `user.email-verified.v1` and
  *   `user.email-changed.v1` set the verified address; `user.profile-updated.v1` sets the name;
- * - `user.deleted.v1`, the last event of the account, forgets its name and address and keeps the
- *   entry as a former member: no later event of it applies, whatever its version, so a late event
- *   never brings the account back (`asyncapi/identity-service.yaml`);
+ *   `user.two-step-verification-changed.v1` sets whether the account has two-step verification,
+ *   for the column "Deux étapes" of the member list, `false` until it says otherwise
+ *   (`openapi/internal/organization-service.yaml`);
+ * - `user.deleted.v1`, the last event of the account, forgets its name, its address and its
+ *   two-step verification and keeps the entry as a former member: no later event of it applies,
+ *   whatever its version, so a late event never brings the account back
+ *   (`asyncapi/identity-service.yaml`);
  * - the account is known (`isSynchronized`) once its name and its address are; an invitation is
  *   matched with its verified address only (decision 5).
  */
@@ -112,6 +117,20 @@ export class DirectoryUser {
   }
 
   /**
+   * Property twoStepVerificationEnabled
+   *
+   * @description
+   * Whether the account has two-step verification, as its last applied
+   * `user.two-step-verification-changed.v1` says; `false` before any.
+   *
+   * @type {boolean}
+   * @readonly
+   */
+  public get twoStepVerificationEnabled(): boolean {
+    return this.state.twoStepVerificationEnabled;
+  }
+
+  /**
    * Property snapshot
    *
    * @description
@@ -148,7 +167,8 @@ export class DirectoryUser {
    * The entry of an account no event was applied to yet.
    *
    * @param {string} userId - Id of the account.
-   * @returns {DirectoryUser} An entry without name or address, at version 0 for both.
+   * @returns {DirectoryUser} An entry without name, address or two-step verification, at version
+   * 0 for each.
    */
   public static unknown(userId: string): DirectoryUser {
     return new DirectoryUser({
@@ -158,6 +178,8 @@ export class DirectoryUser {
       email: null,
       emailVerified: false,
       emailVersion: 0,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 0,
       deleted: false,
     });
   }
@@ -174,7 +196,7 @@ export class DirectoryUser {
    * a deleted account kept a name or an address.
    */
   public static restore(state: DirectoryUserState): DirectoryUser {
-    if (state.nameVersion < 0 || state.emailVersion < 0) {
+    if (state.nameVersion < 0 || state.emailVersion < 0 || state.twoStepVerificationVersion < 0) {
       throw new InvalidStoredStateError('directory entry', 'the versions are not negative');
     }
     if (state.emailVerified && state.email === null) {
@@ -251,12 +273,38 @@ export class DirectoryUser {
   }
 
   /**
+   * Method applyTwoStepVerificationChange
+   *
+   * @description
+   * Applies `user.two-step-verification-changed.v1`: whether the account has two-step verification
+   * after the change, when the version is newer. Whatever its `change`, even one this service does
+   * not know, the event gives the state after it, so `enabled` alone is applied
+   * (`asyncapi/identity-service.yaml`); nothing else of the event is kept.
+   *
+   * @param {number} version - Version of the account after the change.
+   * @param {boolean} enabled - Whether two-step verification is on after the change.
+   * @returns {DirectoryUser} The entry, or this one for a version already applied or a deleted
+   * account.
+   */
+  public applyTwoStepVerificationChange(version: number, enabled: boolean): DirectoryUser {
+    if (this.state.deleted || version <= this.state.twoStepVerificationVersion) {
+      return this;
+    }
+    return new DirectoryUser({
+      ...this.state,
+      twoStepVerificationEnabled: enabled,
+      twoStepVerificationVersion: version,
+    });
+  }
+
+  /**
    * Method applyDeletion
    *
    * @description
-   * Applies `user.deleted.v1`: forgets the name and the address and keeps the entry as a former
-   * member. Both parts take the version of the deletion when it is newer, so a version check that
-   * knows nothing of the deletion still refuses every earlier event of the account.
+   * Applies `user.deleted.v1`: forgets the name, the address and the two-step verification and
+   * keeps the entry as a former member. Every part takes the version of the deletion when it is
+   * newer, so a version check that knows nothing of the deletion still refuses every earlier event
+   * of the account.
    *
    * @param {number} version - Version of the account after the deletion, its last.
    * @returns {DirectoryUser} The former member, or this entry when the deletion is applied already.
@@ -272,6 +320,8 @@ export class DirectoryUser {
       email: null,
       emailVerified: false,
       emailVersion: Math.max(this.state.emailVersion, version),
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: Math.max(this.state.twoStepVerificationVersion, version),
       deleted: true,
     });
   }

@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { MemberView } from '../../../../projections/members/member-view.projection.js';
-import { atelierNord, CAMILLE, HUGO, NADIA } from '../../../organizations.scenario.fixture.js';
+import {
+  atelierNord,
+  CAMILLE,
+  HUGO,
+  INES,
+  NADIA,
+} from '../../../organizations.scenario.fixture.js';
 import type { AtelierNord } from '../../../organizations.scenario.fixture.js';
 import { GetMember } from '../get-member/get-member.use-case.js';
 import type { ListMembersOutput } from './list-members.output.js';
@@ -44,6 +50,55 @@ describe('ListMembers and GetMember', () => {
     expect(found.page.items.map((member: MemberView) => member.name)).toEqual(['Inès Robert']);
     expect(found.total).toBe(1);
     expect(found.counts).toEqual({ owner: 1, admin: 1, member: 1, guest: 1 });
+  });
+
+  it('tells the owner and the admins only which members have two-step verification', async () => {
+    scenario.store.withTwoStepVerification(CAMILLE.id);
+    const request = {
+      organizationId: scenario.organizationId,
+      search: null,
+      roles: null,
+      after: null,
+      limit: 50,
+    };
+    const get: GetMember = new GetMember(scenario.store);
+    const camilleMemberId: string = scenario.memberIds.get(CAMILLE.id) ?? '';
+    const flags = (output: ListMembersOutput): (boolean | null)[] =>
+      output.page.items.map((member: MemberView) => member.twoStepVerificationEnabled);
+
+    // Camille Martin, Hugo Dubois, Inès Robert, Nadia Garnier.
+    expect(flags(await list.execute({ ...request, actorUserId: CAMILLE.id }))).toEqual([
+      true,
+      false,
+      false,
+      false,
+    ]);
+    expect(flags(await list.execute({ ...request, actorUserId: INES.id }))).toEqual([
+      true,
+      false,
+      false,
+      false,
+    ]);
+    expect(flags(await list.execute({ ...request, actorUserId: HUGO.id }))).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    await expect(
+      get.execute({
+        actorUserId: INES.id,
+        organizationId: scenario.organizationId,
+        memberId: camilleMemberId,
+      }),
+    ).resolves.toMatchObject({ twoStepVerificationEnabled: true });
+    await expect(
+      get.execute({
+        actorUserId: HUGO.id,
+        organizationId: scenario.organizationId,
+        memberId: camilleMemberId,
+      }),
+    ).resolves.toMatchObject({ twoStepVerificationEnabled: null });
   });
 
   it('refuses the member list and its members to a guest and to an outsider', async () => {
