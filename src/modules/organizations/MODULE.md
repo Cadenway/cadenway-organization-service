@@ -157,17 +157,23 @@ the seven days the stream holds when it starts; a consumer that needs the member
   methods, the backup codes left and the security key are for the email of notification-service:
   they are never passed to the use case, stored, nor logged here (the kit logs no payload). They
   still reach this service on the wire, and a dead letter of this consumer keeps the whole message
-  in `EVENTS_DLQ` (30 days), as for every event of `EVENTS`: an open question of the contracts.
+  in `EVENTS_DLQ` (30 days), as for every event of `EVENTS` (the kit drops the body of restricted
+  events only): an open question left to the user in P2c-2, for cadenway-api-contracts,
+  cadenway-service-kit and cadenway-ops.
   Accounts that turned two-step verification on before the stream retention of their event and
   before this module first consumed it stay `false` until their next change (see "Beyond the
-  retention of the stream"); the order of the phase (this module live before the gateway exposes
-  the setup routes) leaves none.
+  retention of the stream"). **Deployment prerequisite**: this module's release runs in an
+  environment before the gateway exposes the setup routes of two-step verification there, so that
+  no such account exists; nothing here enforces it.
 - `user.deleted.v1` (decision 9 of P2c), in one system transaction: the directory entry is locked,
   every active membership of the account is locked and removed with its `member.removed.v1`, and
   the entry forgets the name, the address and the two-step verification and becomes a former
   member (`deleted`), its versions raised to the one of the deletion. A deleted entry ends the
   work at once, so the same deletion applied again, under another event id, changes nothing; no
   later event of the account applies, whatever its version, so a late event never brings it back.
+  A deletion a replica of the previous release applies during the rollout leaves
+  `two_step_verification_enabled` as it was: the entry has no membership left, so the flag is never
+  answered; a later release may clear such rows in batches.
 - The entry is locked (`select … for update` after an `insert … on conflict do nothing`), so two
   events of one account apply one after the other. The acceptance of an invitation and the
   creation of an organization hold the entry of their actor in share mode (`select … for share`)
@@ -422,7 +428,9 @@ Any failure rolls back the business rows and the outbox rows together
     (`seesTwoStepVerification`): the repositories always read it, and `toMemberViewFor` drops it
     for anyone but the owner and the admins, before the answer is built. The answer of a change of
     role carries it too, since `Member` says "present when the actor is the owner or an admin" and
-    only they change a role;
+    only they change a role (the role checked is the actor's before the change). Known limit: the
+    repositories fill it for every reader, so a new use case that returns members must pass them
+    through `toMemberViewFor` too, or it answers the flag to members;
   - a deleted account forgets its flag with its name and address: it has no membership left to
     show it on.
 - `tests/organizations.int-spec.ts` proves every route, the isolation, the role rules, the
