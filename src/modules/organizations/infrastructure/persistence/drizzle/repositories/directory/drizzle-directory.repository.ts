@@ -132,6 +132,8 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
         email: state.email,
         emailVerified: state.emailVerified,
         emailVersion: state.emailVersion,
+        twoStepVerificationEnabled: state.twoStepVerificationEnabled,
+        twoStepVerificationVersion: state.twoStepVerificationVersion,
         deleted: state.deleted,
         updatedAt: sql`now()`,
       })

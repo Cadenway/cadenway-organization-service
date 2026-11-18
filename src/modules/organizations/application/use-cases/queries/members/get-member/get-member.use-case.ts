@@ -1,5 +1,6 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { assertReadsMembers } from '../../../../../domain/policies/members/member-permissions.policy.js';
+import { toMemberViewFor } from '../../../../mappers/members/member-view.mapper.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
@@ -15,7 +16,8 @@ import type { GetMemberInput } from './get-member.input.js';
  * Reads one active member of the organization of the request (`GET /internal/v1/members/{memberId}`)
  * in a read-only tenant transaction. A member of another organization is invisible to it and
  * answers like an unknown id (`member-not-found`, decision 9 of P2b); a guest is refused
- * (`role-forbidden`).
+ * (`role-forbidden`). Whether the member has two-step verification is answered to the owner and
+ * the admins only (`toMemberViewFor`).
  */
 export class GetMember {
   // #region Properties
@@ -74,7 +76,7 @@ export class GetMember {
           if (member === null) {
             throw new OrganizationRefusal({ reason: 'member-not-found' });
           }
-          return member;
+          return toMemberViewFor(member, actor.role);
         },
         { readOnly: true },
       );

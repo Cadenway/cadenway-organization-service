@@ -60,6 +60,8 @@ describe('RemoveDeletedUser', () => {
       email: null,
       emailVerified: false,
       emailVersion: 7,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 7,
       deleted: true,
     });
   });

@@ -153,8 +153,23 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       email,
       emailVerified: verified,
       emailVersion: verified ? 2 : 1,
+      twoStepVerificationEnabled: false,
+      twoStepVerificationVersion: 0,
       deleted: false,
     });
+    return this;
+  }
+
+  /** Turns the two-step verification of an account of the directory on, at version 3. */
+  public withTwoStepVerification(userId: string): this {
+    const entry: DirectoryUserState | undefined = this.tables.directory.get(userId);
+    if (entry !== undefined) {
+      this.tables.directory.set(userId, {
+        ...entry,
+        twoStepVerificationEnabled: true,
+        twoStepVerificationVersion: 3,
+      });
+    }
     return this;
   }
 
@@ -205,6 +220,8 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       role: member.role,
       joinedAt: member.joinedAt,
       version: member.version,
+      twoStepVerificationEnabled:
+        tables.directory.get(member.userId)?.twoStepVerificationEnabled ?? false,
     });
     const seats = (organizationId: string): number =>
       activeMembers(organizationId).filter((member: MemberState) => takesSeat(member.role)).length;

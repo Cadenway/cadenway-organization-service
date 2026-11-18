@@ -4,8 +4,8 @@ import type { Role } from '../../../domain/value-objects/members/role.value-obje
  * Interface MemberView
  *
  * @description
- * A member as the member list shows it (`Member` of the contract): the membership and the name and
- * address of its account, from the user directory.
+ * A member as the member list shows it (`Member` of the contract): the membership and the name,
+ * address and two-step verification of its account, from the user directory.
  */
 export interface MemberView {
   // #region Properties
@@ -85,5 +85,19 @@ export interface MemberView {
    * @readonly
    */
   readonly version: number;
+
+  /**
+   * Property twoStepVerificationEnabled
+   *
+   * @description
+   * Whether the account has two-step verification ("Deux étapes"), from the user directory, `false`
+   * until an event says otherwise; `null` when the actor may not see it (anyone but the owner and
+   * the admins), so that the answer leaves it out. The repositories read it; the use cases set it
+   * to `null` with `toMemberViewFor` for such an actor.
+   *
+   * @type {boolean | null}
+   * @readonly
+   */
+  readonly twoStepVerificationEnabled: boolean | null;
   // #endregion
 }

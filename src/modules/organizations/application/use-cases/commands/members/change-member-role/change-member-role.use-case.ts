@@ -1,5 +1,6 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
+import { toMemberViewFor } from '../../../../mappers/members/member-view.mapper.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
@@ -92,7 +93,7 @@ export class ChangeMemberRole {
           if (view === null) {
             throw new OrganizationRefusal({ reason: 'member-not-found' });
           }
-          return view;
+          return toMemberViewFor(view, actor.role);
         },
       );
     } catch (error) {

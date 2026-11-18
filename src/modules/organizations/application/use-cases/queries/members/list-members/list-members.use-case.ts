@@ -1,10 +1,13 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { assertReadsMembers } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import { searchKeyOf } from '../../../../../domain/value-objects/search/search-key.value-object.js';
+import { toMemberViewFor } from '../../../../mappers/members/member-view.mapper.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import type { MemberFilters } from '../../../../models/members/member-filters.model.js';
+import type { Page } from '../../../../models/pagination/page.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
+import type { MemberView } from '../../../../projections/members/member-view.projection.js';
 import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
 import type { ListMembersInput } from './list-members.input.js';
 import type { ListMembersOutput } from './list-members.output.js';
@@ -16,7 +19,8 @@ import type { ListMembersOutput } from './list-members.output.js';
  * Lists the active members of the organization of the request (`GET /internal/v1/members`) in a
  * read-only tenant transaction, sorted by name without regard to case or accents, then by id. The
  * search matches the name and the address the same way. Owner, admins and members read it; a guest
- * is refused (`role-forbidden`, decision 1 of P2b).
+ * is refused (`role-forbidden`, decision 1 of P2b). Whether each member has two-step verification
+ * is answered to the owner and the admins only (`toMemberViewFor`).
  */
 export class ListMembers {
   // #region Properties
@@ -73,8 +77,19 @@ export class ListMembers {
             input.actorUserId,
           );
           assertReadsMembers(actor.role);
+          const page: Page<MemberView> = await store.members.list(
+            input.organizationId,
+            filters,
+            input.after,
+            input.limit,
+          );
           return {
-            page: await store.members.list(input.organizationId, filters, input.after, input.limit),
+            page: {
+              items: page.items.map((member: MemberView): MemberView =>
+                toMemberViewFor(member, actor.role),
+              ),
+              next: page.next,
+            },
             total: await store.members.count(input.organizationId, filters),
             counts: await store.members.countByRole(input.organizationId),
           };

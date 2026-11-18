@@ -42,6 +42,22 @@ export function assertManagesOrganization(role: Role): void {
 }
 
 /**
+ * Function seesTwoStepVerification
+ *
+ * @description
+ * Whether a role sees which members have two-step verification, the column "Deux étapes" of the
+ * member list: the owner and the admins only; a member does not, a guest reads no member at all
+ * (`openapi/public/members.yaml`, "Two-step column"). Decided from the role of the actor in this
+ * module's members, never from the token.
+ *
+ * @param {Role} role - Role of the actor in the organization.
+ * @returns {boolean} `true` for the owner and the admins.
+ */
+export function seesTwoStepVerification(role: Role): boolean {
+  return MANAGING_ROLES.includes(role);
+}
+
+/**
  * Function assertReadsMembers
  *
  * @description

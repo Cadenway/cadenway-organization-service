@@ -117,7 +117,8 @@ export interface MemberRepository {
    * Method view
    *
    * @description
-   * Reads an active member with the name and address of its account.
+   * Reads an active member with the name, address and two-step verification of its account. The
+   * two-step verification is always read; the use case decides whether the actor sees it.
    *
    * @param {string} organizationId - The organization.
    * @param {string} memberId - Id of the membership.
@@ -130,7 +131,7 @@ export interface MemberRepository {
    *
    * @description
    * One page of the active members that match the filters, sorted by the search key of their name,
-   * then by id.
+   * then by id, each with the two-step verification of its account, as `view` reads it.
    *
    * @param {string} organizationId - The organization.
    * @param {MemberFilters} filters - The search and the roles.
