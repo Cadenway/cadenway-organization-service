@@ -34,7 +34,7 @@ audit log are later phases.
 | ----------- | --------- |
 | None        | None      |
 
-`organizations.module.ts` registers the four HTTP controllers, the six event handlers and the
+`organizations.module.ts` registers the HTTP controllers, the six event handlers and the
 providers of the module; no other module imports it.
 
 ## Owned tables
@@ -82,6 +82,7 @@ tenant transaction; "none" routes ignore it.
 | `GET /internal/v1/organization`                            | Required     | 200, `ETag`             | 404 `organization.not-found`                                                                                                                              |
 | `PATCH /internal/v1/organization`                          | Required     | 200, `ETag`             | 400, 403 `organization.role-forbidden`, 404, 409 `organization.slug-taken`, 412 `request.version-mismatch`                                                |
 | `GET /internal/v1/members`                                 | Required     | 200                     | 400, 403 `organization.role-forbidden`, 404 `organization.not-found`                                                                                      |
+| `POST /internal/v1/member-names/lookup`                    | Required     | 200                     | 400, 404 `organization.not-found`                                                                                                                         |
 | `GET /internal/v1/members/{memberId}`                      | Required     | 200, `ETag`             | 400, 403, 404 `member.not-found`                                                                                                                          |
 | `PATCH /internal/v1/members/{memberId}`                    | Required     | 200, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`, 422 `member.owner-protected`                                                                               |
 | `DELETE /internal/v1/members/{memberId}`                   | Required     | 204                     | 400, 403, 404, 422 `member.owner-protected`                                                                                                               |
@@ -97,6 +98,11 @@ tenant transaction; "none" routes ignore it.
 owner or an admin: in the list, the reading of a member and the answer of a change of role (which
 only they make). For any other actor the field is absent from the answer, never `null` nor
 `false` (`openapi/internal/organization-service.yaml`, `Member`); the gateway passes it on as is.
+
+The member-name lookup accepts one to 5,000 account IDs for the gateway's authorized CSV export.
+Every current member, including a guest, may call it. It returns only account IDs and full names
+for current members of the same organization, omitting unavailable names and departed accounts.
+The actor membership and names are read in one tenant snapshot.
 
 Every route also answers the 401 and 403 of the internal token guard. The titles are the English
 reason phrases; the gateway answers the French titles of the public specs. A 429 carries
