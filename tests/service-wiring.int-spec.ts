@@ -26,6 +26,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppModule } from '../src/app.module.js';
 import { appConfigSchema } from '../src/config/app-config.js';
+import { EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE } from '../src/config/job-queues.js';
 
 // The service as main.ts assembles it, on a disposable PostgreSQL and NATS. `@cadenway/nest-testing`
 // does not export its container fixtures yet and a service never depends on `testcontainers` itself,
@@ -69,6 +70,7 @@ const businessTables = [
   'invitation_emails',
   'invitations',
   'members',
+  'organization_logo_reservations',
   'organizations',
 ] as const;
 
@@ -77,9 +79,10 @@ const allTables = [...platformTables, ...businessTables].sort();
 
 /**
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
- * invitation emails, the former members of the user directory, then its two-step verification.
+ * invitation emails, the former members of the user directory, its two-step verification, then
+ * the logo reference and upload reservations.
  */
-const migrationCount = 5;
+const migrationCount = 6;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -345,6 +348,33 @@ describe('organization-service wiring', () => {
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
   });
 
+  it('keeps the durable logo cleanup schedule after provisioning again', async () => {
+    const role = await migrator.query<{ canUse: boolean; canCreate: boolean }>(
+      `select has_schema_privilege('organization_app', 'pgboss', 'USAGE') as "canUse",
+              has_schema_privilege('organization_app', 'pgboss', 'CREATE') as "canCreate"`,
+    );
+    const queues = await migrator.query<{ name: string }>(
+      'select name from pgboss.queue where name = any($1::text[]) order by name',
+      [
+        [
+          EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE,
+          `${EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE}.dead-letter`,
+        ],
+      ],
+    );
+    const schedule = await migrator.query<{ key: string; cron: string; timezone: string }>(
+      'select key, cron, timezone from pgboss.schedule where name = $1',
+      [EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE],
+    );
+
+    expect(role.rows).toEqual([{ canUse: true, canCreate: false }]);
+    expect(queues.rows).toEqual([
+      { name: EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE },
+      { name: `${EXPIRE_ORGANIZATION_LOGO_UPLOADS_QUEUE}.dead-letter` },
+    ]);
+    expect(schedule.rows).toEqual([{ key: 'minutely', cron: '* * * * *', timezone: 'UTC' }]);
+  });
+
   it('forces row-level security on the tables that carry an organization', async () => {
     const tables = await migrator.query<{
       relname: string;
@@ -367,6 +397,11 @@ describe('organization-service wiring', () => {
       { relname: 'invitation_emails', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'members', relrowsecurity: true, relforcerowsecurity: true },
+      {
+        relname: 'organization_logo_reservations',
+        relrowsecurity: true,
+        relforcerowsecurity: true,
+      },
       { relname: 'organizations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
@@ -377,6 +412,10 @@ describe('organization-service wiring', () => {
       { tablename: 'invitation_emails', policyname: 'invitation_emails_organization_isolation' },
       { tablename: 'invitations', policyname: 'invitations_organization_isolation' },
       { tablename: 'members', policyname: 'members_organization_isolation' },
+      {
+        tablename: 'organization_logo_reservations',
+        policyname: 'organization_logo_reservations_organization_isolation',
+      },
       { tablename: 'organizations', policyname: 'organizations_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },
     ]);

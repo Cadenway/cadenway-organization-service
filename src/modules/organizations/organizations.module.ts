@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
 import { projectEmailChangeProvider } from './composition/providers/use-cases/directory/project-email-change.provider.js';
@@ -14,6 +15,7 @@ import { listReceivedInvitationsProvider } from './composition/providers/use-cas
 import { refuseInvitationProvider } from './composition/providers/use-cases/invitations/refuse-invitation.provider.js';
 import { resendInvitationProvider } from './composition/providers/use-cases/invitations/resend-invitation.provider.js';
 import { revokeInvitationProvider } from './composition/providers/use-cases/invitations/revoke-invitation.provider.js';
+import { organizationLogoProviders } from './composition/providers/use-cases/logo/organization-logo.provider.js';
 import { changeMemberRoleProvider } from './composition/providers/use-cases/members/change-member-role.provider.js';
 import { getMemberProvider } from './composition/providers/use-cases/members/get-member.provider.js';
 import { listMembersProvider } from './composition/providers/use-cases/members/list-members.provider.js';
@@ -26,6 +28,7 @@ import { listMyOrganizationsProvider } from './composition/providers/use-cases/o
 import { updateOrganizationProvider } from './composition/providers/use-cases/organizations/update-organization.provider.js';
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
+import { OrganizationLogoController } from './presentation/http/controllers/logo/organization-logo.controller.js';
 import { MembersController } from './presentation/http/controllers/members/members.controller.js';
 import { MemberNamesController } from './presentation/http/controllers/members/member-names.controller.js';
 import { OrganizationsController } from './presentation/http/controllers/organizations/organizations.controller.js';
@@ -48,6 +51,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
 @Module({
   controllers: [
     OrganizationsController,
+    OrganizationLogoController,
     MembersController,
     MemberNamesController,
     InvitationsController,
@@ -56,6 +60,8 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
   providers: [
     unitOfWorkProvider,
     clockProvider,
+    ...organizationLogoProviders,
+    expireOrganizationLogoUploadsHandlerProvider,
     createOrganizationProvider,
     updateOrganizationProvider,
     getCurrentOrganizationProvider,

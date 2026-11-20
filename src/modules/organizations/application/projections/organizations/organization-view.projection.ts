@@ -64,6 +64,9 @@ export interface OrganizationView {
    */
   readonly website: string | null;
 
+  /** Current private logo reference visible to the verified organization member. */
+  readonly logoId: string | null;
+
   /**
    * Property defaultLanguage
    *

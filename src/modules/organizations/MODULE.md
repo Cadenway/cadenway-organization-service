@@ -6,8 +6,8 @@ Organizations and who belongs to them, for P2b of the plan and the account chang
 P2c-2:
 
 - organizations: profile ("Profil de l'organisation": name, address slug, description, website,
-  default language), the plan `free` until billing exists, the answers of the creation form and
-  the owner;
+  default language and logo), the plan `free` until billing exists, the answers of the creation form
+  and the owner;
 - members: one membership per account and organization with its role (`owner`, `admin`, `member`,
   `guest`), kept after a removal with its last version;
 - invitations: an address invited with a role, valid 7 days, resent at most once an hour, revoked,
@@ -25,7 +25,7 @@ searches by the names of the directory in one query; separate modules could not 
 tables. It does not own the current organization of a session, the personal API tokens or the
 copy of the memberships that introspection reads (identity-service), the scopes and the rate
 limit (api-gateway), nor the invitation email (notification-service, from `invitation.issued.v1`).
-Logo, seats, verified domains, auto-join, the reusable link, ownership transfer, deletion and the
+Seats, verified domains, auto-join, the reusable link, ownership transfer, deletion and the
 audit log are later phases.
 
 ## Public entry points
@@ -39,13 +39,14 @@ providers of the module; no other module imports it.
 
 ## Owned tables
 
-| Table               | Key                                                 | Organization scoping                                   |
-| ------------------- | --------------------------------------------------- | ------------------------------------------------------ |
-| `organizations`     | `id`, unique `slug`                                 | Policy on `id` (the organization itself), forced       |
-| `members`           | `id`; one active per (`organization_id`, `user_id`) | `organization_id`, policy forced                       |
-| `invitations`       | `id`; one pending per (`organization_id`, `email`)  | `organization_id`, policy forced                       |
-| `invitation_emails` | `id`; one row per invitation email sent             | `organization_id`, policy forced                       |
-| `directory_users`   | `user_id`, the id identity-service gave the account | None: an account belongs to no organization, no policy |
+| Table                            | Key                                                                              | Organization scoping                                   |
+| -------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `organizations`                  | `id`, unique `slug`                                                              | Policy on `id` (the organization itself), forced       |
+| `members`                        | `id`; one active per (`organization_id`, `user_id`)                              | `organization_id`, policy forced                       |
+| `invitations`                    | `id`; one pending per (`organization_id`, `email`)                               | `organization_id`, policy forced                       |
+| `organization_logo_reservations` | (`organization_id`, `upload_id`), replay key scoped to organization and uploader | `organization_id`, policy forced                       |
+| `invitation_emails`              | `id`; one row per invitation email sent                                          | `organization_id`, policy forced                       |
+| `directory_users`                | `user_id`, the id identity-service gave the account                              | None: an account belongs to no organization, no policy |
 
 Created by `migrations/0001_organizations_members_invitations.sql` and
 `migrations/0002_invitation_emails.sql`, with the `FORCE ROW LEVEL SECURITY` statements added by
@@ -69,6 +70,11 @@ the table holds 100 rows at most per organization, and no job purges it, so an o
 stops inviting keeps its last rows. Their foreign keys are `no action`: the deletion of an
 organization or of an invitation, a later phase, deletes its ledger rows first.
 
+`0005_organization_logo` adds the nullable opaque `organizations.logo_id`, an independent
+`logo_generation` and tenant-owned upload reservations. A reservation binds the uploader,
+declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
+digest of the key. Storage owns the bytes and signed transfers.
+
 ## API
 
 From `openapi/internal/organization-service.yaml` of the installed `@cadenway/contracts`; issuer
@@ -81,6 +87,10 @@ tenant transaction; "none" routes ignore it.
 | `GET /internal/v1/organizations`                           | None         | 200                     | 400                                                                                                                                                       |
 | `GET /internal/v1/organization`                            | Required     | 200, `ETag`             | 404 `organization.not-found`                                                                                                                              |
 | `PATCH /internal/v1/organization`                          | Required     | 200, `ETag`             | 400, 403 `organization.role-forbidden`, 404, 409 `organization.slug-taken`, 412 `request.version-mismatch`                                                |
+| `POST /internal/v1/organization/logo/uploads`              | Required     | 201, `Location`         | 400, 403, 404, 409 key reuse, 422 unsupported declaration or size                                                                                         |
+| `GET /internal/v1/organization/logo/uploads/{uploadId}`    | Required     | 200                     | 400, 403, 404, 409 expired or superseded                                                                                                                  |
+| `PUT /internal/v1/organization/logo`                       | Required     | 204, `ETag`             | 400, 403, 404, 409 expired or superseded, 412 `request.version-mismatch`                                                                                  |
+| `DELETE /internal/v1/organization/logo`                    | Required     | 204, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`                                                                                                             |
 | `GET /internal/v1/members`                                 | Required     | 200                     | 400, 403 `organization.role-forbidden`, 404 `organization.not-found`                                                                                      |
 | `POST /internal/v1/member-names/lookup`                    | Required     | 200                     | 400, 404 `organization.not-found`                                                                                                                         |
 | `GET /internal/v1/members/{memberId}`                      | Required     | 200, `ETag`             | 400, 403, 404 `member.not-found`                                                                                                                          |
@@ -104,6 +114,11 @@ Every current member, including a guest, may call it. It returns only account ID
 for current members of the same organization, omitting unavailable names and departed accounts.
 The actor membership and names are read in one tenant snapshot.
 
+The organization profile includes the current opaque `logoId`. Logo reservation and owner
+mutation responses use `Cache-Control: no-store`, including malformed bodies and guard refusals.
+The gateway asks Storage to prepare a pending upload before publication. A committed retry
+returns the current profile ETag without reactivating the reservation's earlier asset.
+
 Every route also answers the 401 and 403 of the internal token guard. The titles are the English
 reason phrases; the gateway answers the French titles of the public specs. A 429 carries
 `Retry-After`, the seconds until `details.resendAvailableAt` or `details.nextAvailableAt`, rounded
@@ -115,14 +130,16 @@ in the same deployment as this module or before, otherwise they reach the browse
 All appended to the outbox in the transaction of the change, with the organization of the change
 and the version of the aggregate after it; none is restricted.
 
-| Event                     | When                                                             | Actor                    | Version           |
-| ------------------------- | ---------------------------------------------------------------- | ------------------------ | ----------------- |
-| `organization.created.v1` | An organization is created                                       | The creator, its owner   | 1                 |
-| `organization.updated.v1` | A patch of the organization moves something (`changed`)          | The owner or the admin   | Organization's    |
-| `member.joined.v1`        | The owner at the creation; an account that accepts an invitation | The account that joined  | 1                 |
-| `member.role-changed.v1`  | A member gets another role                                       | The owner or the admin   | Membership's (2+) |
-| `member.removed.v1`       | A member is removed, or an account is deleted; its last event    | Owner, admin or system   | Membership's (2+) |
-| `invitation.issued.v1`    | An invitation is created (batch or creation form) or resent      | The sender, also inviter | Invitation's      |
+| Event                                   | When                                                             | Actor                    | Version           |
+| --------------------------------------- | ---------------------------------------------------------------- | ------------------------ | ----------------- |
+| `organization.created.v1`               | An organization is created                                       | The creator, its owner   | 1                 |
+| `organization.updated.v1`               | A patch of the organization moves something (`changed`)          | The owner or the admin   | Organization's    |
+| `organization.logo-changed.v1`          | The active logo reference is set, replaced or removed            | The owner or the admin   | Logo generation   |
+| `organization.logo-upload-abandoned.v1` | An unusable pending reservation becomes terminal                 | Organization service     | 1                 |
+| `member.joined.v1`                      | The owner at the creation; an account that accepts an invitation | The account that joined  | 1                 |
+| `member.role-changed.v1`                | A member gets another role                                       | The owner or the admin   | Membership's (2+) |
+| `member.removed.v1`                     | A member is removed, or an account is deleted; its last event    | Owner, admin or system   | Membership's (2+) |
+| `invitation.issued.v1`                  | An invitation is created (batch or creation form) or resent      | The sender, also inviter | Invitation's      |
 
 Revoking and refusing emit nothing; a patch or a role change that moves nothing emits nothing.
 The removals of a deleted account carry the actor `{ type: 'system', id: 'organization-service' }`
@@ -220,6 +237,16 @@ would apply each item with `onRebuild`), but no rebuild item schema of the accou
 cadenway-api-contracts and identity-service. Until then, a directory entry missing for an old
 account answers `404 user.not-synchronized` at the creation of an organization, and an empty list
 of received invitations.
+
+## Logo reservation expiry
+
+The system schedule `organization.expire-logo-uploads` runs each minute in UTC. A bounded,
+read-only system query selects up to 100 expired pending reservations by deadline. Each candidate
+is rechecked under the organization and reservation locks in a separate tenant transaction. The
+terminal state and `organization.logo-upload-abandoned.v1` commit together. Repeating the sweep
+does not publish again. A stopped worker leaves the next tick to pick up remaining rows. An
+operator checks the failed job's error, fixes the cause and requeues the sweep after an exhausted
+retry. Storage uses the authoritative abandonment fact to reclaim the associated bytes.
 
 ## Invariants
 

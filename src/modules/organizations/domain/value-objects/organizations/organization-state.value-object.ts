@@ -65,6 +65,9 @@ export interface OrganizationState {
    */
   readonly website: string | null;
 
+  /** Current opaque logo reference, assigned through the logo owner operation. */
+  readonly logoId?: string | null;
+
   /**
    * Property defaultLanguage
    *

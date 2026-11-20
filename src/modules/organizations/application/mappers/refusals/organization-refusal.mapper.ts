@@ -1,4 +1,5 @@
 import { InvalidEmailAddressError } from '../../../domain/errors/directory/invalid-email-address.error.js';
+import { OrganizationLogoError } from '../../../domain/errors/logo/organization-logo.error.js';
 import { InvitationAnsweredError } from '../../../domain/errors/invitations/invitation-answered.error.js';
 import { InvitationDailyLimitReachedError } from '../../../domain/errors/invitations/invitation-daily-limit-reached.error.js';
 import { InvitationExpiredError } from '../../../domain/errors/invitations/invitation-expired.error.js';
@@ -25,6 +26,13 @@ import type { Refusal } from '../../models/refusals/refusal.model.js';
  * @returns {Refusal | null} The refusal.
  */
 function refusalOf(error: unknown): Refusal | null {
+  if (
+    error instanceof OrganizationLogoError &&
+    error.reason === 'version-mismatch' &&
+    error.version !== undefined
+  ) {
+    return { reason: 'version-mismatch', version: error.version };
+  }
   if (error instanceof InvalidOrganizationNameError) {
     return { reason: 'invalid-field', field: 'name', code: 'too_small' };
   }

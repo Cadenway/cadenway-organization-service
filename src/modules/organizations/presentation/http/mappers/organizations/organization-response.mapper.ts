@@ -23,6 +23,7 @@ export function toOrganizationResponse(view: OrganizationView): Organization {
     slug: view.slug,
     description: view.description,
     website: view.website,
+    logoId: view.logoId,
     defaultLanguage: view.defaultLanguage,
     plan: view.plan,
     memberCount: view.memberCount,
