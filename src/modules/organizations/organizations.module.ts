@@ -17,6 +17,7 @@ import { revokeInvitationProvider } from './composition/providers/use-cases/invi
 import { changeMemberRoleProvider } from './composition/providers/use-cases/members/change-member-role.provider.js';
 import { getMemberProvider } from './composition/providers/use-cases/members/get-member.provider.js';
 import { listMembersProvider } from './composition/providers/use-cases/members/list-members.provider.js';
+import { lookupMemberNamesProvider } from './composition/providers/use-cases/members/lookup-member-names.provider.js';
 import { removeDeletedUserProvider } from './composition/providers/use-cases/members/remove-deleted-user.provider.js';
 import { removeMemberProvider } from './composition/providers/use-cases/members/remove-member.provider.js';
 import { createOrganizationProvider } from './composition/providers/use-cases/organizations/create-organization.provider.js';
@@ -26,6 +27,7 @@ import { updateOrganizationProvider } from './composition/providers/use-cases/or
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { MembersController } from './presentation/http/controllers/members/members.controller.js';
+import { MemberNamesController } from './presentation/http/controllers/members/member-names.controller.js';
 import { OrganizationsController } from './presentation/http/controllers/organizations/organizations.controller.js';
 import { UserDeletedHandler } from './presentation/messaging/handlers/users/user-deleted.handler.js';
 import { UserEmailChangedHandler } from './presentation/messaging/handlers/users/user-email-changed.handler.js';
@@ -47,6 +49,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
   controllers: [
     OrganizationsController,
     MembersController,
+    MemberNamesController,
     InvitationsController,
     ReceivedInvitationsController,
   ],
@@ -58,6 +61,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     getCurrentOrganizationProvider,
     listMyOrganizationsProvider,
     listMembersProvider,
+    lookupMemberNamesProvider,
     getMemberProvider,
     changeMemberRoleProvider,
     removeMemberProvider,
