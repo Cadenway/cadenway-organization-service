@@ -60,6 +60,7 @@ import { PlatformModule } from './modules/platform/platform.module.js';
         connectionString: config.DATABASE_URL,
         applicationName: 'organization-service',
         idempotency: true,
+        transactionMaxAttempts: config.DATABASE_TRANSACTION_MAX_ATTEMPTS,
       }),
     }),
     MessagingModule.forRootAsync({
