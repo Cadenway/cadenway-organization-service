@@ -50,6 +50,8 @@ export const organizations = pgTable(
     teamSize: text('team_size').notNull(),
     primaryUse: text('primary_use').notNull(),
     ownerUserId: uuid('owner_user_id').notNull(),
+    logoId: uuid('logo_id'),
+    logoGeneration: integer('logo_generation').notNull().default(0),
     version: integer('version').notNull().default(1),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -83,6 +85,7 @@ export const organizations = pgTable(
       sql`${table.primaryUse} in ('product-engineering', 'agency-client-projects', 'marketing-content', 'operations-support', 'other')`,
     ),
     check('organizations_version_check', sql`${table.version} >= 1`),
+    check('organizations_logo_generation_check', sql`${table.logoGeneration} >= 0`),
     pgPolicy('organizations_organization_isolation', {
       as: 'permissive',
       for: 'all',

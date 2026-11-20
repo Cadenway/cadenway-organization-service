@@ -27,6 +27,7 @@ export function toOrganization(row: OrganizationRow): Organization {
     slug: row.slug,
     description: row.description,
     website: row.website,
+    logoId: row.logoId,
     defaultLanguage: row.defaultLanguage,
     plan: row.plan,
     teamSize: row.teamSize,

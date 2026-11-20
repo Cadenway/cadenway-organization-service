@@ -27,6 +27,7 @@ export function toOrganizationView(
     slug: state.slug,
     description: state.description,
     website: state.website,
+    logoId: state.logoId ?? null,
     defaultLanguage: state.defaultLanguage,
     plan: state.plan,
     memberCount,

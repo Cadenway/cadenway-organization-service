@@ -6,12 +6,14 @@ import {
   CreateOrganizationInternalResponse,
   GetMemberInternalResponse,
   GetOrganizationInternalResponse,
+  GetOrganizationLogoUploadStateInternalResponse,
   InviteMembersInternalResponse,
   ListInvitationsInternalResponse,
   ListMembersInternalResponse,
   ListMyOrganizationsInternalResponse,
   ListReceivedInvitationsInternalResponse,
   ResendInvitationInternalResponse,
+  ReserveOrganizationLogoUploadInternalResponse,
   UpdateOrganizationInternalResponse,
 } from '@cadenway/contracts/validators/internal/organization-service';
 import type {
@@ -29,6 +31,7 @@ import type {
 import { runWithOrganizationContext } from '@cadenway/nest-common';
 import type { OrganizationContext } from '@cadenway/nest-common';
 import { TenantTransactionRunner } from '@cadenway/nest-common/database';
+import { OutboxWriter } from '@cadenway/nest-messaging/outbox';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import type { Response } from 'supertest';
@@ -165,11 +168,11 @@ describe('organizations, members and invitations', () => {
    * @returns The response.
    */
   async function call(
-    method: 'get' | 'post' | 'patch' | 'delete',
+    method: 'get' | 'post' | 'put' | 'patch' | 'delete',
     path: string,
     account: Account | null,
     organizationId: string | null,
-    body?: object,
+    body?: object | string,
     headers: Readonly<Record<string, string>> = {},
   ): Promise<Response> {
     let pending = request(app.getHttpServer())[method](path);
@@ -1848,6 +1851,158 @@ describe('organizations, members and invitations', () => {
       expect(await rowsOf('invitation_emails', lilleId)).toBe(100);
       expect(await outboxCount('invitation.issued.v1', 'organizationId', lilleId)).toBe(issued + 5);
     });
+  });
+
+  it('publishes and clears a private logo with locked authorization and committed replay', async () => {
+    await vi.waitFor(
+      async () => {
+        expect(await directoryOf(camille)).toMatchObject({ email_verified: true });
+      },
+      { timeout: 15_000 },
+    );
+    const create = await call('post', '/internal/v1/organizations', camille, null, {
+      name: 'Organization Logo Fixture',
+      teamSize: '6-20',
+      primaryUse: 'product-engineering',
+      inviteEmails: [],
+    });
+    expect(create.status).toBe(201);
+    const organizationId = (create.body as OrganizationCreated).organization.id;
+    const path = '/internal/v1/organization/logo';
+    const uploads = `${path}/uploads`;
+    const declaration = { contentType: 'image/png', sizeBytes: 512 };
+
+    const anonymous = await call('post', uploads, null, null, declaration);
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers['cache-control']).toBe('no-store');
+    const malformed = await call('post', uploads, camille, organizationId, '{', {
+      'Content-Type': 'application/json',
+    });
+    expect(malformed.status).toBe(400);
+    expect(malformed.headers['cache-control']).toBe('no-store');
+
+    const reserved = await call('post', uploads, camille, organizationId, declaration, {
+      'Idempotency-Key': 'example-logo-reservation',
+    });
+    expect(reserved.status).toBe(201);
+    expect(reserved.headers['cache-control']).toBe('no-store');
+    conforms(ReserveOrganizationLogoUploadInternalResponse, reserved);
+    const { uploadId, expiresAt } = ReserveOrganizationLogoUploadInternalResponse.parse(
+      reserved.body,
+    );
+    expect(reserved.headers.location).toBe(`${uploads}/${uploadId}`);
+    const replayed = await call('post', uploads, camille, organizationId, declaration, {
+      'Idempotency-Key': 'example-logo-reservation',
+    });
+    expect(replayed.status).toBe(201);
+    expect(replayed.body).toEqual(reserved.body);
+
+    const read = await call('get', `${uploads}/${uploadId}`, camille, organizationId, undefined, {
+      'If-None-Match': '*',
+    });
+    expect(read.status).toBe(200);
+    expect(read.headers['cache-control']).toBe('no-store');
+    conforms(GetOrganizationLogoUploadStateInternalResponse, read);
+    expect(read.body).toEqual({ uploadId, state: 'pending', expiresAt });
+    const outsider = await call('get', `${uploads}/${uploadId}`, ines, organizationId);
+    expect(outsider.status).toBe(404);
+    expect(outsider.headers['cache-control']).toBe('no-store');
+
+    const stale = await call(
+      'put',
+      path,
+      camille,
+      organizationId,
+      { uploadId },
+      {
+        'If-Match': '"9"',
+      },
+    );
+    expect(stale.status).toBe(412);
+    expect(stale.headers['cache-control']).toBe('no-store');
+    expect(stale.body).toMatchObject({
+      code: 'request.version-mismatch',
+      details: { version: 1 },
+    });
+    const append = vi
+      .spyOn(app.get(OutboxWriter), 'append')
+      .mockRejectedValueOnce(new Error('Simulated logo outbox failure.'));
+    try {
+      const failed = await call(
+        'put',
+        path,
+        camille,
+        organizationId,
+        { uploadId },
+        { 'If-Match': '"1"' },
+      );
+      expect(failed.status).toBe(500);
+      expect(failed.headers['cache-control']).toBe('no-store');
+    } finally {
+      append.mockRestore();
+    }
+    const stillPending = await call('get', `${uploads}/${uploadId}`, camille, organizationId);
+    expect(stillPending.body).toMatchObject({ uploadId, state: 'pending' });
+    const unchanged = await call('get', '/internal/v1/organization', camille, organizationId);
+    expect(unchanged.body).toMatchObject({ logoId: null, version: 1 });
+    expect(
+      await outboxCount('organization.logo-changed.v1', 'organizationId', organizationId),
+    ).toBe(0);
+
+    const written = await call(
+      'put',
+      path,
+      camille,
+      organizationId,
+      { uploadId },
+      {
+        'If-Match': '"1"',
+      },
+    );
+    expect(written.status).toBe(204);
+    expect(written.headers.etag).toBe('"2"');
+    expect(written.headers['cache-control']).toBe('no-store');
+    const changed = await published(
+      'organization.logo-changed.v1',
+      (event) => event.assetId === uploadId,
+    );
+    expect(changed).toMatchObject({
+      version: 1,
+      organizationId,
+      actor: { type: 'user', id: camille.id },
+      assetId: uploadId,
+      oldAssetId: null,
+    });
+    const profile = await call('get', '/internal/v1/organization', camille, organizationId);
+    expect(profile.body).toMatchObject({ logoId: uploadId, version: 2 });
+
+    const removed = await call('delete', path, camille, organizationId, undefined, {
+      'If-Match': '"2"',
+    });
+    expect(removed.status).toBe(204);
+    expect(removed.headers.etag).toBe('"3"');
+    const retired = await published(
+      'organization.logo-changed.v1',
+      (event) => event.oldAssetId === uploadId,
+    );
+    expect(retired).toMatchObject({ version: 2, assetId: null });
+    const committedReplay = await call(
+      'put',
+      path,
+      camille,
+      organizationId,
+      { uploadId },
+      {
+        'If-Match': '"1"',
+      },
+    );
+    expect(committedReplay.status).toBe(204);
+    expect(committedReplay.headers.etag).toBe('"3"');
+    const cleared = await call('get', '/internal/v1/organization', camille, organizationId);
+    expect(cleared.body).toMatchObject({ logoId: null, version: 3 });
+    expect(
+      await outboxCount('organization.logo-changed.v1', 'organizationId', organizationId),
+    ).toBe(2);
   });
 
   it('answers only the client errors each operation declares in the contract', () => {

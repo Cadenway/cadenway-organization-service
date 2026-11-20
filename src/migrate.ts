@@ -2,12 +2,14 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { loadConfig } from '@cadenway/nest-common';
+import { provisionJobs } from '@cadenway/nest-jobs/provisioning';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
 
 import { migrationConfigSchema } from './config/app-config.js';
 import type { MigrationConfig } from './config/app-config.js';
+import { jobQueues } from './config/job-queues.js';
 
 // Entry point of the one-off migration container (`node dist/migrate.js`), which the GitOps agent of
 // cadenway-ops runs before it starts a new version. drizzle-kit is a development dependency and is
@@ -17,6 +19,8 @@ import type { MigrationConfig } from './config/app-config.js';
 // role of DATABASE_URL holds no DDL right and would be refused. The variable is validated only when
 // there is something to apply, and a missing or malformed one stops the container with a
 // ConfigError that names it.
+//
+// The migrator also provisions pg-boss and grants its runtime privileges to organization_app.
 /**
  * Constant migrationsFolder
  *
@@ -41,4 +45,10 @@ if (!existsSync(`${migrationsFolder}/meta/_journal.json`)) {
   } finally {
     await pool.end();
   }
+  await provisionJobs({
+    connection: { connectionString: migration.MIGRATION_DATABASE_URL },
+    appRole: 'organization_app',
+    queues: jobQueues,
+  });
+  console.log('Job queues provisioned.');
 }
