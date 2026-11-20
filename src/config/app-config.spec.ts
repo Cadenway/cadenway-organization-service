@@ -26,6 +26,7 @@ describe('appConfigSchema', () => {
       LOG_LEVEL: 'info',
       LOG_PRETTY: false,
       DATABASE_URL: 'postgres://organization_app:organization_app@localhost:5432/organization',
+      DATABASE_TRANSACTION_MAX_ATTEMPTS: 3,
       NATS_URL: 'nats://localhost:4222',
       NATS_USER: 'organization',
       NATS_PASSWORD: 'organization',
@@ -50,6 +51,13 @@ describe('appConfigSchema', () => {
 
     expect(() => loadConfig(appConfigSchema, example)).not.toThrow();
     expect(() => loadConfig(migrationConfigSchema, example)).not.toThrow();
+  });
+
+  it('accepts one transaction attempt to disable retries', () => {
+    expect(
+      loadConfig(appConfigSchema, { ...complete, DATABASE_TRANSACTION_MAX_ATTEMPTS: '1' })
+        .DATABASE_TRANSACTION_MAX_ATTEMPTS,
+    ).toBe(1);
   });
 
   it('refuses to start without the database, the broker, the audience or the trusted issuers', () => {
