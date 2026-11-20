@@ -57,7 +57,8 @@ function fixture() {
 
 describe('organization logo use cases', () => {
   it('locks current membership before allocation and replays the same original reservation', async () => {
-    const { store, work, clock, reservation } = fixture();
+    const { store, work, reservation } = fixture();
+    const clock = { now: () => new Date(now.getTime() + 789) };
     const reserve = new ReserveOrganizationLogoUpload(work, clock, 300_000);
     const input = {
       ...actor,

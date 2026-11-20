@@ -14,7 +14,7 @@ export class ReserveOrganizationLogoUpload {
     private readonly clock: Clock,
     private readonly lifetimeMs: number,
   ) {
-    if (!Number.isSafeInteger(lifetimeMs) || lifetimeMs <= 0)
+    if (!Number.isSafeInteger(lifetimeMs) || lifetimeMs < 1_000)
       throw new RangeError('Invalid logo reservation lifetime.');
   }
   // #endregion
@@ -51,7 +51,8 @@ export class ReserveOrganizationLogoUpload {
           { organizationId: input.organizationId, uploaderUserId: input.actorUserId, uploadId },
           declaration,
           now,
-          new Date(now.getTime() + this.lifetimeMs),
+          // The signed S3 POST policy represents its deadline in whole seconds.
+          new Date(Math.floor((now.getTime() + this.lifetimeMs) / 1_000) * 1_000),
         );
         await store.insertReservation(reservation, input.idempotencyKey);
         return {
