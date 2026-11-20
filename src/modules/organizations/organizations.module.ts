@@ -26,12 +26,16 @@ import { createOrganizationProvider } from './composition/providers/use-cases/or
 import { getCurrentOrganizationProvider } from './composition/providers/use-cases/organizations/get-current-organization.provider.js';
 import { listMyOrganizationsProvider } from './composition/providers/use-cases/organizations/list-my-organizations.provider.js';
 import { updateOrganizationProvider } from './composition/providers/use-cases/organizations/update-organization.provider.js';
+import { getSearchMembershipProvider } from './composition/providers/use-cases/search/get-search-membership.provider.js';
+import { listSearchOrganizationsProvider } from './composition/providers/use-cases/search/list-search-organizations.provider.js';
+import { searchOrganizationCursorProvider } from './composition/providers/use-cases/search/search-organization-cursor.provider.js';
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { OrganizationLogoController } from './presentation/http/controllers/logo/organization-logo.controller.js';
 import { MembersController } from './presentation/http/controllers/members/members.controller.js';
 import { MemberNamesController } from './presentation/http/controllers/members/member-names.controller.js';
 import { OrganizationsController } from './presentation/http/controllers/organizations/organizations.controller.js';
+import { SearchAuthorityController } from './presentation/http/controllers/search/search-authority.controller.js';
 import { UserDeletedHandler } from './presentation/messaging/handlers/users/user-deleted.handler.js';
 import { UserEmailChangedHandler } from './presentation/messaging/handlers/users/user-email-changed.handler.js';
 import { UserEmailVerifiedHandler } from './presentation/messaging/handlers/users/user-email-verified.handler.js';
@@ -56,6 +60,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     MemberNamesController,
     InvitationsController,
     ReceivedInvitationsController,
+    SearchAuthorityController,
   ],
   providers: [
     unitOfWorkProvider,
@@ -66,6 +71,9 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     updateOrganizationProvider,
     getCurrentOrganizationProvider,
     listMyOrganizationsProvider,
+    getSearchMembershipProvider,
+    listSearchOrganizationsProvider,
+    searchOrganizationCursorProvider,
     listMembersProvider,
     lookupMemberNamesProvider,
     getMemberProvider,

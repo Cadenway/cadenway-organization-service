@@ -60,6 +60,84 @@ describe('appConfigSchema', () => {
     ).toBe(1);
   });
 
+  it('loads the Search public key fragment and a canonical cursor secret', () => {
+    const first = {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: 'MVZQc5h6AXxnMpaBTaYw5kI-yWWawl6zp8Srhuf5NK0',
+      kid: 'fixture-search-1',
+    };
+    const second = { ...first, kid: 'fixture-search-2' };
+    const cursorSecret = Buffer.alloc(32, 7).toString('base64url');
+    const config = loadConfig(appConfigSchema, {
+      ...complete,
+      SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: [first, second]
+        .map((key) => JSON.stringify(key))
+        .join(','),
+      SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret,
+    });
+
+    expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).toMatchObject({
+      'api-gateway': [{ kid: 'local-placeholder' }],
+      'search-service': [first, second],
+    });
+    expect(config.SEARCH_PROJECTION_CURSOR_SECRET).toBe(cursorSecret);
+  });
+
+  it('gives the explicit Search issuer precedence over the fallback', () => {
+    const key = {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: 'MVZQc5h6AXxnMpaBTaYw5kI-yWWawl6zp8Srhuf5NK0',
+      kid: 'fixture-explicit-search',
+    };
+    const explicit = `${trustedIssuers.slice(0, -1)},"search-service":[${JSON.stringify(key)}]}`;
+
+    expect(
+      loadConfig(appConfigSchema, {
+        ...complete,
+        INTERNAL_TOKEN_TRUSTED_ISSUERS: explicit,
+        SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: 'unusable-fallback',
+      }).INTERNAL_TOKEN_TRUSTED_ISSUERS,
+    ).toMatchObject({
+      'api-gateway': [{ kid: 'local-placeholder' }],
+      'search-service': [key],
+    });
+  });
+
+  it.each(['', '  ', 'null'])('leaves Search dormant with the fallback %j', (fallback) => {
+    const config = loadConfig(appConfigSchema, {
+      ...complete,
+      SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: fallback,
+      SEARCH_PROJECTION_CURSOR_SECRET: '',
+    });
+
+    expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('search-service');
+    expect(config).not.toHaveProperty('SEARCH_PROJECTION_CURSOR_SECRET');
+  });
+
+  it('refuses a private Search key without printing it', () => {
+    const key = JSON.stringify({
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: 'MVZQc5h6AXxnMpaBTaYw5kI-yWWawl6zp8Srhuf5NK0',
+      kid: 'fixture-private-search',
+      d: 'synthetic-private-key-contents',
+    });
+    const load = () =>
+      loadConfig(appConfigSchema, { ...complete, SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: key });
+    expect(load).toThrow(/SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS/u);
+    expect(load).not.toThrow(/synthetic-private-key-contents/u);
+  });
+
+  it('refuses a noncanonical encoding of the cursor secret without printing it', () => {
+    const secret = `${'A'.repeat(42)}B`;
+    const load = () =>
+      loadConfig(appConfigSchema, { ...complete, SEARCH_PROJECTION_CURSOR_SECRET: secret });
+    expect(load).toThrow(/SEARCH_PROJECTION_CURSOR_SECRET/u);
+    expect(load).not.toThrow(secret);
+  });
+
   it('refuses to start without the database, the broker, the audience or the trusted issuers', () => {
     expect(() => loadConfig(appConfigSchema, { PORT: '3011' })).toThrow(ConfigError);
     try {

@@ -81,6 +81,12 @@ From `openapi/internal/organization-service.yaml` of the installed `@cadenway/co
 `api-gateway`, actor `user`. "Required" routes act on the organization of the internal token in its
 tenant transaction; "none" routes ignore it.
 
+Search uses two private, uncacheable routes. `GET /internal/v1/search-organizations` requires
+the Search system identity without an organization claim and exports only organization IDs.
+It resumes within the authenticated upper bound of the first page.
+`GET /internal/v1/search-membership` requires an authenticated user and organization delegated
+by Search. One tenant snapshot returns the active membership ID, role and membership version.
+
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /internal/v1/organizations`                          | None         | 201, `Location`, `ETag` | 400, 404 `user.not-synchronized`, 409 `organization.slug-taken`, 422 `organization.slug-invalid`                                                          |
@@ -313,12 +319,15 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
 
 ## Transactions
 
-`DrizzleOrganizationsUnitOfWork` runs each use case in one transaction of the kit's runners, the
-acceptance and the refusal in two (a read-only check, then the write):
+`DrizzleOrganizationsUnitOfWork` runs organization, member and invitation use cases in the kit's
+transactions. It runs invitation acceptance and refusal in two (a read-only check, then the write).
+The Search readers open their snapshots directly with the kit's transaction runners:
 
 - Tenant transaction of the organization of the token: reading and patching the organization,
   every member and invitation route. The membership of the actor, the change, its version check
   and its event commit together.
+- `GET /internal/v1/search-membership` opens a tenant `REPEATABLE READ READ ONLY` transaction and
+  reads the active membership of the delegated user in the token's organization.
 - The batches and the resends of an organization run one after the other: the check of the daily
   allowance locks the row of the organization (`select … for no key update`) until the end of the
   transaction, then counts the ledger, so two concurrent requests cannot both pass on the same
@@ -342,6 +351,9 @@ acceptance and the refusal in two (a read-only check, then the write):
     of the actor's directory entry;
   - the first checks of an answer to an invitation: a read-only lookup of one invitation by id
     and of the actor's directory entry;
+  - `GET /internal/v1/search-organizations`: a `REPEATABLE READ READ ONLY` export of at most 100
+    active organization IDs per page up to the first snapshot's high-water UUID. Only the
+    `search-service` system actor in a token with a null organization can open this transaction;
   - the projection of the directory: one entry by its account id, in the transaction of the
     deduplicator;
   - the removal of a deleted account: its directory entry and its active memberships in every

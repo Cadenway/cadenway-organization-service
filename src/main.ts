@@ -5,6 +5,7 @@ import { AppModule } from './app.module.js';
 import { appConfigSchema } from './config/app-config.js';
 import type { AppConfig } from './config/app-config.js';
 import { installOrganizationLogoCachePolicy } from './infrastructure/http/organization-logo-cache-policy.js';
+import { installOrganizationSearchCachePolicy } from './infrastructure/http/organization-search-cache-policy.js';
 
 // Started after the instrumentation hooks and `telemetry.js`, with the heap capped for the 256M
 // container: `node --max-old-space-size=160 --import @cadenway/nest-common/register
@@ -28,5 +29,6 @@ await runApplication({ service: 'organization-service' }, async (): Promise<void
     },
   });
   installOrganizationLogoCachePolicy(app);
+  installOrganizationSearchCachePolicy(app);
   await app.listen(config.PORT);
 });
