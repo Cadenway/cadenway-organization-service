@@ -25,13 +25,20 @@ import { z } from 'zod';
  *   which accepts an anonymous local broker, but every broker of Cadenway refuses a connection
  *   without them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
- *   and the public keys of the backends allowed to call it.
+ *   and the public keys of the backends allowed to call it. An optional
+ *   `SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS` supplies Search keys when the map has no Search
+ *   issuer.
+ * - `SEARCH_PROJECTION_CURSOR_SECRET`: optional organization-local key for Search export cursors,
+ *   as 32 bytes in canonical base64url.
  *
  * `OTEL_EXPORTER_OTLP_ENDPOINT` is read by `telemetry.ts`, before the application exists.
- *
- * @type {BaseConfig & DatabaseConfig & MessagingConfig & InternalTokenVerifierConfig}
  */
-export type AppConfig = BaseConfig & DatabaseConfig & MessagingConfig & InternalTokenVerifierConfig;
+export type AppConfig = BaseConfig &
+  DatabaseConfig &
+  MessagingConfig &
+  InternalTokenVerifierConfig & {
+    readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
+  };
 
 /**
  * Constant appConfigSchema
@@ -44,12 +51,72 @@ export type AppConfig = BaseConfig & DatabaseConfig & MessagingConfig & Internal
  *
  * @type {z.ZodType<AppConfig>}
  */
-export const appConfigSchema: z.ZodType<AppConfig> = z.object({
-  ...baseConfigShape,
-  ...databaseConfigShape,
-  ...messagingConfigShape,
-  ...internalTokenVerifierConfigShape,
-});
+export const appConfigSchema: z.ZodType<AppConfig> = z
+  .object({
+    ...baseConfigShape,
+    ...databaseConfigShape,
+    ...messagingConfigShape,
+    ...internalTokenVerifierConfigShape,
+    SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    SEARCH_PROJECTION_CURSOR_SECRET: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z
+        .string()
+        .refine(
+          (value) =>
+            value.length === 43 && Buffer.from(value, 'base64url').toString('base64url') === value,
+          'Expected 32 bytes in canonical base64url.',
+        )
+        .optional(),
+    ),
+  })
+  .transform(
+    (
+      {
+        SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: searchKeys,
+        SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret,
+        ...baseConfig
+      },
+      context,
+    ): AppConfig => {
+      const config: AppConfig = {
+        ...baseConfig,
+        ...(cursorSecret === undefined ? {} : { SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret }),
+      };
+      if (
+        !searchKeys ||
+        searchKeys === 'null' ||
+        Object.hasOwn(config.INTERNAL_TOKEN_TRUSTED_ISSUERS, 'search-service')
+      ) {
+        return config;
+      }
+
+      try {
+        const keys: unknown = JSON.parse(`[${searchKeys}]`);
+        const searchIssuer =
+          internalTokenVerifierConfigShape.INTERNAL_TOKEN_TRUSTED_ISSUERS.safeParse(
+            JSON.stringify({ 'search-service': keys }),
+          );
+        if (searchIssuer.success) {
+          return {
+            ...config,
+            INTERNAL_TOKEN_TRUSTED_ISSUERS: {
+              ...config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
+              ...searchIssuer.data,
+            },
+          };
+        }
+      } catch {
+        // Report the variable without its contents.
+      }
+      context.addIssue({
+        code: 'custom',
+        path: ['SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
+        message: 'Expected comma-separated public Ed25519 JWKs.',
+      });
+      return z.NEVER;
+    },
+  );
 
 /**
  * Interface MigrationConfig
