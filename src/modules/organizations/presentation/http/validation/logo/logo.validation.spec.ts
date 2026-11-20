@@ -29,9 +29,11 @@ describe('organization logo HTTP validation', () => {
   });
 
   it('reports supported media refusals with the specified 422 codes', () => {
-    expect(
-      problem(() => pipe.transform({ contentType: 'image/png', sizeBytes: 5_242_881 }, metadata)),
-    ).toMatchObject({ status: 422, code: 'media.file-too-large' });
+    for (const sizeBytes of [5_242_881, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(
+        problem(() => pipe.transform({ contentType: 'image/png', sizeBytes }, metadata)),
+      ).toMatchObject({ status: 422, code: 'media.file-too-large' });
+    }
     expect(
       problem(() => pipe.transform({ contentType: 'image/jpeg', sizeBytes: 50 }, metadata)),
     ).toMatchObject({ status: 422, code: 'media.unsupported-type' });
@@ -40,6 +42,7 @@ describe('organization logo HTTP validation', () => {
   it('refuses invalid or additional body fields using the contract validator', () => {
     for (const value of [
       { contentType: 'image/png', sizeBytes: 0 },
+      { contentType: 'image/png', sizeBytes: 5_242_880.5 },
       { contentType: 'image/png', sizeBytes: 1, organizationId: 'other' },
       { contentType: 'image/png' },
     ]) {

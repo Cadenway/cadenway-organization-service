@@ -28,7 +28,7 @@ export class LogoDeclarationPipe implements PipeTransform {
       'sizeBytes' in value &&
       typeof value.contentType === 'string' &&
       typeof value.sizeBytes === 'number' &&
-      Number.isSafeInteger(value.sizeBytes) &&
+      Number.isInteger(value.sizeBytes) &&
       value.sizeBytes > 0
     ) {
       if (value.contentType !== 'image/png' && value.contentType !== 'image/svg+xml') {
