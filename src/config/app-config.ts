@@ -38,8 +38,8 @@ const optionalCursorSecret = z.preprocess(
  *   without them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it. An optional
- *   issuer-specific fallback supplies public Search, Billing and Notification keys when the map has
- *   no corresponding issuer.
+ *   issuer-specific fallback supplies public Search, Identity, Billing and Notification keys when
+ *   the map has no corresponding issuer.
  * - `SEARCH_PROJECTION_CURSOR_SECRET` and `BILLING_AUTHORITY_CURSOR_SECRET`: stable keys for their
  *   respective export cursors, as 32 bytes in canonical base64url.
  * - `ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED`: enables the Billing durable independently of
@@ -75,6 +75,7 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
     SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
@@ -92,6 +93,7 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     (
       {
         SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: searchKeys,
+        IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: identityKeys,
         BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: billingKeys,
         NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: notificationKeys,
         SEARCH_PROJECTION_CURSOR_SECRET: searchCursorSecret,
@@ -103,6 +105,7 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       const trusted = { ...baseConfig.INTERNAL_TOKEN_TRUSTED_ISSUERS };
       const fallbacks = [
         ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', searchKeys],
+        ['identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', identityKeys],
         ['billing-service', 'BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', billingKeys],
         [
           'notification-service',

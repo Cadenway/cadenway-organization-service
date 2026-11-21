@@ -2,13 +2,14 @@ import type {
   SearchMembership,
   SearchOrganizationPage,
 } from '@cadenway/contracts/types/internal/organization-service';
+import type { InternalPrincipal } from '@cadenway/nest-common';
 import {
-  getOrganizationContext,
   InternalAccess,
+  principalOf,
   ProblemException,
   ZodValidationPipe,
 } from '@cadenway/nest-common';
-import { Controller, Get, Header, Query } from '@nestjs/common';
+import { Controller, Get, Header, Query, Req } from '@nestjs/common';
 
 import { GetSearchMembership } from '../../../../application/use-cases/queries/search/get-search-membership/get-search-membership.use-case.js';
 import { ListSearchOrganizations } from '../../../../application/use-cases/queries/search/list-search-organizations/list-search-organizations.use-case.js';
@@ -18,7 +19,9 @@ import { answerSearchAuthority } from '../../errors/search/search-authority.prob
 import { toActorUserId, toOrganizationId } from '../../mappers/context/request-context.mapper.js';
 import { SearchOrganizationCursor } from '../../mappers/search/search-organization-cursor.mapper.js';
 
-/** Supplies Search with bounded bootstrap IDs and live membership stamps. */
+const authorityIssuers = ['search-service', 'identity-service'] as const;
+
+/** Supplies Search and Identity with bounded bootstrap IDs and live membership stamps. */
 @Controller('internal/v1')
 @InternalAccess({ issuers: ['search-service'] })
 export class SearchAuthorityController {
@@ -37,16 +40,19 @@ export class SearchAuthorityController {
   // #endregion
 
   // #region Methods
-  /** Reserves the cross-tenant scan for the unscoped Search system actor. */
+  /** Reserves the cross-tenant scan for the signing service's unscoped system actor. */
   @Get('search-organizations')
-  @InternalAccess({ actors: ['system'], organization: 'optional' })
+  @InternalAccess({ issuers: authorityIssuers, actors: ['system'], organization: 'optional' })
   @Header('Cache-Control', 'private, no-store')
-  public async list(@Query() query: ListSearchOrganizationsQuery): Promise<SearchOrganizationPage> {
-    const context = getOrganizationContext();
-    if (context?.actor.type !== 'system' || context.actor.id !== 'search-service') {
+  public async list(
+    @Query() query: ListSearchOrganizationsQuery,
+    @Req() request: object,
+  ): Promise<SearchOrganizationPage> {
+    const principal = this.requireAuthorityPrincipal(request);
+    if (principal.actor.type !== 'system' || principal.actor.id !== principal.issuer) {
       throw new ProblemException({ status: 403, code: 'auth.actor-not-allowed' });
     }
-    if (context.organizationId !== null) {
+    if (principal.organizationId !== null) {
       throw new ProblemException({ status: 403, code: 'auth.organization-not-allowed' });
     }
     return answerSearchAuthority(async () => {
@@ -60,9 +66,13 @@ export class SearchAuthorityController {
 
   /** Proves the current membership of the signed user in the signed organization. */
   @Get('search-membership')
-  @InternalAccess({ actors: ['user'], organization: 'required' })
+  @InternalAccess({ issuers: authorityIssuers, actors: ['user'], organization: 'required' })
   @Header('Cache-Control', 'private, no-store')
-  public async membership(@Query() query: unknown): Promise<SearchMembership> {
+  public async membership(
+    @Query() query: unknown,
+    @Req() request: object,
+  ): Promise<SearchMembership> {
+    this.requireAuthorityPrincipal(request);
     this.membershipQuery.transform(query, { type: 'query' });
     return answerSearchAuthority(() =>
       this.getSearchMembership.execute({
@@ -70,6 +80,19 @@ export class SearchAuthorityController {
         organizationId: toOrganizationId(),
       }),
     );
+  }
+
+  /** Identity requests a current stamp using only the signed actor and tenant. */
+  private requireAuthorityPrincipal(request: object): InternalPrincipal {
+    const principal = principalOf(request);
+    if (
+      principal === undefined ||
+      (principal.issuer === 'identity-service' &&
+        (principal.role !== null || principal.scopes.length !== 0))
+    ) {
+      throw new ProblemException({ status: 403, code: 'auth.actor-not-allowed' });
+    }
+    return principal;
   }
   // #endregion
 }
