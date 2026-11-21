@@ -16,7 +16,7 @@ Organizations and who belongs to them.
 
 **Events emitted**: `organization.created.v1`, `organization.updated.v1`, `member.joined.v1`, `member.role-changed.v1`, `member.removed.v1`, `invitation.issued.v1` (`asyncapi/organization-service.yaml`; none restricted). Later phases (deletion, verified domains) add their own versioned events once `cadenway-api-contracts` publishes them.
 
-**Events consumed**: `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and `user.two-step-verification-changed.v1` of identity-service, into the user directory (names and addresses of the members, the verified address that accepts an invitation, whether each account has two-step verification, which only the owner and the admins see), and `user.deleted.v1`, which removes the memberships of a deleted account and keeps it in the directory as « Ancien membre ». Later phases add the seat count of billing-service and the audit log once their events exist in the contract.
+**Events consumed**: `user.signed-up.v1`, `user.email-verified.v1`, `user.profile-updated.v1`, `user.email-changed.v1` and `user.two-step-verification-changed.v1` of identity-service, into the user directory (names and addresses of the members, the verified address that accepts an invitation, whether each account has two-step verification, which only the owner and the admins see), and `user.deleted.v1`, which removes the memberships of a deleted account and keeps it in the directory as « Ancien membre ». When enabled, `subscription.changed.v1` of billing-service projects the versioned seat limit used at admission. A later phase adds the audit log once its events exist in the contract.
 
 **External systems**: DNS lookups for domain verification (TXT record).
 

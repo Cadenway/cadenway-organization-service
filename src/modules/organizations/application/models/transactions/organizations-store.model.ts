@@ -1,4 +1,5 @@
 import type { OrganizationEvents } from '../../ports/outbound/messaging/organizations/organization-events.port.js';
+import type { SeatEntitlementRepository } from '../../ports/outbound/persistence/billing/seat-entitlement-repository.port.js';
 import type { DirectoryRepository } from '../../ports/outbound/persistence/directory/directory-repository.port.js';
 import type { InvitationEmailRepository } from '../../ports/outbound/persistence/invitations/invitation-email-repository.port.js';
 import type { InvitationRepository } from '../../ports/outbound/persistence/invitations/invitation-repository.port.js';
@@ -34,6 +35,9 @@ export interface OrganizationsStore {
    * @readonly
    */
   readonly members: MemberRepository;
+
+  /** The Billing seat projection of the tenant. */
+  readonly seatEntitlements: SeatEntitlementRepository;
 
   /**
    * Property invitations

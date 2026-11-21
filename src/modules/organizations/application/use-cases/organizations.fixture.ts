@@ -4,6 +4,7 @@ import { Member } from '../../domain/aggregates/member/member.aggregate.js';
 import { Organization } from '../../domain/aggregates/organization/organization.aggregate.js';
 import { SlugTakenError } from '../../domain/errors/organizations/slug-taken.error.js';
 import { takesSeat } from '../../domain/policies/members/seat.policy.js';
+import type { SeatEntitlement } from '../../domain/value-objects/billing/seat-entitlement.value-object.js';
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
@@ -63,6 +64,9 @@ interface Tables {
   /** Memberships by id. */
   members: Map<string, MemberState>;
 
+  /** Committed seat projections by organization. */
+  seatEntitlements: Map<string, SeatEntitlement>;
+
   /** Invitations by id. */
   invitations: Map<string, InvitationState>;
 
@@ -110,6 +114,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
   public tables: Tables = {
     organizations: new Map(),
     members: new Map(),
+    seatEntitlements: new Map(),
     invitations: new Map(),
     directory: new Map(),
     invitationEmails: [],
@@ -191,6 +196,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
     const tables: Tables = {
       organizations: new Map(this.tables.organizations),
       members: new Map(this.tables.members),
+      seatEntitlements: new Map(this.tables.seatEntitlements),
       invitations: new Map(this.tables.invitations),
       directory: new Map(this.tables.directory),
       invitationEmails: [...this.tables.invitationEmails],
@@ -369,6 +375,21 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
         },
         count: (organizationId: string, filters: MemberFilters): Promise<number> =>
           Promise.resolve(matching(organizationId, filters).length),
+      },
+      seatEntitlements: {
+        find: (organizationId: string): Promise<SeatEntitlement | null> =>
+          Promise.resolve(tables.seatEntitlements.get(organizationId) ?? null),
+        writeNext: (organizationId: string, entitlement: SeatEntitlement): Promise<boolean> => {
+          const current = tables.seatEntitlements.get(organizationId);
+          if (
+            current !== undefined &&
+            (current.version >= entitlement.version || current.seatLimit > entitlement.seatLimit)
+          ) {
+            return Promise.resolve(false);
+          }
+          tables.seatEntitlements.set(organizationId, entitlement);
+          return Promise.resolve(true);
+        },
       },
       invitations: {
         insertPending: (draft: InvitationDraft): Promise<Invitation | null> => {

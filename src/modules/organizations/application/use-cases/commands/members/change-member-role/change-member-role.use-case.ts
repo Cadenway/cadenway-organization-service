@@ -8,6 +8,7 @@ import type { OrganizationsStore } from '../../../../models/transactions/organiz
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { MemberView } from '../../../../projections/members/member-view.projection.js';
 import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
+import { requireAvailableSeat } from '../../../../services/members/seat-limit.service.js';
 import { assertVersionMatches } from '../../../../services/versions/version-check.service.js';
 import type { ChangeMemberRoleInput } from './change-member-role.input.js';
 
@@ -88,16 +89,8 @@ export class ChangeMemberRole {
           const changed: Member = member.changeRole(input.role);
           if (changed !== member) {
             if (this.seatQuotaEnabled && !takesSeat(member.role) && takesSeat(changed.role)) {
-              const organization = await store.organizations.find(input.organizationId);
-              if (organization === null) {
-                throw new OrganizationRefusal({ reason: 'organization-not-found' });
-              }
-              if (organization.snapshot.plan === 'free') {
-                await store.members.lockSeatAdmission(input.organizationId);
-                if ((await store.members.countSeats(input.organizationId)) >= 5) {
-                  throw new OrganizationRefusal({ reason: 'seat-quota-exceeded' });
-                }
-              }
+              await store.members.lockSeatAdmission(input.organizationId);
+              await requireAvailableSeat(store, input.organizationId);
             }
             await store.members.update(changed);
             await store.events.memberRoleChanged(changed, member.role, input.actorUserId);
