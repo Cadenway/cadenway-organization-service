@@ -43,6 +43,13 @@
       "when": 1795202159196,
       "tag": "0005_organization_logo",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1795249743428,
+      "tag": "0006_billing_membership_index",
+      "breakpoints": true
     }
   ]
 }

@@ -75,6 +75,11 @@ organization or of an invitation, a later phase, deletes its ledger rows first.
 declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
 digest of the key. Storage owns the bytes and signed transfers.
 
+`0006_billing_membership_index` adds `(organization_id, id)` for a bounded snapshot that includes
+removed memberships. The Billing reader returns member IDs and source versions with the role of
+active memberships. The Notification reader returns current owner and administrator user IDs
+from the existing active-member index. Their HTTP adapters use the published service contracts.
+
 ## API
 
 From `openapi/internal/organization-service.yaml` of the installed `@cadenway/contracts`; issuer

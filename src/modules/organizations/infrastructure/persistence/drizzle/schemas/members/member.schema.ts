@@ -51,6 +51,7 @@ export const members = pgTable(
     index('members_user_active_index')
       .on(table.userId)
       .where(sql`${table.removedAt} is null`),
+    index('members_organization_membership_index').on(table.organizationId, table.id),
     check('members_role_check', sql`${table.role} in ('owner', 'admin', 'member', 'guest')`),
     check('members_version_check', sql`${table.version} >= 1`),
     organizationPolicy('members_organization_isolation'),
