@@ -74,29 +74,33 @@ describe('appConfigSchema', () => {
     });
   });
 
-  it('loads the Search public key fragment and a canonical cursor secret', () => {
-    const first = {
-      kty: 'OKP',
-      crv: 'Ed25519',
-      x: 'MVZQc5h6AXxnMpaBTaYw5kI-yWWawl6zp8Srhuf5NK0',
-      kid: 'fixture-search-1',
-    };
-    const second = { ...first, kid: 'fixture-search-2' };
-    const cursorSecret = Buffer.alloc(32, 7).toString('base64url');
-    const config = loadConfig(appConfigSchema, {
-      ...complete,
-      SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: [first, second]
-        .map((key) => JSON.stringify(key))
-        .join(','),
-      SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret,
-    });
+  it.each([
+    ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
+    ['identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
+  ] as const)(
+    'loads rotating public keys for %s and a canonical cursor secret',
+    (issuer, variable) => {
+      const first = {
+        kty: 'OKP',
+        crv: 'Ed25519',
+        x: 'MVZQc5h6AXxnMpaBTaYw5kI-yWWawl6zp8Srhuf5NK0',
+        kid: 'fixture-rotation-1',
+      };
+      const second = { ...first, kid: 'fixture-rotation-2' };
+      const cursorSecret = Buffer.alloc(32, 7).toString('base64url');
+      const config = loadConfig(appConfigSchema, {
+        ...complete,
+        [variable]: [first, second].map((key) => JSON.stringify(key)).join(','),
+        SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret,
+      });
 
-    expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).toMatchObject({
-      'api-gateway': [{ kid: 'local-placeholder' }],
-      'search-service': [first, second],
-    });
-    expect(config.SEARCH_PROJECTION_CURSOR_SECRET).toBe(cursorSecret);
-  });
+      expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).toMatchObject({
+        'api-gateway': [{ kid: 'local-placeholder' }],
+        [issuer]: [first, second],
+      });
+      expect(config.SEARCH_PROJECTION_CURSOR_SECRET).toBe(cursorSecret);
+    },
+  );
 
   it('gives the explicit Search issuer precedence over the fallback', () => {
     const key = {
@@ -119,16 +123,21 @@ describe('appConfigSchema', () => {
     });
   });
 
-  it.each(['', '  ', 'null'])('leaves Search dormant with the fallback %j', (fallback) => {
-    const config = loadConfig(appConfigSchema, {
-      ...complete,
-      SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: fallback,
-      SEARCH_PROJECTION_CURSOR_SECRET: '',
-    });
+  it.each(['', '  ', 'null'])(
+    'leaves Search and Identity dormant with the fallback %j',
+    (fallback) => {
+      const config = loadConfig(appConfigSchema, {
+        ...complete,
+        SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: fallback,
+        IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: fallback,
+        SEARCH_PROJECTION_CURSOR_SECRET: '',
+      });
 
-    expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('search-service');
-    expect(config).not.toHaveProperty('SEARCH_PROJECTION_CURSOR_SECRET');
-  });
+      expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('search-service');
+      expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('identity-service');
+      expect(config).not.toHaveProperty('SEARCH_PROJECTION_CURSOR_SECRET');
+    },
+  );
 
   it('refuses a private Search key without printing it', () => {
     const key = JSON.stringify({

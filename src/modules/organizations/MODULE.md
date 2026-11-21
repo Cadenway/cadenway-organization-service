@@ -92,11 +92,12 @@ From `openapi/internal/organization-service.yaml` of the installed `@cadenway/co
 `api-gateway`, actor `user`. "Required" routes act on the organization of the internal token in its
 tenant transaction; "none" routes ignore it.
 
-Search uses two private, uncacheable routes. `GET /internal/v1/search-organizations` requires
-the Search system identity without an organization claim and exports only organization IDs.
-It resumes within the authenticated upper bound of the first page.
-`GET /internal/v1/search-membership` requires an authenticated user and organization delegated
-by Search. One tenant snapshot returns the active membership ID, role and membership version.
+Search and Identity use two private, uncacheable routes. `GET /internal/v1/search-organizations`
+requires the signing service's own system identity without an organization claim and exports only
+organization IDs. It resumes within the authenticated upper bound of the first page.
+`GET /internal/v1/search-membership` requires a signed user actor and organization. One tenant
+snapshot returns the active membership ID, role and membership version. Identity calls these
+routes without a delegated role or scopes.
 
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
