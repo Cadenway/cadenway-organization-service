@@ -95,10 +95,11 @@ by Search. One tenant snapshot returns the active membership ID, role and member
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
 with an organization claim and returns the active and removed member versions for that tenant.
-Notification uses `GET` and `POST /internal/v1/quota-notification-recipients` with its
-system identity and an organization claim. The list pages the current owners and administrators.
-The lookup rechecks candidate user IDs before delivery. All four operations send
-`Cache-Control: private, no-store`, including authentication errors.
+Notification uses `GET /internal/v1/quota-notification-recipients` and
+`POST /internal/v1/quota-notification-recipients/lookup` with its system identity and an
+organization claim. The list pages the current owners and administrators. The lookup rechecks
+candidate user IDs before delivery. All four operations send `Cache-Control: private, no-store`,
+including authentication errors.
 
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
