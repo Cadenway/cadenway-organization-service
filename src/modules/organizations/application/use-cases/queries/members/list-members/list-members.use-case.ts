@@ -17,10 +17,11 @@ import type { ListMembersOutput } from './list-members.output.js';
  *
  * @description
  * Lists the active members of the organization of the request (`GET /internal/v1/members`) in a
- * read-only tenant transaction, sorted by name without regard to case or accents, then by id. The
- * search matches the name and the address the same way. Owner, admins and members read it; a guest
- * is refused (`role-forbidden`, decision 1 of P2b). Whether each member has two-step verification
- * is answered to the owner and the admins only (`toMemberViewFor`).
+ * read-only tenant snapshot, so the page and its counts observe the same membership state.
+ * The page is sorted by name without regard to case or accents, then by id. Search matches
+ * the name and address the same way. Owner, admins and members read it; a guest is refused
+ * (`role-forbidden`, decision 1 of P2b). The two-step verification flag is visible to the owner
+ * and admins only (`toMemberViewFor`).
  */
 export class ListMembers {
   // #region Properties
@@ -94,7 +95,7 @@ export class ListMembers {
             counts: await store.members.countByRole(input.organizationId),
           };
         },
-        { readOnly: true },
+        { readOnly: true, isolationLevel: 'repeatable read' },
       );
     } catch (error) {
       throw toOrganizationRefusal(error);

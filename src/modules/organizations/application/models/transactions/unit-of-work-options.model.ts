@@ -16,5 +16,8 @@ export interface UnitOfWorkOptions {
    * @readonly
    */
   readonly readOnly?: boolean;
+
+  /** Keeps all reads in this transaction on the same snapshot when requested. */
+  readonly isolationLevel?: 'repeatable read';
   // #endregion
 }

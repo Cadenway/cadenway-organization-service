@@ -385,6 +385,8 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - Tenant transaction of the organization of the token: reading and patching the organization,
   every member and invitation route. The membership of the actor, the change, its version check
   and its event commit together.
+- `GET /internal/v1/members` opens a tenant `REPEATABLE READ READ ONLY` transaction for the
+  permission check, the page, the filtered total and the counts by role.
 - `GET /internal/v1/search-membership` opens a tenant `REPEATABLE READ READ ONLY` transaction and
   reads the active membership of the delegated user in the token's organization.
 - The batches and the resends of an organization run one after the other: the check of the daily
