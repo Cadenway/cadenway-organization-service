@@ -6,6 +6,18 @@ import { messagingConfigShape } from '@cadenway/nest-messaging';
 import type { MessagingConfig } from '@cadenway/nest-messaging';
 import { z } from 'zod';
 
+const optionalCursorSecret = z.preprocess(
+  (value) => (value === '' ? undefined : value),
+  z
+    .string()
+    .refine(
+      (value) =>
+        value.length === 43 && Buffer.from(value, 'base64url').toString('base64url') === value,
+      'Expected 32 bytes in canonical base64url.',
+    )
+    .optional(),
+);
+
 /**
  * Type AppConfig
  *
@@ -26,10 +38,10 @@ import { z } from 'zod';
  *   without them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it. An optional
- *   `SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS` supplies Search keys when the map has no Search
- *   issuer.
- * - `SEARCH_PROJECTION_CURSOR_SECRET`: optional organization-local key for Search export cursors,
- *   as 32 bytes in canonical base64url.
+ *   issuer-specific fallback supplies public Search, Billing and Notification keys when the map has
+ *   no corresponding issuer.
+ * - `SEARCH_PROJECTION_CURSOR_SECRET` and `BILLING_AUTHORITY_CURSOR_SECRET`: stable keys for their
+ *   respective export cursors, as 32 bytes in canonical base64url.
  *
  * `OTEL_EXPORTER_OTLP_ENDPOINT` is read by `telemetry.ts`, before the application exists.
  */
@@ -38,6 +50,7 @@ export type AppConfig = BaseConfig &
   MessagingConfig &
   InternalTokenVerifierConfig & {
     readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
+    readonly BILLING_AUTHORITY_CURSOR_SECRET?: string;
   };
 
 /**
@@ -58,63 +71,65 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
     SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
-    SEARCH_PROJECTION_CURSOR_SECRET: z.preprocess(
-      (value) => (value === '' ? undefined : value),
-      z
-        .string()
-        .refine(
-          (value) =>
-            value.length === 43 && Buffer.from(value, 'base64url').toString('base64url') === value,
-          'Expected 32 bytes in canonical base64url.',
-        )
-        .optional(),
-    ),
+    BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
+    BILLING_AUTHORITY_CURSOR_SECRET: optionalCursorSecret,
   })
   .transform(
     (
       {
         SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: searchKeys,
-        SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret,
+        BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: billingKeys,
+        NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: notificationKeys,
+        SEARCH_PROJECTION_CURSOR_SECRET: searchCursorSecret,
+        BILLING_AUTHORITY_CURSOR_SECRET: billingCursorSecret,
         ...baseConfig
       },
       context,
     ): AppConfig => {
-      const config: AppConfig = {
-        ...baseConfig,
-        ...(cursorSecret === undefined ? {} : { SEARCH_PROJECTION_CURSOR_SECRET: cursorSecret }),
-      };
-      if (
-        !searchKeys ||
-        searchKeys === 'null' ||
-        Object.hasOwn(config.INTERNAL_TOKEN_TRUSTED_ISSUERS, 'search-service')
-      ) {
-        return config;
-      }
-
-      try {
-        const keys: unknown = JSON.parse(`[${searchKeys}]`);
-        const searchIssuer =
-          internalTokenVerifierConfigShape.INTERNAL_TOKEN_TRUSTED_ISSUERS.safeParse(
-            JSON.stringify({ 'search-service': keys }),
-          );
-        if (searchIssuer.success) {
-          return {
-            ...config,
-            INTERNAL_TOKEN_TRUSTED_ISSUERS: {
-              ...config.INTERNAL_TOKEN_TRUSTED_ISSUERS,
-              ...searchIssuer.data,
-            },
-          };
+      const trusted = { ...baseConfig.INTERNAL_TOKEN_TRUSTED_ISSUERS };
+      const fallbacks = [
+        ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', searchKeys],
+        ['billing-service', 'BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', billingKeys],
+        [
+          'notification-service',
+          'NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS',
+          notificationKeys,
+        ],
+      ] as const;
+      for (const [issuer, variable, fragment] of fallbacks) {
+        if (!fragment || fragment === 'null' || Object.hasOwn(trusted, issuer)) continue;
+        try {
+          const keys: unknown = JSON.parse(`[${fragment}]`);
+          const issuerConfig =
+            internalTokenVerifierConfigShape.INTERNAL_TOKEN_TRUSTED_ISSUERS.safeParse(
+              JSON.stringify({ [issuer]: keys }),
+            );
+          if (issuerConfig.success) {
+            Object.assign(trusted, issuerConfig.data);
+            continue;
+          }
+        } catch {
+          // Report the variable without its contents.
         }
-      } catch {
-        // Report the variable without its contents.
+        context.addIssue({
+          code: 'custom',
+          path: [variable],
+          message: 'Expected comma-separated public Ed25519 JWKs.',
+        });
+        return z.NEVER;
       }
-      context.addIssue({
-        code: 'custom',
-        path: ['SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
-        message: 'Expected comma-separated public Ed25519 JWKs.',
-      });
-      return z.NEVER;
+      return {
+        ...baseConfig,
+        INTERNAL_TOKEN_TRUSTED_ISSUERS: trusted,
+        ...(searchCursorSecret === undefined
+          ? {}
+          : { SEARCH_PROJECTION_CURSOR_SECRET: searchCursorSecret }),
+        ...(billingCursorSecret === undefined
+          ? {}
+          : { BILLING_AUTHORITY_CURSOR_SECRET: billingCursorSecret }),
+      };
     },
   );
 
