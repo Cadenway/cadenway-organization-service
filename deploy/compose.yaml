@@ -7,8 +7,8 @@
 # below in docs/service-environment.md. Required variables must exist on the host before the
 # release that reads them. The Search variables default to empty during a staged rollout.
 #
-# INTERNAL_TOKEN_TRUSTED_ISSUERS configures the API gateway. Search activates with its optional
-# public keys. The folded scalar gives the service one line of JSON.
+# INTERNAL_TOKEN_TRUSTED_ISSUERS configures the API gateway. Search and Identity activate with
+# their optional public keys. The folded scalar gives the service one line of JSON.
 #
 # MIGRATION_DATABASE_URL is deliberately absent: the GitOps agent of cadenway-ops hands the
 # migrator's URL to the one-off migration container only (docs/database.md there), so the running
@@ -27,6 +27,7 @@ services:
       INTERNAL_TOKEN_TRUSTED_ISSUERS: >-
         {"api-gateway": [${API_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS}]}
       SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
+      IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
       SEARCH_PROJECTION_CURSOR_SECRET: ${ORGANIZATION_SEARCH_PROJECTION_CURSOR_SECRET:-}
       BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
       NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
