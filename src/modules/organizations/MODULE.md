@@ -101,6 +101,12 @@ organization claim. The list pages the current owners and administrators. The lo
 candidate user IDs before delivery. All four operations send `Cache-Control: private, no-store`,
 including authentication errors.
 
+The API Gateway calls `POST /internal/v1/automation-recipients/check` with a signed user and
+the selected organization. One tenant statement checks the caller's current owner or admin role
+and the recipient's active membership. The private, uncacheable response contains only
+`{ eligible }`. Task remains responsible for the recipient's visibility and assignment eligibility
+when Automation runs an action.
+
 When Free seat admission is enabled, accepting an invitation that adds a billed seat and
 promoting a guest share one tenant transaction lock. The transaction counts active billed
 roles after acquiring the lock and returns `409 organization.seat-quota-exceeded` above

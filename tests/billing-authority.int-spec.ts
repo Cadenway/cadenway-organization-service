@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto';
 
 import {
+  CheckAutomationRecipientInternalResponse,
   ListBillingMembershipsInternalResponse,
   ListBillingOrganizationsInternalResponse,
   ListQuotaNotificationRecipientsInternalResponse,
@@ -13,6 +14,7 @@ import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { newId, ServiceStack } from './support/service-stack.js';
+import { DeclaredErrors } from './support/declared-errors.js';
 
 function issuerKey(kid: string): {
   readonly publicJwk: Ed25519PublicJwk;
@@ -197,6 +199,92 @@ describe('signed Billing and quota notification authorities', () => {
     expect(responses.map(({ status }) => status)).toEqual([401, 403, 403, 403, 403, 404]);
     for (const response of responses) {
       expect(response.headers['cache-control']).toBe('private, no-store');
+    }
+  });
+
+  it('checks Automation recipients against current membership and the signed tenant', async () => {
+    const activeAdminId = '019a7031-2b3c-7d4e-8f5a-6b7c8d9e0f12';
+    const activeGuestId = '019a7032-2b3c-7d4e-8f5a-6b7c8d9e0f12';
+    const removedId = '019a7033-2b3c-7d4e-8f5a-6b7c8d9e0f12';
+    const foreignId = '019a7034-2b3c-7d4e-8f5a-6b7c8d9e0f12';
+    const invitedId = '019a7035-2b3c-7d4e-8f5a-6b7c8d9e0f12';
+    const activeAdminMemberId = newId();
+    await stack.system(
+      `insert into members (id, organization_id, user_id, role, joined_at, removed_at)
+       values ($1, $5, $6, 'admin', now(), null),
+              ($2, $5, $7, 'guest', now(), null),
+              ($3, $5, $8, 'member', now(), now()),
+              ($4, $9, $10, 'member', now(), null)`,
+      [
+        activeAdminMemberId,
+        newId(),
+        newId(),
+        newId(),
+        organizationId,
+        activeAdminId,
+        activeGuestId,
+        removedId,
+        otherOrganizationId,
+        foreignId,
+      ],
+    );
+    await stack.system(
+      `insert into directory_users (user_id, email, email_verified)
+       values ($1, 'pending@atelier-nord.fr', true)`,
+      [invitedId],
+    );
+    await stack.system(
+      `insert into invitations
+       (id, organization_id, email, role, invited_by_user_id, sent_at, expires_at)
+       values ($1, $2, 'pending@atelier-nord.fr', 'member', $3, now(), now() + interval '7 days')`,
+      [newId(), organizationId, ownerId],
+    );
+    const path = '/internal/v1/automation-recipients/check';
+    const owner = await stack.bearer(ownerId, organizationId);
+    const admin = await stack.bearer(activeAdminId, organizationId);
+    const check = (authorization: string, userId: string) =>
+      request(app.getHttpServer()).post(path).set('Authorization', authorization).send({ userId });
+
+    for (const authorization of [owner, admin]) {
+      for (const [userId, eligible] of [
+        [activeGuestId, true],
+        [ownerId, true],
+        [removedId, false],
+        [foreignId, false],
+        [invitedId, false],
+      ] as const) {
+        const response = await check(authorization, userId);
+        expect(response.status).toBe(200);
+        expect(response.headers['cache-control']).toBe('private, no-store');
+        expect(CheckAutomationRecipientInternalResponse.parse(response.body as unknown)).toEqual({
+          eligible,
+        });
+      }
+    }
+
+    await stack.system("update members set role = 'member' where id = $1", [activeAdminMemberId]);
+    const demoted = await check(admin, activeGuestId);
+    expect(demoted.status).toBe(403);
+    expect(demoted.body).toMatchObject({ code: 'organization.role-forbidden' });
+
+    await stack.system('update members set removed_at = now() where id = $1', [
+      activeAdminMemberId,
+    ]);
+    const removed = await check(admin, activeGuestId);
+    expect(removed.status).toBe(404);
+    expect(removed.body).toMatchObject({ code: 'organization.not-found' });
+
+    const malformed = await check(owner, 'not-a-uuid');
+    const missing = await request(app.getHttpServer()).post(path).send({ userId: activeGuestId });
+    expect(malformed.status).toBe(400);
+    expect(missing.status).toBe(401);
+    const declared = DeclaredErrors.load();
+    for (const response of [demoted, removed, malformed, missing]) {
+      expect(response.headers['cache-control']).toBe('private, no-store');
+      const body = response.body as { readonly code: string };
+      expect(
+        declared.declares({ method: 'post', path, status: response.status, code: body.code }),
+      ).toBe(true);
     }
   });
 });
