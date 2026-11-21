@@ -4,6 +4,7 @@ import { expireOrganizationLogoUploadsHandlerProvider } from './composition/prov
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
 import { billingAuthorityProviders } from './composition/providers/use-cases/billing/billing-authority.provider.js';
+import { checkAutomationRecipientProvider } from './composition/providers/use-cases/automation/check-automation-recipient.provider.js';
 import { projectEmailChangeProvider } from './composition/providers/use-cases/directory/project-email-change.provider.js';
 import { projectEmailVerificationProvider } from './composition/providers/use-cases/directory/project-email-verification.provider.js';
 import { projectProfileUpdateProvider } from './composition/providers/use-cases/directory/project-profile-update.provider.js';
@@ -31,6 +32,7 @@ import { getSearchMembershipProvider } from './composition/providers/use-cases/s
 import { listSearchOrganizationsProvider } from './composition/providers/use-cases/search/list-search-organizations.provider.js';
 import { searchOrganizationCursorProvider } from './composition/providers/use-cases/search/search-organization-cursor.provider.js';
 import { BillingAuthorityController } from './presentation/http/controllers/billing/billing-authority.controller.js';
+import { AutomationRecipientController } from './presentation/http/controllers/automation/automation-recipient.controller.js';
 import { QuotaNotificationRecipientsController } from './presentation/http/controllers/billing/quota-notification-recipients.controller.js';
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
@@ -64,6 +66,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     InvitationsController,
     ReceivedInvitationsController,
     SearchAuthorityController,
+    AutomationRecipientController,
     BillingAuthorityController,
     QuotaNotificationRecipientsController,
   ],
@@ -72,6 +75,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     clockProvider,
     ...organizationLogoProviders,
     ...billingAuthorityProviders,
+    checkAutomationRecipientProvider,
     expireOrganizationLogoUploadsHandlerProvider,
     createOrganizationProvider,
     updateOrganizationProvider,
