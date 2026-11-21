@@ -82,7 +82,7 @@ const allTables = [...platformTables, ...businessTables].sort();
  * invitation emails, the former members of the user directory, its two-step verification, then
  * the logo reference and upload reservations.
  */
-const migrationCount = 6;
+const migrationCount = 7;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -332,11 +332,17 @@ describe('organization-service wiring', () => {
     const journal = await migrator.query<{ applied: number }>(
       'select count(*)::int as applied from drizzle.__drizzle_migrations',
     );
+    const membershipIndex = await migrator.query<{ indexdef: string }>(
+      `select indexdef from pg_indexes
+       where schemaname = 'public' and tablename = 'members'
+         and indexname = 'members_organization_membership_index'`,
+    );
 
     expect(tables.rows).toEqual(
       allTables.map((tablename) => ({ tablename, tableowner: 'organization_migrator' })),
     );
     expect(journal.rows).toEqual([{ applied: migrationCount }]);
+    expect(membershipIndex.rows[0]?.indexdef).toContain('USING btree (organization_id, id)');
   });
 
   it('applies nothing when the migrator runs again', async () => {

@@ -11,6 +11,7 @@ import { vi } from 'vitest';
 
 import { AppModule } from '../../src/app.module.js';
 import { appConfigSchema } from '../../src/config/app-config.js';
+import { installOrganizationAuthorityCachePolicy } from '../../src/infrastructure/http/organization-authority-cache-policy.js';
 import { installOrganizationLogoCachePolicy } from '../../src/infrastructure/http/organization-logo-cache-policy.js';
 
 // The service as main.ts assembles it, on the disposable PostgreSQL and NATS of compose.dev.yaml
@@ -288,6 +289,7 @@ export class ServiceStack {
       logDestination: { write: (): void => undefined },
     });
     installOrganizationLogoCachePolicy(app);
+    installOrganizationAuthorityCachePolicy(app);
     await app.init();
     this.signer = await InternalTokenSigner.create({
       issuer: 'api-gateway',

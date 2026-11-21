@@ -75,6 +75,11 @@ organization or of an invitation, a later phase, deletes its ledger rows first.
 declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
 digest of the key. Storage owns the bytes and signed transfers.
 
+`0006_billing_membership_index` adds `(organization_id, id)` for a bounded snapshot that includes
+removed memberships. The Billing reader returns member IDs and source versions with the role of
+active memberships. The Notification reader returns current owner and administrator user IDs
+from the existing active-member index. Their HTTP adapters use the published service contracts.
+
 ## API
 
 From `openapi/internal/organization-service.yaml` of the installed `@cadenway/contracts`; issuer
@@ -86,6 +91,15 @@ the Search system identity without an organization claim and exports only organi
 It resumes within the authenticated upper bound of the first page.
 `GET /internal/v1/search-membership` requires an authenticated user and organization delegated
 by Search. One tenant snapshot returns the active membership ID, role and membership version.
+
+Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
+organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
+with an organization claim and returns the active and removed member versions for that tenant.
+Notification uses `GET /internal/v1/quota-notification-recipients` and
+`POST /internal/v1/quota-notification-recipients/lookup` with its system identity and an
+organization claim. The list pages the current owners and administrators. The lookup rechecks
+candidate user IDs before delivery. All four operations send `Cache-Control: private, no-store`,
+including authentication errors.
 
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
