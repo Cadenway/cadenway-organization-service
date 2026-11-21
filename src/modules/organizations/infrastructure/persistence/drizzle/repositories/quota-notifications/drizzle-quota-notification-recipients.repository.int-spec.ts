@@ -3,6 +3,7 @@ import { TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { newId, ServiceStack } from '../../../../../../../../tests/support/service-stack.js';
+import { DrizzleQuotaNotificationRecipientsUnitOfWork } from '../../transactions/quota-notifications/drizzle-quota-notification-recipients.unit-of-work.js';
 import { DrizzleQuotaNotificationRecipientsReader } from './drizzle-quota-notification-recipients.repository.js';
 
 describe('quota notification recipient persistence', () => {
@@ -120,5 +121,45 @@ describe('quota notification recipient persistence', () => {
           ).rejects.toThrow();
         }),
     );
+  });
+
+  it('checks organization existence and tenant identity in the same snapshot', async () => {
+    const work = new DrizzleQuotaNotificationRecipientsUnitOfWork(tenant);
+    const context = {
+      organizationId,
+      actor: { type: 'system' as const, id: 'notification-service' },
+      role: null,
+      scopes: [],
+    };
+
+    await runWithOrganizationContext(context, () =>
+      work.read(organizationId, async (snapshot) => {
+        expect(await snapshot.organizationExists()).toBe(true);
+        expect(await snapshot.recipients.findActive(organizationId, [ownerId])).toEqual([ownerId]);
+        await stack.system(
+          'update members set role = $3 where organization_id = $1 and user_id = $2',
+          [organizationId, ownerId, 'member'],
+        );
+        expect(await snapshot.recipients.findActive(organizationId, [ownerId])).toEqual([ownerId]);
+      }),
+    );
+    expect(
+      await runWithOrganizationContext(context, () =>
+        work.read(organizationId, (snapshot) =>
+          snapshot.recipients.findActive(organizationId, [ownerId]),
+        ),
+      ),
+    ).toEqual([]);
+    await expect(
+      runWithOrganizationContext(context, () =>
+        work.read(otherOrganizationId, (snapshot) => snapshot.organizationExists()),
+      ),
+    ).rejects.toThrow('does not match its tenant scope');
+    const missingId = newId();
+    expect(
+      await runWithOrganizationContext({ ...context, organizationId: missingId }, () =>
+        work.read(missingId, (snapshot) => snapshot.organizationExists()),
+      ),
+    ).toBe(false);
   });
 });
