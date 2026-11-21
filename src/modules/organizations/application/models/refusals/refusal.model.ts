@@ -17,6 +17,7 @@ export type Refusal =
   | { readonly reason: 'version-mismatch'; readonly version: number }
   | { readonly reason: 'member-not-found' }
   | { readonly reason: 'owner-protected' }
+  | { readonly reason: 'seat-quota-exceeded' }
   | { readonly reason: 'invitation-not-found' }
   | { readonly reason: 'invitation-email-mismatch' }
   | { readonly reason: 'invitation-revoked' }

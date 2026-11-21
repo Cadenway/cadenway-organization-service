@@ -51,6 +51,7 @@ export type AppConfig = BaseConfig &
   InternalTokenVerifierConfig & {
     readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
     readonly BILLING_AUTHORITY_CURSOR_SECRET?: string;
+    readonly ORGANIZATION_SEAT_QUOTA_ENABLED: boolean;
   };
 
 /**
@@ -75,6 +76,10 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
     BILLING_AUTHORITY_CURSOR_SECRET: optionalCursorSecret,
+    ORGANIZATION_SEAT_QUOTA_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
   })
   .transform(
     (

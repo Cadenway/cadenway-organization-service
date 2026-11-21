@@ -30,6 +30,7 @@ describe('appConfigSchema', () => {
       NATS_URL: 'nats://localhost:4222',
       NATS_USER: 'organization',
       NATS_PASSWORD: 'organization',
+      ORGANIZATION_SEAT_QUOTA_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'organization-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [

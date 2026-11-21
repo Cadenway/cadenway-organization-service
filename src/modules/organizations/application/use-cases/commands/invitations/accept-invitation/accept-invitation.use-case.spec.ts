@@ -60,6 +60,62 @@ describe('the invitation lifecycle', () => {
     ).rejects.toMatchObject({ refusal: { reason: 'invitation-answered', status: 'accepted' } });
   });
 
+  it('rolls back an acceptance at the free seat limit', async () => {
+    const member = scenario.store.tables.members.get(scenario.memberIds.get(HUGO.id) ?? '');
+    if (member === undefined) throw new Error('The member fixture is missing.');
+    for (const id of ['extra-one', 'extra-two']) {
+      scenario.store.tables.members.set(id, { ...member, id, userId: id });
+    }
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+
+    await expect(
+      acceptance.execute({ actorUserId: MARC.id, userId: MARC.id, invitationId }),
+    ).rejects.toMatchObject({ refusal: { reason: 'seat-quota-exceeded' } });
+    expect(scenario.store.tables.invitations.get(invitationId)?.status).toBe('pending');
+    expect(scenario.store.eventsNamed('member.joined.v1')).toEqual([]);
+    expect([...scenario.store.tables.members.values()].some((row) => row.userId === MARC.id)).toBe(
+      false,
+    );
+  });
+
+  it('accepts the last free seat when enforcement is enabled', async () => {
+    const member = scenario.store.tables.members.get(scenario.memberIds.get(HUGO.id) ?? '');
+    if (member === undefined) throw new Error('The member fixture is missing.');
+    scenario.store.tables.members.set('extra-one', {
+      ...member,
+      id: 'extra-one',
+      userId: 'extra-one',
+    });
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+    const joined = await acceptance.execute({
+      actorUserId: MARC.id,
+      userId: MARC.id,
+      invitationId,
+    });
+    expect(joined.memberCount).toBe(5);
+    expect(scenario.store.eventsNamed('member.joined.v1')).toHaveLength(1);
+  });
+
+  it('accepts a guest even when all free seats are occupied', async () => {
+    const member = scenario.store.tables.members.get(scenario.memberIds.get(HUGO.id) ?? '');
+    const invitation = scenario.store.tables.invitations.get(invitationId);
+    if (member === undefined || invitation === undefined) {
+      throw new Error('The invitation fixtures are missing.');
+    }
+    for (const id of ['extra-one', 'extra-two']) {
+      scenario.store.tables.members.set(id, { ...member, id, userId: id });
+    }
+    scenario.store.tables.invitations.set(invitationId, { ...invitation, role: 'guest' });
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+    const joined = await acceptance.execute({
+      actorUserId: MARC.id,
+      userId: MARC.id,
+      invitationId,
+    });
+    expect(joined).toMatchObject({ role: 'guest', memberCount: 5 });
+    expect(scenario.store.eventsNamed('member.joined.v1')).toHaveLength(1);
+  });
+
   it('checks the account, then the invitation, then the address, then the state', async () => {
     await expect(
       accept.execute({ actorUserId: MARC.id, userId: HUGO.id, invitationId }),
