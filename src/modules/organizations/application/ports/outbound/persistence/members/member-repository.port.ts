@@ -103,6 +103,14 @@ export interface MemberRepository {
   countSeats(organizationId: string): Promise<number>;
 
   /**
+   * Serializes seat increases for this organization until the transaction ends.
+   *
+   * @param organizationId - The tenant whose seat capacity is being checked.
+   * @returns Resolves after acquiring the transaction-scoped lock.
+   */
+  lockSeatAdmission(organizationId: string): Promise<void>;
+
+  /**
    * Method countByRole
    *
    * @description

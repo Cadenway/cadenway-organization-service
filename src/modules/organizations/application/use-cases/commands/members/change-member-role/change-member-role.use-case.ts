@@ -1,5 +1,6 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
+import { takesSeat } from '../../../../../domain/policies/members/seat.policy.js';
 import { toMemberViewFor } from '../../../../mappers/members/member-view.mapper.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
@@ -15,7 +16,7 @@ import type { ChangeMemberRoleInput } from './change-member-role.input.js';
  *
  * @description
  * Gives a member of the organization of the request another role
- * (`PATCH /internal/v1/members/{memberId}`), at once and without a seat check, in its tenant
+ * (`PATCH /internal/v1/members/{memberId}`) in its tenant
  * transaction. Checks, in order: the actor belongs to it (`organization-not-found`), is its owner
  * or an admin (`role-forbidden`), the member exists in it (`member-not-found`), `If-Match` matches
  * (`version-mismatch`), and the member is not the owner (`owner-protected`). The same role answers
@@ -46,7 +47,10 @@ export class ChangeMemberRole {
    * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
    * @constructor
    */
-  public constructor(unitOfWork: OrganizationsUnitOfWork) {
+  public constructor(
+    unitOfWork: OrganizationsUnitOfWork,
+    private readonly seatQuotaEnabled: boolean = false,
+  ) {
     this.unitOfWork = unitOfWork;
   }
   // #endregion
@@ -83,6 +87,18 @@ export class ChangeMemberRole {
           assertVersionMatches(input.expectedVersion, member.snapshot.version);
           const changed: Member = member.changeRole(input.role);
           if (changed !== member) {
+            if (this.seatQuotaEnabled && !takesSeat(member.role) && takesSeat(changed.role)) {
+              const organization = await store.organizations.find(input.organizationId);
+              if (organization === null) {
+                throw new OrganizationRefusal({ reason: 'organization-not-found' });
+              }
+              if (organization.snapshot.plan === 'free') {
+                await store.members.lockSeatAdmission(input.organizationId);
+                if ((await store.members.countSeats(input.organizationId)) >= 5) {
+                  throw new OrganizationRefusal({ reason: 'seat-quota-exceeded' });
+                }
+              }
+            }
             await store.members.update(changed);
             await store.events.memberRoleChanged(changed, member.role, input.actorUserId);
           }

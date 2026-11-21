@@ -101,6 +101,11 @@ organization claim. The list pages the current owners and administrators. The lo
 candidate user IDs before delivery. All four operations send `Cache-Control: private, no-store`,
 including authentication errors.
 
+When Free seat admission is enabled, accepting an invitation that adds a billed seat and
+promoting a guest share one tenant transaction lock. The transaction counts active billed
+roles after acquiring the lock and returns `409 organization.seat-quota-exceeded` above
+five seats. Invitations and guests do not reserve seats. A refused mutation emits no fact.
+
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /internal/v1/organizations`                          | None         | 201, `Location`, `ETag` | 400, 404 `user.not-synchronized`, 409 `organization.slug-taken`, 422 `organization.slug-invalid`                                                          |

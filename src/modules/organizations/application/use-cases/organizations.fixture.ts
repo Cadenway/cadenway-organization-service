@@ -333,6 +333,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
                 tables.directory.get(member.userId)?.email === email.value,
             ),
           ),
+        lockSeatAdmission: (): Promise<void> => Promise.resolve(),
         countSeats: (organizationId: string): Promise<number> =>
           Promise.resolve(seats(organizationId)),
         countByRole: (organizationId: string): Promise<RoleCounts> => {

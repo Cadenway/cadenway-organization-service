@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { MemberView } from '../../../../projections/members/member-view.projection.js';
-import { atelierNord, CAMILLE, HUGO, INES } from '../../../organizations.scenario.fixture.js';
+import {
+  atelierNord,
+  CAMILLE,
+  HUGO,
+  INES,
+  NADIA,
+} from '../../../organizations.scenario.fixture.js';
 import type { AtelierNord } from '../../../organizations.scenario.fixture.js';
 import { RemoveMember } from '../remove-member/remove-member.use-case.js';
 import { ChangeMemberRole } from './change-member-role.use-case.js';
@@ -62,6 +68,26 @@ describe('ChangeMemberRole and RemoveMember', () => {
 
     expect(same.version).toBe(1);
     expect(scenario.store.tables.events).toEqual([]);
+  });
+
+  it('keeps a guest unchanged when a promotion would exceed the free seat limit', async () => {
+    const member = scenario.store.tables.members.get(memberOf(HUGO.id));
+    if (member === undefined) throw new Error('The member fixture is missing.');
+    for (const id of ['extra-one', 'extra-two']) {
+      scenario.store.tables.members.set(id, { ...member, id, userId: id });
+    }
+    const guardedChange = new ChangeMemberRole(scenario.store, true);
+    await expect(
+      guardedChange.execute({
+        actorUserId: CAMILLE.id,
+        organizationId: scenario.organizationId,
+        memberId: memberOf(NADIA.id),
+        role: 'member',
+        expectedVersion: [1],
+      }),
+    ).rejects.toMatchObject({ refusal: { reason: 'seat-quota-exceeded' } });
+    expect(scenario.store.tables.members.get(memberOf(NADIA.id))?.role).toBe('guest');
+    expect(scenario.store.eventsNamed('member.role-changed.v1')).toEqual([]);
   });
 
   it('refuses a member, a stale version, the owner and an unknown member', async () => {

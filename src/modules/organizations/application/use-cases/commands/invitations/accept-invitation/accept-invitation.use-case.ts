@@ -1,6 +1,7 @@
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import { takesSeat } from '../../../../../domain/policies/members/seat.policy.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
@@ -62,7 +63,11 @@ export class AcceptInvitation {
    * @param {Clock} clock - The time of the acceptance.
    * @constructor
    */
-  public constructor(unitOfWork: OrganizationsUnitOfWork, clock: Clock) {
+  public constructor(
+    unitOfWork: OrganizationsUnitOfWork,
+    clock: Clock,
+    private readonly seatQuotaEnabled: boolean = false,
+  ) {
     this.unitOfWork = unitOfWork;
     this.clock = clock;
   }
@@ -104,7 +109,13 @@ export class AcceptInvitation {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
           await store.invitations.update(invitation.accept(now));
-          const member: Member = await this.membershipOf(store, invitation, input.actorUserId, now);
+          const member: Member = await this.membershipOf(
+            store,
+            invitation,
+            input.actorUserId,
+            now,
+            organization.snapshot.plan === 'free',
+          );
           return {
             id: organization.id,
             name: organization.snapshot.name,
@@ -139,14 +150,26 @@ export class AcceptInvitation {
     invitation: Invitation,
     actorUserId: string,
     now: Date,
+    freePlan: boolean,
   ): Promise<Member> {
     const organizationId: string = invitation.snapshot.organizationId;
+    if (this.seatQuotaEnabled && freePlan && takesSeat(invitation.snapshot.role)) {
+      await store.members.lockSeatAdmission(organizationId);
+    }
     const existing: Member | null = await store.members.findActiveOfUser(
       organizationId,
       actorUserId,
     );
     if (existing !== null) {
       return existing;
+    }
+    if (
+      this.seatQuotaEnabled &&
+      freePlan &&
+      takesSeat(invitation.snapshot.role) &&
+      (await store.members.countSeats(organizationId)) >= 5
+    ) {
+      throw new OrganizationRefusal({ reason: 'seat-quota-exceeded' });
     }
     const joined: Member = await store.members.insert(
       Member.joining(organizationId, actorUserId, invitation.snapshot.role, invitation.id, now),

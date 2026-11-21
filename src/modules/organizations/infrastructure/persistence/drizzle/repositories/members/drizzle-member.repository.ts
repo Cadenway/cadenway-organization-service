@@ -1,3 +1,4 @@
+import { requireOrganizationId } from '@cadenway/nest-common';
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
 import { and, asc, eq, inArray, isNull, like, or, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
@@ -315,6 +316,25 @@ export class DrizzleMemberRepository implements MemberRepository {
       )
       .limit(1);
     return rows.length > 0;
+  }
+
+  /**
+   * Method lockSeatAdmission
+   *
+   * @description
+   * Serializes seat increases in one tenant until the transaction ends. The caller counts seats
+   * in a later statement so READ COMMITTED observes an earlier lock holder's committed changes.
+   *
+   * @param {string} organizationId - The organization in the current tenant context.
+   * @returns {Promise<void>} Resolves after acquiring the transaction-scoped lock.
+   */
+  public async lockSeatAdmission(organizationId: string): Promise<void> {
+    if (requireOrganizationId() !== organizationId) {
+      throw new Error('Seat admission organization does not match the current tenant.');
+    }
+    await this.db.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended('organization-seat-admission:' || ${organizationId}::uuid::text, 0))`,
+    );
   }
 
   /**

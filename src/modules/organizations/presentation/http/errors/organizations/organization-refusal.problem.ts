@@ -86,6 +86,8 @@ function shapeOf(refusal: Refusal): ProblemShape {
       return { status: 404, code: 'organization.not-found' };
     case 'role-forbidden':
       return { status: 403, code: 'organization.role-forbidden' };
+    case 'seat-quota-exceeded':
+      return { status: 409, code: 'organization.seat-quota-exceeded' };
     case 'slug-taken':
       return { status: 409, code: 'organization.slug-taken', details: { slug: refusal.slug } };
     case 'slug-invalid':
