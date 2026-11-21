@@ -50,6 +50,13 @@
       "when": 1795249743428,
       "tag": "0006_billing_membership_index",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1795277096848,
+      "tag": "0007_organization_seat_entitlements",
+      "breakpoints": true
     }
   ]
 }

@@ -90,6 +90,42 @@ describe('ChangeMemberRole and RemoveMember', () => {
     expect(scenario.store.eventsNamed('member.role-changed.v1')).toEqual([]);
   });
 
+  it('admits a guest promotion through the last Team seat and enforces the Team ceiling', async () => {
+    const member = scenario.store.tables.members.get(memberOf(HUGO.id));
+    const guest = scenario.store.tables.members.get(memberOf(NADIA.id));
+    if (member === undefined || guest === undefined) throw new Error('Membership fixture missing.');
+    for (const id of ['extra-one', 'extra-two']) {
+      scenario.store.tables.members.set(id, { ...member, id, userId: id });
+    }
+    const extraGuestId = 'extra-guest';
+    scenario.store.tables.members.set(extraGuestId, {
+      ...guest,
+      id: extraGuestId,
+      userId: extraGuestId,
+    });
+    scenario.store.tables.seatEntitlements.set(scenario.organizationId, {
+      version: 1,
+      plan: 'team',
+      seatLimit: 6,
+    });
+    const guardedChange = new ChangeMemberRole(scenario.store, true);
+    const request = {
+      actorUserId: CAMILLE.id,
+      organizationId: scenario.organizationId,
+      role: 'member' as const,
+      expectedVersion: [1],
+    };
+
+    await expect(
+      guardedChange.execute({ ...request, memberId: memberOf(NADIA.id) }),
+    ).resolves.toMatchObject({ role: 'member', version: 2 });
+    await expect(
+      guardedChange.execute({ ...request, memberId: extraGuestId }),
+    ).rejects.toMatchObject({ refusal: { reason: 'seat-quota-exceeded' } });
+    expect(scenario.store.tables.members.get(extraGuestId)?.role).toBe('guest');
+    expect(scenario.store.eventsNamed('member.role-changed.v1')).toHaveLength(1);
+  });
+
   it('refuses a member, a stale version, the owner and an unknown member', async () => {
     const request = {
       organizationId: scenario.organizationId,

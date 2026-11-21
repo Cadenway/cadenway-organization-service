@@ -45,6 +45,7 @@ providers of the module; no other module imports it.
 | `members`                        | `id`; one active per (`organization_id`, `user_id`)                              | `organization_id`, policy forced                       |
 | `invitations`                    | `id`; one pending per (`organization_id`, `email`)                               | `organization_id`, policy forced                       |
 | `organization_logo_reservations` | (`organization_id`, `upload_id`), replay key scoped to organization and uploader | `organization_id`, policy forced                       |
+| `organization_seat_entitlements` | `organization_id`, one versioned Billing seat projection                         | `organization_id`, policy forced                       |
 | `invitation_emails`              | `id`; one row per invitation email sent                                          | `organization_id`, policy forced                       |
 | `directory_users`                | `user_id`, the id identity-service gave the account                              | None: an account belongs to no organization, no policy |
 
@@ -80,6 +81,11 @@ removed memberships. The Billing reader returns member IDs and source versions w
 active memberships. The Notification reader returns current owner and administrator user IDs
 from the existing active-member index. Their HTTP adapters use the published service contracts.
 
+`0007_organization_seat_entitlements` adds the seat projection. An absent row represents Free
+version zero and five seats, so existing organizations need no backfill. The expansion leaves the
+previous application working. Deploy the migration before new replicas and keep the table during
+rollback. Plan fields on existing organization responses retain their current source.
+
 ## API
 
 From `openapi/internal/organization-service.yaml` of the installed `@cadenway/contracts`; issuer
@@ -107,10 +113,18 @@ and the recipient's active membership. The private, uncacheable response contain
 `{ eligible }`. Task remains responsible for the recipient's visibility and assignment eligibility
 when Automation runs an action.
 
-When Free seat admission is enabled, accepting an invitation that adds a billed seat and
-promoting a guest share one tenant transaction lock. The transaction counts active billed
-roles after acquiring the lock and returns `409 organization.seat-quota-exceeded` above
-five seats. Invitations and guests do not reserve seats. A refused mutation emits no fact.
+When seat admission is enabled, accepting an invitation that adds a billed seat and promoting
+a guest share one tenant transaction lock. After acquiring the lock, the transaction reads the
+current projected limit and counts active owners, admins and members. It returns
+`409 organization.seat-quota-exceeded` when no seat remains. Existing active memberships keep
+their roles on acceptance. Pending invitations and active guests do not take seats. A refused
+mutation emits no fact.
+
+The internal `ApplySeatEntitlement` operation uses the same lock to classify a verified Billing
+snapshot and apply it atomically using a one-row compare-and-set. It keeps the projection for
+identical replays and refuses older versions, conflicting same-version values and decreases.
+A higher version can change the plan while keeping its limit. Delivery and recovery adapters
+require the published Billing contracts.
 
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |

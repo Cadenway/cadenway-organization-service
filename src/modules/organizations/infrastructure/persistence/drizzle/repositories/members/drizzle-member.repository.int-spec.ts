@@ -4,6 +4,8 @@ import { sql } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { newId, ServiceStack } from '../../../../../../../../tests/support/service-stack.js';
+import { ApplySeatEntitlement } from '../../../../../application/use-cases/commands/billing/apply-seat-entitlement/apply-seat-entitlement.use-case.js';
+import { DrizzleSeatEntitlementRepository } from '../billing/drizzle-seat-entitlement.repository.js';
 import { DrizzleMemberRepository } from './drizzle-member.repository.js';
 
 describe('Seat admission persistence', () => {
@@ -12,11 +14,13 @@ describe('Seat admission persistence', () => {
   const ownerId = newId();
   let stack: ServiceStack | undefined;
   let tenant: TenantTransactionRunner;
+  let apply: ApplySeatEntitlement;
 
   beforeAll(async () => {
     stack = await ServiceStack.start('seat-admission');
     const app = await stack.startApplication();
     tenant = app.get(TenantTransactionRunner);
+    apply = app.get(ApplySeatEntitlement);
     await stack.system(
       `insert into organizations
         (id, name, name_key, slug, default_language, team_size, primary_use, owner_user_id)
@@ -101,6 +105,72 @@ describe('Seat admission persistence', () => {
             new DrizzleMemberRepository(db).lockSeatAdmission(otherOrganizationId),
           ).rejects.toThrow('Seat admission organization does not match the current tenant.');
         }),
+    );
+  });
+
+  it('applies a new limit only when the shared admission lock is released', async () => {
+    let release: () => void = () => undefined;
+    let announce: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      announce = resolve;
+    });
+    const mayCommit = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const context = {
+      organizationId,
+      actor: { type: 'system' as const, id: 'billing-service' },
+      role: null,
+      scopes: [],
+    };
+    const owner = runWithOrganizationContext(context, () =>
+      tenant.run(async ({ db }) => {
+        await new DrizzleMemberRepository(db).lockSeatAdmission(organizationId);
+        const seats = new DrizzleSeatEntitlementRepository(db);
+        expect(await seats.find(organizationId)).toBeNull();
+        announce();
+        await mayCommit;
+        expect(await seats.find(organizationId)).toBeNull();
+      }),
+    );
+    await Promise.race([held, owner]);
+    let settled = false;
+    const entitlement = { version: 2, plan: 'team', seatLimit: 8 };
+    const projection = runWithOrganizationContext(context, () =>
+      apply.execute({ organizationId, entitlement }),
+    ).then((result) => {
+      settled = true;
+      return result;
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+    } finally {
+      release();
+    }
+    await owner;
+    await expect(projection).resolves.toBe('applied');
+    await runWithOrganizationContext(context, () =>
+      tenant.run(async ({ db }) => {
+        await new DrizzleMemberRepository(db).lockSeatAdmission(organizationId);
+        const seats = new DrizzleSeatEntitlementRepository(db);
+        await expect(seats.find(organizationId)).resolves.toEqual(entitlement);
+        await expect(
+          seats.writeNext(organizationId, { ...entitlement, version: 1, seatLimit: 9 }),
+        ).resolves.toBe(false);
+        await expect(
+          seats.writeNext(organizationId, { ...entitlement, version: 3, seatLimit: 7 }),
+        ).resolves.toBe(false);
+        await expect(seats.find(organizationId)).resolves.toEqual(entitlement);
+      }),
+    );
+    await runWithOrganizationContext({ ...context, organizationId: otherOrganizationId }, () =>
+      tenant.run(async ({ db }) => {
+        const rows = await db.execute(
+          sql`select organization_id from organization_seat_entitlements where organization_id = ${organizationId}`,
+        );
+        expect(rows.rows).toEqual([]);
+      }),
     );
   });
 });

@@ -12,6 +12,7 @@ import type { UnitOfWorkOptions } from '../../../../../application/models/transa
 import type { OrganizationsUnitOfWork } from '../../../../../application/ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import { OutboxOrganizationEvents } from '../../../../messaging/outbox/organizations/outbox-organization-events.adapter.js';
+import { DrizzleSeatEntitlementRepository } from '../../repositories/billing/drizzle-seat-entitlement.repository.js';
 import { DrizzleDirectoryRepository } from '../../repositories/directory/drizzle-directory.repository.js';
 import { DrizzleInvitationEmailRepository } from '../../repositories/invitations/drizzle-invitation-email.repository.js';
 import { DrizzleInvitationRepository } from '../../repositories/invitations/drizzle-invitation.repository.js';
@@ -222,6 +223,7 @@ export class DrizzleOrganizationsUnitOfWork implements OrganizationsUnitOfWork {
         work({
           organizations: new DrizzleOrganizationRepository(transaction.db),
           members: new DrizzleMemberRepository(transaction.db),
+          seatEntitlements: new DrizzleSeatEntitlementRepository(transaction.db),
           invitations: new DrizzleInvitationRepository(transaction.db),
           invitationEmails: new DrizzleInvitationEmailRepository(transaction.db),
           directory: new DrizzleDirectoryRepository(transaction.db),

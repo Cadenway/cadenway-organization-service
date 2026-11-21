@@ -12,6 +12,7 @@ import {
   assertAddressedToActor,
   findAddressedInvitation,
 } from '../../../../services/invitations/addressed-invitation.service.js';
+import { requireAvailableSeat } from '../../../../services/members/seat-limit.service.js';
 import type { AcceptInvitationInput } from './accept-invitation.input.js';
 
 /**
@@ -109,13 +110,7 @@ export class AcceptInvitation {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
           await store.invitations.update(invitation.accept(now));
-          const member: Member = await this.membershipOf(
-            store,
-            invitation,
-            input.actorUserId,
-            now,
-            organization.snapshot.plan === 'free',
-          );
+          const member: Member = await this.membershipOf(store, invitation, input.actorUserId, now);
           return {
             id: organization.id,
             name: organization.snapshot.name,
@@ -150,10 +145,10 @@ export class AcceptInvitation {
     invitation: Invitation,
     actorUserId: string,
     now: Date,
-    freePlan: boolean,
   ): Promise<Member> {
     const organizationId: string = invitation.snapshot.organizationId;
-    if (this.seatQuotaEnabled && freePlan && takesSeat(invitation.snapshot.role)) {
+    const requiresSeat: boolean = this.seatQuotaEnabled && takesSeat(invitation.snapshot.role);
+    if (requiresSeat) {
       await store.members.lockSeatAdmission(organizationId);
     }
     const existing: Member | null = await store.members.findActiveOfUser(
@@ -163,13 +158,8 @@ export class AcceptInvitation {
     if (existing !== null) {
       return existing;
     }
-    if (
-      this.seatQuotaEnabled &&
-      freePlan &&
-      takesSeat(invitation.snapshot.role) &&
-      (await store.members.countSeats(organizationId)) >= 5
-    ) {
-      throw new OrganizationRefusal({ reason: 'seat-quota-exceeded' });
+    if (requiresSeat) {
+      await requireAvailableSeat(store, organizationId);
     }
     const joined: Member = await store.members.insert(
       Member.joining(organizationId, actorUserId, invitation.snapshot.role, invitation.id, now),

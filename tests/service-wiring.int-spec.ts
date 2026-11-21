@@ -71,6 +71,7 @@ const businessTables = [
   'invitations',
   'members',
   'organization_logo_reservations',
+  'organization_seat_entitlements',
   'organizations',
 ] as const;
 
@@ -80,9 +81,10 @@ const allTables = [...platformTables, ...businessTables].sort();
 /**
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
  * invitation emails, the former members of the user directory, its two-step verification, then
- * the logo reference and upload reservations.
+ * the logo reference and upload reservations, the billing membership index and the seat
+ * entitlement projection.
  */
-const migrationCount = 7;
+const migrationCount = 8;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -408,6 +410,11 @@ describe('organization-service wiring', () => {
         relrowsecurity: true,
         relforcerowsecurity: true,
       },
+      {
+        relname: 'organization_seat_entitlements',
+        relrowsecurity: true,
+        relforcerowsecurity: true,
+      },
       { relname: 'organizations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
@@ -421,6 +428,10 @@ describe('organization-service wiring', () => {
       {
         tablename: 'organization_logo_reservations',
         policyname: 'organization_logo_reservations_organization_isolation',
+      },
+      {
+        tablename: 'organization_seat_entitlements',
+        policyname: 'organization_seat_entitlements_organization_isolation',
       },
       { tablename: 'organizations', policyname: 'organizations_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },

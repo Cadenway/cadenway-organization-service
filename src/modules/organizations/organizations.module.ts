@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
+import { applySeatEntitlementProvider } from './composition/providers/use-cases/billing/apply-seat-entitlement.provider.js';
 import { billingAuthorityProviders } from './composition/providers/use-cases/billing/billing-authority.provider.js';
 import { checkAutomationRecipientProvider } from './composition/providers/use-cases/automation/check-automation-recipient.provider.js';
 import { projectEmailChangeProvider } from './composition/providers/use-cases/directory/project-email-change.provider.js';
@@ -75,6 +76,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     clockProvider,
     ...organizationLogoProviders,
     ...billingAuthorityProviders,
+    applySeatEntitlementProvider,
     checkAutomationRecipientProvider,
     expireOrganizationLogoUploadsHandlerProvider,
     createOrganizationProvider,
