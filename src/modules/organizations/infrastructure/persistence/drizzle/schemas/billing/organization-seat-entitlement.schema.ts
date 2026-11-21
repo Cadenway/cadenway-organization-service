@@ -18,10 +18,7 @@ export const organizationSeatEntitlements = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    check(
-      'organization_seat_entitlements_plan_check',
-      sql`char_length(${table.plan}) between 1 and 255`,
-    ),
+    check('organization_seat_entitlements_plan_check', sql`char_length(${table.plan}) > 0`),
     check(
       'organization_seat_entitlements_limit_check',
       sql`${table.seatLimit} between 5 and 9007199254740991`,

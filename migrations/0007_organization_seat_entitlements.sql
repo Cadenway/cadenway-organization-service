@@ -5,7 +5,7 @@ CREATE TABLE "organization_seat_entitlements" (
 	"version" bigint NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "organization_seat_entitlements_plan_check" CHECK (char_length("organization_seat_entitlements"."plan") between 1 and 255),
+	CONSTRAINT "organization_seat_entitlements_plan_check" CHECK (char_length("organization_seat_entitlements"."plan") > 0),
 	CONSTRAINT "organization_seat_entitlements_limit_check" CHECK ("organization_seat_entitlements"."seat_limit" between 5 and 9007199254740991),
 	CONSTRAINT "organization_seat_entitlements_version_check" CHECK ("organization_seat_entitlements"."version" between 1 and 9007199254740991)
 );

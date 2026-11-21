@@ -283,6 +283,25 @@ cadenway-api-contracts and identity-service. Until then, a directory entry missi
 account answers `404 user.not-synchronized` at the creation of an organization, and an empty list
 of received invitations.
 
+### Billing seat entitlement
+
+`subscription.changed.v1` is consumed by `organization-service__project-seat-entitlement` on
+`EVENTS` when `ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED=true`. The flag defaults to false
+and can enable projection before quota enforcement. Deploy the exact consumer permissions and
+reserve publication of `evt.subscription.changed.v1` for Billing before enabling the flag.
+The published schema and the required `system` actor `billing-service` are validated before
+opening the tenant transaction. The projector receives the tenant ID, plan, seat limit and
+version from the validated envelope. The plan identifier remains extensible.
+
+The durable starts from retained deliveries and resumes its position when restarted. The kit
+commits its event-ID record with the projection in the same tenant transaction. The projection
+independently fences duplicated, stale, conflicting or decreasing snapshots under the seat
+admission lock. A handler failure retries on 32 deliveries over about 25 hours and 43 minutes.
+A malformed envelope goes straight to the dead-letter path. An operator may replay a valid
+dead letter after resolving the delivery failure. A malformed envelope requires a correction
+at the producer. Replaying retained messages covers the `EVENTS` retention window. Recovery
+of an expired snapshot through the signed Billing entitlement endpoint is a separate rollout step.
+
 ## Logo reservation expiry
 
 The system schedule `organization.expire-logo-uploads` runs each minute in UTC. A bounded,

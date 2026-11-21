@@ -31,6 +31,7 @@ describe('appConfigSchema', () => {
       NATS_USER: 'organization',
       NATS_PASSWORD: 'organization',
       ORGANIZATION_SEAT_QUOTA_ENABLED: false,
+      ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: false,
       INTERNAL_TOKEN_AUDIENCE: 'organization-service',
       INTERNAL_TOKEN_TRUSTED_ISSUERS: {
         'api-gateway': [
@@ -59,6 +60,18 @@ describe('appConfigSchema', () => {
       loadConfig(appConfigSchema, { ...complete, DATABASE_TRANSACTION_MAX_ATTEMPTS: '1' })
         .DATABASE_TRANSACTION_MAX_ATTEMPTS,
     ).toBe(1);
+  });
+
+  it('enables the Billing consumer independently of seat quota enforcement', () => {
+    expect(
+      loadConfig(appConfigSchema, {
+        ...complete,
+        ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: 'true',
+      }),
+    ).toMatchObject({
+      ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: true,
+      ORGANIZATION_SEAT_QUOTA_ENABLED: false,
+    });
   });
 
   it('loads the Search public key fragment and a canonical cursor secret', () => {

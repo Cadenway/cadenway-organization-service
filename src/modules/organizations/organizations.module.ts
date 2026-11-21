@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { subscriptionChangedHandlerProvider } from './composition/providers/adapters/billing/subscription-changed-handler.provider.js';
 import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
@@ -104,6 +105,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     projectEmailChangeProvider,
     projectTwoStepVerificationChangeProvider,
     removeDeletedUserProvider,
+    subscriptionChangedHandlerProvider,
     UserSignedUpHandler,
     UserEmailVerifiedHandler,
     UserProfileUpdatedHandler,

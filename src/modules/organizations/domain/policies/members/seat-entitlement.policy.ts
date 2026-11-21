@@ -17,8 +17,7 @@ export function decideSeatEntitlement(
     !Number.isSafeInteger(incoming.seatLimit) ||
     incoming.version < current.version ||
     incoming.seatLimit < current.seatLimit ||
-    incoming.plan.length === 0 ||
-    Array.from(incoming.plan).length > 255
+    incoming.plan.length === 0
   ) {
     return 'refused';
   }

@@ -673,6 +673,9 @@ describe('organization-service wiring', () => {
     ).toBe(false);
     expect(brokerAccepts(organization, 'stream', 'info', 'EVENTS')).toBe(false);
     expect(brokerAccepts(organization, 'pub', 'evt.task.wiring-probe', 'refused')).toBe(false);
+    expect(brokerAccepts(organization, 'pub', 'evt.subscription.changed.v1', 'refused')).toBe(
+      false,
+    );
     expect(
       brokerAccepts({ NATS_USER: '', NATS_PASSWORD: '' }, 'pub', 'evt.organization.x', 'x'),
     ).toBe(false);
@@ -729,6 +732,21 @@ describe('organization-service wiring', () => {
       brokerAccepts({}, 'consumer', 'info', 'EVENTS', 'organization-service__wiring-probe'),
     ).toBe(false);
 
+    expect(
+      brokerAccepts(
+        organization,
+        ...inbox,
+        'consumer',
+        'add',
+        'EVENTS',
+        'organization-service__project-seat-entitlement',
+        '--filter',
+        'evt.user.signed-up.v1',
+        '--pull',
+        '--defaults',
+      ),
+    ).toBe(false);
+
     // A handler whose consumer cadenway-ops does not grant cannot start.
     await expect(
       service()
@@ -740,6 +758,18 @@ describe('organization-service wiring', () => {
           handle: (): Promise<void> => Promise.resolve(),
         }),
     ).rejects.toThrow();
+  });
+
+  it('leaves the Billing seat entitlement durable unprovisioned by default', () => {
+    expect(
+      brokerAccepts(
+        {},
+        'consumer',
+        'info',
+        'EVENTS',
+        'organization-service__project-seat-entitlement',
+      ),
+    ).toBe(false);
   });
 
   it('stops being ready while NATS is down, and is ready again once it is back', async () => {
