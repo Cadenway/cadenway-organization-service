@@ -9,13 +9,14 @@ import type { OrganizationsUnitOfWork } from '../../ports/outbound/transactions/
  * Function assertAddressedToActor
  *
  * @description
- * Checks that an invitation is addressed to the verified address the user directory holds for the
- * actor (decision 5 of P2b): no verified address yet answers like an unknown invitation
+ * Checks that an invitation is addressed to the current verified address from identity-service.
+ * An absent or deleted local account, or no current verified address, answers like an unknown invitation
  * (`invitation-not-found`), another address `invitation-email-mismatch`.
  *
  * @param {OrganizationsStore} store - The store of the transaction.
  * @param {Invitation | null} invitation - The invitation, or `null` when unknown.
  * @param {string} actorUserId - The verified actor of the request.
+ * @param {EmailAddress | null} currentEmail - The current address returned by identity-service.
  * @returns {Promise<Invitation>} The invitation, addressed to the actor.
  * @throws {OrganizationRefusal} `invitation-not-found` or `invitation-email-mismatch`.
  */
@@ -23,13 +24,13 @@ export async function assertAddressedToActor(
   store: OrganizationsStore,
   invitation: Invitation | null,
   actorUserId: string,
+  currentEmail: EmailAddress | null,
 ): Promise<Invitation> {
   const user: DirectoryUser | null = await store.directory.find(actorUserId);
-  const email: EmailAddress | null = user?.verifiedEmail ?? null;
-  if (email === null || invitation === null) {
+  if (user === null || user.isDeleted || currentEmail === null || invitation === null) {
     throw new OrganizationRefusal({ reason: 'invitation-not-found' });
   }
-  if (!invitation.isAddressedTo(email)) {
+  if (!invitation.isAddressedTo(currentEmail)) {
     throw new OrganizationRefusal({ reason: 'invitation-email-mismatch' });
   }
   return invitation;
@@ -49,6 +50,7 @@ export async function assertAddressedToActor(
  * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
  * @param {{ readonly actorUserId: string; readonly userId: string; readonly invitationId: string }} request -
  * The actor, the account of the path and the invitation.
+ * @param {EmailAddress | null} currentEmail - The current address returned by identity-service.
  * @returns {Promise<Invitation>} The invitation, addressed to the actor.
  * @throws {OrganizationRefusal} `user-not-found`, `invitation-not-found` or
  * `invitation-email-mismatch`.
@@ -56,6 +58,7 @@ export async function assertAddressedToActor(
 export async function findAddressedInvitation(
   unitOfWork: OrganizationsUnitOfWork,
   request: { readonly actorUserId: string; readonly userId: string; readonly invitationId: string },
+  currentEmail: EmailAddress | null,
 ): Promise<Invitation> {
   if (request.userId !== request.actorUserId) {
     throw new OrganizationRefusal({ reason: 'user-not-found' });
@@ -66,6 +69,7 @@ export async function findAddressedInvitation(
         store,
         await store.invitations.find(request.invitationId),
         request.actorUserId,
+        currentEmail,
       ),
     { readOnly: true },
   );

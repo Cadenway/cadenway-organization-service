@@ -1,11 +1,9 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
-import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
-import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
-import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
+import { requireManagingMembership } from '../../../../services/members/actor-membership.service.js';
 import type { RemoveMemberInput } from './remove-member.input.js';
 
 /**
@@ -78,19 +76,7 @@ export class RemoveMember {
     try {
       await this.unitOfWork.runInRequestOrganization(
         async (store: OrganizationsStore): Promise<void> => {
-          const actor: Member = await requireActorMembership(
-            store,
-            input.organizationId,
-            input.actorUserId,
-          );
-          assertManagesOrganization(actor.role);
-          const member: Member | null = await store.members.findActiveForUpdate(
-            input.organizationId,
-            input.memberId,
-          );
-          if (member === null) {
-            throw new OrganizationRefusal({ reason: 'member-not-found' });
-          }
+          const { member } = await requireManagingMembership(store, input);
           const removed: Member = member.remove(now);
           await store.members.update(removed);
           await store.events.memberRemoved(removed, input.actorUserId);

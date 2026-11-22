@@ -3,6 +3,10 @@ import { Invitation } from '../../../../../domain/aggregates/invitation/invitati
 import { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
 import { distinctAddresses } from '../../../../../domain/policies/invitations/invitation-batch.policy.js';
+import {
+  assertInvitationEmailsAvailable,
+  invitationEmailWindowStart,
+} from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import type { OrganizationDraft } from '../../../../../domain/value-objects/organizations/organization-draft.value-object.js';
 import { toOrganizationView } from '../../../../mappers/organizations/organization-view.mapper.js';
@@ -28,9 +32,8 @@ import type { CreateOrganizationOutput } from './create-organization.output.js';
  * `user-not-synchronized` and creates nothing.
  *
  * Each invited address takes one email of the daily allowance of the new organization: its entry
- * in the ledger of invitation emails commits with the invitation. The creation is never refused for
- * the allowance: it invites 50 addresses at most, out of 100, and no other transaction can write
- * the ledger of an organization before it exists (decision 1 of the P2b security follow-ups).
+ * in the organization and sender ledgers commits with the invitation. A creation with no new
+ * invitations does not consume the sender allowance.
  */
 export class CreateOrganization {
   // #region Properties
@@ -111,6 +114,16 @@ export class CreateOrganization {
           if (creator === null || creatorName === null || !creator.isSynchronized) {
             throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
           }
+          const needed = addresses.filter(
+            (address) => !creator.verifiedEmail?.equals(address),
+          ).length;
+          if (needed > 0) {
+            const usage = await store.invitationEmails.lockSenderUsage(
+              input.actorUserId,
+              invitationEmailWindowStart(now),
+            );
+            assertInvitationEmailsAvailable(usage, needed, now);
+          }
           const organization: Organization = await store.organizations.insert(draft);
           const owner: Member = await store.members.insert(
             Member.owner(organization.id, input.actorUserId, now),
@@ -174,7 +187,7 @@ export class CreateOrganization {
         invitationId: pending?.id ?? null,
       };
     }
-    await store.invitationEmails.record(invitation);
+    await store.invitationEmails.record(invitation, input.actorUserId);
     await store.events.invitationIssued(invitation, {
       inviterUserId: input.actorUserId,
       inviterName: creatorName,

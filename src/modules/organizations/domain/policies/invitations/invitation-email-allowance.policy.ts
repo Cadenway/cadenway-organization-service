@@ -5,8 +5,8 @@ import type { InvitationEmailUsage } from '../../value-objects/invitations/invit
  * Constant DAILY_INVITATION_EMAILS
  *
  * @description
- * The invitation emails an organization can cause in any 24 hours, issues and resends together
- * (decision 1 of the P2b security follow-ups, `openapi/internal/organization-service.yaml`).
+ * The invitation emails each sender and each organization can cause in any 24 hours
+ * Issues and resends share the allowance.
  *
  * @type {number}
  */
@@ -67,4 +67,18 @@ export function assertInvitationEmailsAvailable(
     remaining,
     new Date(oldest.getTime() + INVITATION_EMAIL_WINDOW_MS),
   );
+}
+
+/** Checks the smaller of the independent sender and organization allowances. */
+export function assertInvitationBatchAvailable(
+  sender: InvitationEmailUsage,
+  organization: InvitationEmailUsage,
+  needed: number,
+  now: Date,
+): void {
+  const senderIsTighter =
+    sender.count > organization.count ||
+    (sender.count === organization.count &&
+      (sender.oldestSentAt?.getTime() ?? 0) > (organization.oldestSentAt?.getTime() ?? 0));
+  assertInvitationEmailsAvailable(senderIsTighter ? sender : organization, needed, now);
 }

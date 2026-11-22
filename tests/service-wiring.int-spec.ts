@@ -68,6 +68,7 @@ const platformTables = [
 const businessTables = [
   'directory_users',
   'invitation_emails',
+  'invitation_sender_emails',
   'invitations',
   'members',
   'organization_logo_reservations',
@@ -82,9 +83,9 @@ const allTables = [...platformTables, ...businessTables].sort();
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
  * invitation emails, the former members of the user directory, its two-step verification, then
  * the logo reference and upload reservations, the billing membership index and the seat
- * entitlement projection.
+ * entitlement projection and the sender budget ledger.
  */
-const migrationCount = 8;
+const migrationCount = 9;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -383,7 +384,7 @@ describe('organization-service wiring', () => {
     expect(schedule.rows).toEqual([{ key: 'minutely', cron: '* * * * *', timezone: 'UTC' }]);
   });
 
-  it('forces row-level security on the tables that carry an organization', async () => {
+  it('forces row-level security on tenant tables and the account-scoped sender ledger', async () => {
     const tables = await migrator.query<{
       relname: string;
       relrowsecurity: boolean;
@@ -403,6 +404,7 @@ describe('organization-service wiring', () => {
       { relname: 'event_versions', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitation_emails', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'invitation_sender_emails', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'members', relrowsecurity: true, relforcerowsecurity: true },
       {
@@ -423,6 +425,10 @@ describe('organization-service wiring', () => {
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
       { tablename: 'invitation_emails', policyname: 'invitation_emails_organization_isolation' },
+      {
+        tablename: 'invitation_sender_emails',
+        policyname: 'invitation_sender_emails_sender_isolation',
+      },
       { tablename: 'invitations', policyname: 'invitations_organization_isolation' },
       { tablename: 'members', policyname: 'members_organization_isolation' },
       {

@@ -185,10 +185,15 @@ export class DrizzleMemberRepository implements MemberRepository {
    *
    * @param {string} organizationId - The organization.
    * @param {string} userId - The account.
+   * @param {'share'} lock - Optionally holds the role and membership active until the commit.
    * @returns {Promise<Member | null>} The membership, or `null`.
    */
-  public async findActiveOfUser(organizationId: string, userId: string): Promise<Member | null> {
-    const rows: MemberRow[] = await this.db
+  public async findActiveOfUser(
+    organizationId: string,
+    userId: string,
+    lock?: 'share',
+  ): Promise<Member | null> {
+    const query = this.db
       .select()
       .from(members)
       .where(
@@ -199,38 +204,30 @@ export class DrizzleMemberRepository implements MemberRepository {
         ),
       )
       .limit(1);
+    const rows: MemberRow[] = await (lock === undefined ? query : query.for(lock));
     const row: MemberRow | undefined = rows[0];
     return row === undefined ? null : toMember(row);
   }
 
-  /**
-   * Method findActiveForUpdate
-   *
-   * @description
-   * Loads and locks an active membership.
-   *
-   * @param {string} organizationId - The organization.
-   * @param {string} memberId - Id of the membership.
-   * @returns {Promise<Member | null>} The membership, or `null`.
-   */
-  public async findActiveForUpdate(
+  /** Locks the active actor and target rows in a stable order before permission is evaluated. */
+  public async lockActorAndTarget(
     organizationId: string,
+    actorUserId: string,
     memberId: string,
-  ): Promise<Member | null> {
+  ): Promise<readonly Member[]> {
     const rows: MemberRow[] = await this.db
       .select()
       .from(members)
       .where(
         and(
           eq(members.organizationId, organizationId),
-          eq(members.id, memberId),
           isNull(members.removedAt),
+          or(eq(members.userId, actorUserId), eq(members.id, memberId)),
         ),
       )
-      .limit(1)
+      .orderBy(asc(members.id))
       .for('update');
-    const row: MemberRow | undefined = rows[0];
-    return row === undefined ? null : toMember(row);
+    return rows.map(toMember);
   }
 
   /**

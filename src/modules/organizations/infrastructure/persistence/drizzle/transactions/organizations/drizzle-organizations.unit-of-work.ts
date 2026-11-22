@@ -231,7 +231,7 @@ export class DrizzleOrganizationsUnitOfWork implements OrganizationsUnitOfWork {
             appends.count += 1;
           }),
         }),
-      { readOnly: options.readOnly ?? false },
+      options,
     );
     if (appends.count > 0) {
       this.relay.wake();

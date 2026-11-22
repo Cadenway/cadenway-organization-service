@@ -625,6 +625,17 @@ describe('organizations, members and invitations', () => {
   });
 
   describe('invitations', () => {
+    it('withholds a pending invitation after Identity confirms a new address', async () => {
+      stack.verifiedEmails.set(ines.id, 3, 'current-address@example.test');
+      try {
+        const response = await call('get', `/internal/v1/users/${ines.id}/invitations`, ines, null);
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({ items: [] });
+      } finally {
+        stack.verifiedEmails.set(ines.id, 4, ines.email);
+      }
+    });
+
     it('lists the invitations addressed to the verified address of the invitee', async () => {
       const response = await call('get', `/internal/v1/users/${ines.id}/invitations`, ines, null);
       const other = await call('get', `/internal/v1/users/${camille.id}/invitations`, ines, null);
@@ -1098,10 +1109,8 @@ describe('organizations, members and invitations', () => {
       expect(early.status).toBe(404);
       expect(early.body).toMatchObject({ code: 'invitation.not-found' });
 
-      stack.publish('user.email-verified.v1', emailVerified(marc, 3));
-      await vi.waitFor(async () => {
-        expect((await directoryOf(marc))?.email_verified).toBe(true);
-      });
+      expect((await directoryOf(marc))?.email_verified).toBe(false);
+      stack.verifiedEmails.set(marc.id, 3, marc.email);
       const received = await call('get', `/internal/v1/users/${marc.id}/invitations`, marc, null);
       expect((received.body as ReceivedInvitationPage).items).toEqual([
         expect.objectContaining({
@@ -1118,6 +1127,12 @@ describe('organizations, members and invitations', () => {
       );
       expect(accepted.status).toBe(200);
       expect(accepted.body).toMatchObject({ role: 'member', memberCount: 4 });
+      expect((await directoryOf(marc))?.email_verified).toBe(false);
+
+      stack.publish('user.email-verified.v1', emailVerified(marc, 3));
+      await vi.waitFor(async () => {
+        expect((await directoryOf(marc))?.email_verified).toBe(true);
+      });
     });
   });
 
@@ -1554,6 +1569,14 @@ describe('organizations, members and invitations', () => {
   });
 
   describe('invitation email limits', () => {
+    beforeAll(async () => {
+      await vi.waitFor(
+        async () => {
+          expect(await directoryOf(camille)).toMatchObject({ email_verified: true });
+        },
+        { timeout: 15_000 },
+      );
+    });
     // Decision 1 of the P2b security follow-ups: an invitation email goes out at most once an
     // hour, and an organization causes at most 100 of them in any 24 hours.
 
@@ -1617,7 +1640,29 @@ describe('organizations, members and invitations', () => {
       return Number(response.headers['retry-after']);
     }
 
+    /** Ages earlier fixture sends so each group can exercise its own tenant budget. */
+    async function expireSenderUsage(account: Account): Promise<void> {
+      const client = await stack.migrator.connect();
+      try {
+        await client.query('begin');
+        await client.query(`select set_config('app.invitation_sender_id', $1::uuid::text, true)`, [
+          account.id,
+        ]);
+        await client.query(
+          `update invitation_sender_emails set sent_at = now() - interval '25 hours' where sender_id = $1`,
+          [account.id],
+        );
+        await client.query('commit');
+      } catch (error) {
+        await client.query('rollback');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
     it('counts the addresses a creation invites against the allowance of the new organization', async () => {
+      await expireSenderUsage(camille);
       const created = await call('post', '/internal/v1/organizations', camille, null, {
         name: 'Atelier Nord Lyon',
         inviteEmails: newcomers('lyon', 50),
@@ -1708,6 +1753,7 @@ describe('organizations, members and invitations', () => {
     });
 
     it('grows the allowance again once the oldest emails leave the 24 hours, and forgets them', async () => {
+      await expireSenderUsage(camille);
       await stack.system(
         `update invitation_emails set sent_at = sent_at - interval '1 day 1 minute'
           where organization_id = $1
@@ -1728,6 +1774,7 @@ describe('organizations, members and invitations', () => {
     });
 
     it('refuses a resend within the hour of the last sending, with when it becomes possible', async () => {
+      await expireSenderUsage(camille);
       const created = await call('post', '/internal/v1/organizations', camille, null, {
         name: 'Atelier Nord Lille',
       });
@@ -1850,6 +1897,37 @@ describe('organizations, members and invitations', () => {
       expect(await rowsOf('invitations', lilleId)).toBe(invitations + 5);
       expect(await rowsOf('invitation_emails', lilleId)).toBe(100);
       expect(await outboxCount('invitation.issued.v1', 'organizationId', lilleId)).toBe(issued + 5);
+    });
+
+    it('applies the same sender allowance to a different organization and to creation', async () => {
+      const empty = await call('post', '/internal/v1/organizations', camille, null, {
+        name: 'Atelier Nord Marseille',
+        inviteEmails: [camille.email],
+      });
+      expect(empty.status).toBe(201);
+      const organizationId = (empty.body as OrganizationCreated).organization.id;
+      expect((empty.body as OrganizationCreated).invitations).toMatchObject([
+        { outcome: 'already-member' },
+      ]);
+
+      const batch = await invite(organizationId, newcomers('marseille', 1));
+      expect(batch.status).toBe(429);
+      expect(batch.body).toMatchObject({
+        code: 'invitation.daily-limit-reached',
+        details: { remaining: 0 },
+      });
+      expect(await rowsOf('invitation_emails', organizationId)).toBe(0);
+
+      const name = 'Atelier Nord Nantes';
+      const refusedCreation = await call('post', '/internal/v1/organizations', camille, null, {
+        name,
+        inviteEmails: newcomers('nantes', 1),
+      });
+      expect(refusedCreation.status).toBe(429);
+      expect(refusedCreation.body).toMatchObject({ code: 'invitation.daily-limit-reached' });
+      expect(await stack.system('select id from organizations where name = $1', [name])).toEqual(
+        [],
+      );
     });
   });
 

@@ -1,5 +1,13 @@
-import { baseConfigShape, internalTokenVerifierConfigShape } from '@cadenway/nest-common';
-import type { BaseConfig, InternalTokenVerifierConfig } from '@cadenway/nest-common';
+import {
+  baseConfigShape,
+  internalTokenSignerConfigShape,
+  internalTokenVerifierConfigShape,
+} from '@cadenway/nest-common';
+import type {
+  BaseConfig,
+  InternalTokenSignerConfig,
+  InternalTokenVerifierConfig,
+} from '@cadenway/nest-common';
 import { databaseConfigShape } from '@cadenway/nest-common/database';
 import type { DatabaseConfig } from '@cadenway/nest-common/database';
 import { messagingConfigShape } from '@cadenway/nest-messaging';
@@ -53,6 +61,8 @@ export type AppConfig = BaseConfig &
   InternalTokenVerifierConfig & {
     readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
     readonly BILLING_AUTHORITY_CURSOR_SECRET?: string;
+    readonly IDENTITY_SERVICE_URL?: string;
+    readonly ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
     readonly ORGANIZATION_SEAT_QUOTA_ENABLED: boolean;
     readonly ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: boolean;
   };
@@ -74,6 +84,9 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...databaseConfigShape,
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
+    IDENTITY_SERVICE_URL: z.url({ protocol: /^https?$/u }).optional(),
+    ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK:
+      internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
     SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
@@ -91,6 +104,15 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       .default('false')
       .transform((value) => value === 'true'),
   })
+  .refine(
+    (config) =>
+      (config.IDENTITY_SERVICE_URL === undefined) ===
+      (config.ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK === undefined),
+    {
+      path: ['IDENTITY_SERVICE_URL'],
+      error: 'Configure the Identity URL and Organization signing key together.',
+    },
+  )
   .transform(
     (
       {

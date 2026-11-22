@@ -59,7 +59,10 @@ jobs:
           }
           service=${REPOSITORY#cadenway-}
           variable=$(tr '[:lower:]-' '[:upper:]_' <<<"$service")_VERSION
+          # Compose validates required interpolation here without accessing the host environment.
           env GHCR_OWNER=owner DOMAIN=domain.invalid ENVIRONMENT=env PUBLIC_SCHEME=https \
+            IDENTITY_SERVICE_URL=http://identity-service:3010 \
+            ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK='{}' \
             "$variable=$VERSION" docker compose -p check -f service/deploy/compose.yaml \
             config --format json >definition.json
           jq -e --arg service "$service" --arg image "ghcr.io/owner/$REPOSITORY:$VERSION" '

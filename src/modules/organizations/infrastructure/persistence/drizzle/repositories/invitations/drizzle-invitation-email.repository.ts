@@ -1,10 +1,12 @@
+import { getOrganizationContext } from '@cadenway/nest-common';
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { and, count, eq, gt, lte, min } from 'drizzle-orm';
+import { and, count, eq, gt, lte, min, sql } from 'drizzle-orm';
 
 import type { InvitationEmailRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-email-repository.port.js';
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import type { InvitationEmailUsage } from '../../../../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../../../../domain/value-objects/invitations/invitation-state.value-object.js';
+import { invitationSenderEmails } from '../../schemas/invitations/invitation-sender-email.schema.js';
 import { invitationEmails } from '../../schemas/invitations/invitation-email.schema.js';
 import { organizations } from '../../schemas/organizations/organization.schema.js';
 
@@ -95,21 +97,58 @@ export class DrizzleInvitationEmailRepository implements InvitationEmailReposito
   }
 
   /**
+   * Locks the sender before the tenant ledger. The advisory lock also covers a first send.
+   * Scope the separate ledger to this verified account for the life of the transaction.
+   */
+  public async lockSenderUsage(senderId: string, windowStart: Date): Promise<InvitationEmailUsage> {
+    const actor = getOrganizationContext()?.actor;
+    if (actor?.type !== 'user' || actor.id?.toLowerCase() !== senderId.toLowerCase()) {
+      throw new Error('Invitation sender does not match the verified account.');
+    }
+    await this.db.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended('invitation-sender:' || ${senderId}::uuid::text, 0))`,
+    );
+    await this.db.execute(
+      sql`select set_config('app.invitation_sender_id', ${senderId}::uuid::text, true)`,
+    );
+    await this.db
+      .delete(invitationSenderEmails)
+      .where(
+        and(
+          eq(invitationSenderEmails.senderId, senderId),
+          lte(invitationSenderEmails.sentAt, windowStart),
+        ),
+      );
+    const [usage] = await this.db
+      .select({ count: count(), oldestSentAt: min(invitationSenderEmails.sentAt) })
+      .from(invitationSenderEmails)
+      .where(
+        and(
+          eq(invitationSenderEmails.senderId, senderId),
+          gt(invitationSenderEmails.sentAt, windowStart),
+        ),
+      );
+    return usage ?? { count: 0, oldestSentAt: null };
+  }
+
+  /**
    * Method record
    *
    * @description
-   * Inserts the entry of the email of an invitation at its `sentAt`.
+   * Inserts the email in the organization and sender ledgers at the same instant.
    *
    * @param {Invitation} invitation - The stored invitation after its issue or its resend.
+   * @param {string} senderId - The verified sender who holds the sender allowance lock.
    * @returns {Promise<void>} Resolves once inserted.
    */
-  public async record(invitation: Invitation): Promise<void> {
+  public async record(invitation: Invitation, senderId: string): Promise<void> {
     const state: InvitationState = invitation.snapshot;
     await this.db.insert(invitationEmails).values({
       organizationId: state.organizationId,
       invitationId: state.id,
       sentAt: state.sentAt,
     });
+    await this.db.insert(invitationSenderEmails).values({ senderId, sentAt: state.sentAt });
   }
   // #endregion
 }

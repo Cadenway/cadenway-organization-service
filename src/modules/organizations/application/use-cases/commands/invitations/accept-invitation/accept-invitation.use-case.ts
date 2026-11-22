@@ -1,10 +1,12 @@
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import { takesSeat } from '../../../../../domain/policies/members/seat.policy.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
+import type { VerifiedEmailAuthority } from '../../../../ports/outbound/identity/invitations/verified-email-authority.port.js';
 import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { MyOrganizationView } from '../../../../projections/organizations/my-organization-view.projection.js';
@@ -62,11 +64,14 @@ export class AcceptInvitation {
    *
    * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
    * @param {Clock} clock - The time of the acceptance.
+   * @param {VerifiedEmailAuthority} verifiedEmails - The current verified account address.
+   * @param {boolean} seatQuotaEnabled - Whether to enforce the committed seat limit.
    * @constructor
    */
   public constructor(
     unitOfWork: OrganizationsUnitOfWork,
     clock: Clock,
+    private readonly verifiedEmails: VerifiedEmailAuthority,
     private readonly seatQuotaEnabled: boolean = false,
   ) {
     this.unitOfWork = unitOfWork;
@@ -89,21 +94,29 @@ export class AcceptInvitation {
    */
   public async execute(input: AcceptInvitationInput): Promise<MyOrganizationView> {
     try {
-      const addressed: Invitation = await findAddressedInvitation(this.unitOfWork, input);
+      if (input.userId !== input.actorUserId) {
+        throw new OrganizationRefusal({ reason: 'user-not-found' });
+      }
+      const currentEmail: EmailAddress | null = await this.verifiedEmails.find(input.actorUserId);
+      const addressed: Invitation = await findAddressedInvitation(
+        this.unitOfWork,
+        input,
+        currentEmail,
+      );
       const organizationId: string = addressed.snapshot.organizationId;
       const now: Date = this.clock.now();
       return await this.unitOfWork.runInOrganizationOf(
         addressed,
         input.actorUserId,
         async (store: OrganizationsStore): Promise<MyOrganizationView> => {
-          // The directory entry of the actor is held until the commit, before the invitation: a
-          // deletion of the account under way is waited for, then leaves no verified address, and
-          // a later one finds the new membership (`RemoveDeletedUser`).
+          // Lock the directory entry before the invitation so account deletion either leaves a
+          // tombstone before this check or finds the membership after this transaction commits.
           await store.directory.findForShare(input.actorUserId);
           const invitation: Invitation = await assertAddressedToActor(
             store,
             await store.invitations.findForUpdate(organizationId, input.invitationId),
             input.actorUserId,
+            currentEmail,
           );
           const organization: Organization | null = await store.organizations.find(organizationId);
           if (organization === null) {

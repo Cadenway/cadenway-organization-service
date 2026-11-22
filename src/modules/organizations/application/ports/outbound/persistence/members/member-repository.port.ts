@@ -36,21 +36,17 @@ export interface MemberRepository {
    *
    * @param {string} organizationId - The organization.
    * @param {string} userId - The account.
+   * @param {'share'} lock - Optionally blocks role changes and removals until commit.
    * @returns {Promise<Member | null>} The membership, or `null` when the account is not a member.
    */
-  findActiveOfUser(organizationId: string, userId: string): Promise<Member | null>;
+  findActiveOfUser(organizationId: string, userId: string, lock?: 'share'): Promise<Member | null>;
 
-  /**
-   * Method findActiveForUpdate
-   *
-   * @description
-   * Loads an active membership by its id and locks it until the end of the transaction.
-   *
-   * @param {string} organizationId - The organization.
-   * @param {string} memberId - Id of the membership.
-   * @returns {Promise<Member | null>} The membership, or `null`.
-   */
-  findActiveForUpdate(organizationId: string, memberId: string): Promise<Member | null>;
+  /** Locks the actor and target memberships in ID order and returns their current states. */
+  lockActorAndTarget(
+    organizationId: string,
+    actorUserId: string,
+    memberId: string,
+  ): Promise<readonly Member[]>;
 
   /**
    * Method findActiveOfAccountForUpdate
@@ -70,7 +66,7 @@ export interface MemberRepository {
    * Method update
    *
    * @description
-   * Writes the role, the removal and the version of a membership locked by `findActiveForUpdate` or
+   * Writes the role, the removal and the version of a membership locked by `lockActorAndTarget` or
    * `findActiveOfAccountForUpdate`.
    *
    * @param {Member} member - The membership after the change.

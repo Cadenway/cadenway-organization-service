@@ -2,7 +2,7 @@ import { Invitation } from '../../../../../domain/aggregates/invitation/invitati
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
 import {
-  assertInvitationEmailsAvailable,
+  assertInvitationBatchAvailable,
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
@@ -103,10 +103,22 @@ export class ResendInvitation {
             input.actorUserId,
           );
           assertManagesOrganization(actor.role);
+          const windowStart = invitationEmailWindowStart(now);
+          const senderUsage = await store.invitationEmails.lockSenderUsage(
+            input.actorUserId,
+            windowStart,
+          );
           const usage: InvitationEmailUsage = await store.invitationEmails.lockUsage(
             input.organizationId,
-            invitationEmailWindowStart(now),
+            windowStart,
           );
+          const currentActor = await requireActorMembership(
+            store,
+            input.organizationId,
+            input.actorUserId,
+            'share',
+          );
+          assertManagesOrganization(currentActor.role);
           const invitation: Invitation | null = await store.invitations.findForUpdate(
             input.organizationId,
             input.invitationId,
@@ -118,9 +130,9 @@ export class ResendInvitation {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
           const resent: Invitation = invitation.resend(now);
-          assertInvitationEmailsAvailable(usage, 1, now);
+          assertInvitationBatchAvailable(senderUsage, usage, 1, now);
           await store.invitations.update(resent);
-          await store.invitationEmails.record(resent);
+          await store.invitationEmails.record(resent, input.actorUserId);
           await store.events.invitationIssued(resent, {
             inviterUserId: input.actorUserId,
             inviterName: await senderNameOf(store, input.actorUserId),

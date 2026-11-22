@@ -26,6 +26,9 @@ export interface InvitationEmailRepository {
    */
   lockUsage(organizationId: string, windowStart: Date): Promise<InvitationEmailUsage>;
 
+  /** Locks and reads the verified sender's allowance across organizations. Acquire it before the tenant allowance. */
+  lockSenderUsage(senderId: string, windowStart: Date): Promise<InvitationEmailUsage>;
+
   /**
    * Method record
    *
@@ -34,8 +37,9 @@ export interface InvitationEmailRepository {
    * organization, the invitation and the instant only, never the address.
    *
    * @param {Invitation} invitation - The stored invitation after its issue or its resend.
+   * @param {string} senderId - The verified sender of this email, including on a resend.
    * @returns {Promise<void>} Resolves once recorded.
    */
-  record(invitation: Invitation): Promise<void>;
+  record(invitation: Invitation, senderId: string): Promise<void>;
   // #endregion
 }

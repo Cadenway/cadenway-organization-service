@@ -47,6 +47,7 @@ providers of the module; no other module imports it.
 | `organization_logo_reservations` | (`organization_id`, `upload_id`), replay key scoped to organization and uploader | `organization_id`, policy forced                       |
 | `organization_seat_entitlements` | `organization_id`, one versioned Billing seat projection                         | `organization_id`, policy forced                       |
 | `invitation_emails`              | `id`; one row per invitation email sent                                          | `organization_id`, policy forced                       |
+| `invitation_sender_emails`       | `id`; one row per email, with a sender ID and timestamp only                     | `sender_id`, policy forced                             |
 | `directory_users`                | `user_id`, the id identity-service gave the account                              | None: an account belongs to no organization, no policy |
 
 Created by `migrations/0001_organizations_members_invitations.sql` and
@@ -71,6 +72,12 @@ the table holds 100 rows at most per organization, and no job purges it, so an o
 stops inviting keeps its last rows. Their foreign keys are `no action`: the deletion of an
 organization or of an invitation, a later phase, deletes its ledger rows first.
 
+`migrations/0008_invitation_sender_budget.sql` adds the account-scoped ledger. It records the
+verified account that actually sent each email, including a resend by a different administrator.
+The account's next send drops expired rows under its transaction lock. The tenant ledger retains
+its existing semantics and earlier entries. The sender ledger starts counting with the first
+version that writes it, since earlier entries do not identify the sender of each email.
+
 `0005_organization_logo` adds the nullable opaque `organizations.logo_id`, an independent
 `logo_generation` and tenant-owned upload reservations. A reservation binds the uploader,
 declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
@@ -92,12 +99,13 @@ From `openapi/internal/organization-service.yaml` of the installed `@cadenway/co
 `api-gateway`, actor `user`. "Required" routes act on the organization of the internal token in its
 tenant transaction; "none" routes ignore it.
 
-`GET /internal/v1/search-organizations` serves Search and Identity. It requires the signing
-service's own system identity without an organization claim and exports only organization IDs.
-It resumes within the authenticated upper bound of the first page.
+Search and Identity use two private, uncacheable routes. `GET /internal/v1/search-organizations`
+requires the signing service's own system identity without an organization claim and exports only
+organization IDs. It resumes within the authenticated upper bound of the first page.
 `GET /internal/v1/search-membership` requires a signed user actor and organization. One tenant
 snapshot returns the active membership ID, role and membership version. Task and Realtime can
-read this proof only. Identity, Task and Realtime send neither a delegated role nor scopes.
+call only this membership route. Identity, Task and Realtime sign it without a delegated role
+or scopes.
 
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
@@ -192,11 +200,7 @@ Revoking and refusing emit nothing; a patch or a role change that moves nothing 
 The removals of a deleted account carry the actor `{ type: 'system', id: 'organization-service' }`
 (`asyncapi/organization-service.yaml`), one event per organization, appended in the system
 transaction of the removal.
-The language of `invitation.issued.v1` is the default language of the organization. No rebuild
-use case exists yet: identity-service, the one consumer of the membership events today, reads
-the seven days the stream holds when it starts; a consumer that needs the memberships beyond them
-(the permissions already allow `rebuild.*.member`) needs a rebuild item schema in
-`@cadenway/contracts` and a re-emission use case here, with `RebuildEmitter`.
+The language of `invitation.issued.v1` is the default language of the organization.
 
 ## Offline membership export
 
@@ -263,20 +267,15 @@ Ops protects the stream between the Organization exporter and the Task importer.
   events of one account apply one after the other. The acceptance of an invitation and the
   creation of an organization hold the entry of their actor in share mode (`select … for share`)
   until they commit, before they write a membership: a deletion under way is waited for, then
-  leaves no verified address (`invitation.not-found`) nor synchronized account
+  leaves a tombstone (`invitation.not-found`) and no synchronized account
   (`user.not-synchronized`), and a deletion that comes later waits for them and finds the new
   membership (the owner of a new organization refuses it).
-- The directory decides which account accepts an invitation, so a failing event is not given up
-  before 24 hours (decision 3 of the P2b security follow-ups): the three directory consumers retry
-  on `DIRECTORY_REDELIVERY` (`application/models/directory/`), 1 s, 5 s, 30 s, 2 min, 10 min,
-  30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter, the schedule
-  the README of `@cadenway/nest-messaging` gives for security projections. The two consumers of P2c
-  use the same schedule: the address decides which account accepts an invitation, and the
-  deletion stops the access of the account to its organizations (identity-service stops it on
-  `member.removed.v1`). So does the consumer of P2c-2: the owner and the admins read the two-step
-  verification of their members from it, a security signal a lost event would misreport. The kit
-  applies it with `nak(delay)` and sets `max_deliver` to 32 on each consumer when the service
-  starts, in place.
+- The directory tracks account status, member display and two-step verification. Its consumers
+  retry on `DIRECTORY_REDELIVERY` (`application/models/directory/`): 1 s, 5 s, 30 s, 2 min, 10 min,
+  30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter. The same
+  schedule protects the deletion event, which removes the account's memberships and emits
+  `member.removed.v1`. The kit applies the schedule with `nak(delay)` and sets `max_deliver` to 32
+  on each consumer at startup.
   **A rollout of this schedule, or of any change to it, must replace every replica**: a replica
   still on the previous limit (5 deliveries) treats its own last delivery as final and can use up
   the remaining deliveries at once, and sets `max_deliver` back when it restarts.
@@ -359,16 +358,15 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `sentAt` (the issue or the previous resend) answers `429 invitation.resend-throttled` with
   `details.resendAvailableAt`, `sentAt` plus one hour, checked after the invitation is found and
   pending (decision 1 of the P2b security follow-ups).
-- An organization causes at most 100 invitation emails in any 24 hours: each `invited` address of a
-  batch or of the creation and each resend takes one. Once the role is accepted, a batch whose
-  addresses to invite need more than what remains, or a resend with none left (after the hour
-  rule), answers `429 invitation.daily-limit-reached` with `details.remaining` (`0` or more) and
-  `details.nextAvailableAt` (the oldest email counted plus 24 hours), and writes, sends and emits
-  nothing. A batch that invites nobody is never refused. The creation is never refused (50
-  addresses at most) but counts.
-- An invitation is accepted or refused only by the account whose verified address, in the
-  directory, is the invited address (decision 5); the checks run in the order of the contract, and
-  the address is checked again under the lock of the invitation.
+- Both the organization and the sender allow at most 100 invitation emails in any 24 hours.
+  Each newly invited address and each resend takes one from both budgets. A creation, batch or
+  resend exceeding either allowance answers `429 invitation.daily-limit-reached` and writes,
+  sends and emits nothing. Batches with no new invitations consume no units.
+- Received invitations use the current verified address from Identity. The local directory
+  still tracks account existence and deletion. Acceptance and refusal check that the invitation
+  still matches the address from Identity under the invitation lock. These routes require
+  `IDENTITY_SERVICE_URL` and `ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK`; Identity must trust
+  the matching Organization issuer before rollout.
 - A cursor is unsigned: its id must be a UUID and its key the sort key of its list (an instant for
   the invitation lists), else `400 request.invalid`, the code of the contract. The kit answers a
   malformed cursor and a malformed `If-Match` with that code itself; this module answers it for
@@ -401,6 +399,8 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - Tenant transaction of the organization of the token: reading and patching the organization,
   every member and invitation route. The membership of the actor, the change, its version check
   and its event commit together.
+- `GET /internal/v1/members` opens a tenant `REPEATABLE READ READ ONLY` transaction for the
+  permission check, the page, the filtered total and the counts by role.
 - `GET /internal/v1/search-membership` opens a tenant `REPEATABLE READ READ ONLY` transaction and
   reads the active membership of the delegated user in the token's organization.
 - The batches and the resends of an organization run one after the other: the check of the daily
@@ -412,8 +412,9 @@ The Search readers open their snapshots directly with the kit's transaction runn
   organization before an invitation (the resend: organization, then the invitation), so the locks
   are always taken in that order. The count is a statement of its own after the lock, so it sees
   what the previous holder committed under READ COMMITTED, the isolation the kit's runners open; a
-  runner opened at REPEATABLE READ would break the check. The creation writes the ledger of an
-  organization nobody else can see yet and takes no lock. A request waiting on the lock longer
+  runner opened at REPEATABLE READ would break the check. Creation takes the sender budget lock
+  when it sends mail. It needs no tenant budget lock because its new organization is private to
+  the transaction. A request waiting on the lock longer
   than the `lock_timeout` of the application role (5 s) fails with a 500.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
   - the creation of an organization: the organization does not exist before it and PostgreSQL
@@ -422,8 +423,8 @@ The Search readers open their snapshots directly with the kit's transaction runn
     system transaction) and reads the directory entry of the actor, held in share mode until it
     commits;
   - the list of the organizations of the actor: a read-only query filtered on `members.user_id`;
-  - the invitations addressed to the actor: a read-only query filtered on the verified address
-    of the actor's directory entry;
+  - the invitations addressed to the actor: a read-only query filtered on the current verified
+    address from Identity, provided the directory entry is active;
   - the first checks of an answer to an invitation: a read-only lookup of one invitation by id
     and of the actor's directory entry;
   - `GET /internal/v1/search-organizations`: a `REPEATABLE READ READ ONLY` export of at most 100
@@ -493,25 +494,24 @@ Any failure rolls back the business rows and the outbox rows together
   `@cadenway/nest-common` 0.6.0 (decision 5 of the P2b security follow-ups); this module no longer
   maps the former kit codes. The generated query validators of `@cadenway/contracts` 0.6.0 read
   `limit` from its text, so the module keeps only its splitting of `role`.
-- The invitation email limits, decision 1 of the P2b security follow-ups, as
-  `openapi/internal/organization-service.yaml` of `@cadenway/contracts` 0.6.0 describes them (the
-  user may revise them): one email an hour per invitation, counted from its `sentAt`; 100 per
-  organization in any 24 hours, issues, creation invitations and resends together; a batch over
-  what remains refused as a whole. Choices made here:
-  - the ledger `invitation_emails` counts the emails, since `sentAt` is overwritten by a resend;
-    it holds no address, and its rows are purged by the next batch or resend of their
-    organization rather than by a job;
-  - the check is serialized per organization by a row lock on the organization, not an advisory
-    lock (no shared key space to coordinate) nor a constraint (a count over a window is no
-    constraint);
-  - the order of the refusals of a resend follows the contract: found, pending, the hour, then
-    the allowance;
-  - `Retry-After` is computed when the refusal is answered, from the instant of the details, as
-    identity-service does.
-  - Known limit, as the contract defines the hour per invitation: revoking an invitation and
-    inviting the address again sends a new email at once, within the daily allowance, and each new
-    organization starts with its own 100. A per-address hour and a limit on creations need the
-    contract first; reported to cadenway-api-contracts and the gateway.
+- Each invitation permits one resend an hour. Invitation emails consume both the organization's
+  and the sender's independent budgets of 100 in any 24 hours. Creation invitations, new
+  invitations and resends count together. An invitation batch or a creation requiring more
+  emails than remain is refused as a whole. No-op addresses and an organization created without
+  invitations consume no units.
+  - The sender budget is serialized first with a transaction advisory lock keyed by verified user
+    ID, followed by the organization row lock. Issue and resend then recheck the sender's role
+    under a share lock on the active membership before taking any invitation row lock. Read committed
+    transactions count previous committed sends after obtaining each lock. The invitation,
+    both ledger entries and the outbox record commit together.
+  - Resend refusal order remains found, pending, the hour, then the allowance. The refusal
+    reports the smaller remaining allowance. If both allowances have the same remaining
+    balance, it reports the later time that one place becomes available in both. `Retry-After`
+    is calculated when responding from the indicated time.
+  - Revoking and reinviting uses a different invitation ID and still consumes the shared
+    sender and organization budgets.
+- Role changes and removals lock the actor and target memberships in member ID order before
+  making authorization decisions. The same row supplies both roles when the actor is the target.
 - The account changes of P2c, decision 9 of its brief (the user may revise them):
   - `user.email-changed.v1` updates the address of the directory, verified, by the version of the
     account, like the other directory events;
@@ -528,10 +528,10 @@ Any failure rolls back the business rows and the outbox rows together
   - a verified address moves between accounts with `user.email-changed.v1` and comes free again
     with `user.deleted.v1`. The versions order the events of one account only, so while the change
     of the account that leaves an address is not applied yet (retried, or a dead letter), the
-    account that takes it and the one that left it can both hold it verified, and both list and
-    answer its invitations. identity-service never lets two accounts verify one address, so the
-    window lasts as long as the event of the leaving account waits; a unique address would turn it
-    into a projection that fails until then, which this module does not do;
+    account that takes it and the one that left it can both appear verified in the projection.
+    Identity verifies one owner per address, and invitation reads and answers use that current
+    proof. The directory allows the temporary duplicate so it can apply each account's events
+    independently;
   - the deletion of an owner is refused and becomes a dead letter rather than applied without the
     owner membership: the event contradicts the contract, so identity-service and this service
     disagree on who owns the organization; applying it in part would hide that and leave an

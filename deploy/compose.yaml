@@ -7,8 +7,8 @@
 # below in docs/service-environment.md. Required variables must exist on the host before the
 # release that reads them. The Search variables default to empty during a staged rollout.
 #
-# INTERNAL_TOKEN_TRUSTED_ISSUERS configures the API gateway. Search, Identity, Task and Realtime
-# activate with their optional public keys. The folded scalar gives the service one line of JSON.
+# INTERNAL_TOKEN_TRUSTED_ISSUERS configures the API gateway. Search and Identity activate with
+# their optional public keys. The folded scalar gives the service one line of JSON.
 #
 # MIGRATION_DATABASE_URL is deliberately absent: the GitOps agent of cadenway-ops hands the
 # migrator's URL to the one-off migration container only (docs/database.md there), so the running
@@ -24,6 +24,8 @@ services:
       NATS_USER: organization
       NATS_PASSWORD: ${ORGANIZATION_NATS_PASSWORD}
       INTERNAL_TOKEN_AUDIENCE: organization-service
+      IDENTITY_SERVICE_URL: ${IDENTITY_SERVICE_URL:?IDENTITY_SERVICE_URL is required}
+      ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK: ${ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK:?Organization signing key is required}
       INTERNAL_TOKEN_TRUSTED_ISSUERS: >-
         {"api-gateway": [${API_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS}]}
       SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: ${SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS:-}
