@@ -80,7 +80,9 @@ export class IdentityEmailAuthorityFixture {
           }
           send(200, { email });
         })
-        .catch(() => send(401, {}));
+        .catch(() => {
+          send(401, {});
+        });
     });
     this.server = server;
     await new Promise<void>((resolve, reject) => {

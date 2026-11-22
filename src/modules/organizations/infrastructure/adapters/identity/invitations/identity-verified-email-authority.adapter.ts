@@ -1,5 +1,5 @@
 import { GetVerifiedEmailInternalResponse } from '@cadenway/contracts/validators/internal/identity-service';
-import { InternalHttpClient, ProblemException } from '@cadenway/nest-common';
+import { type InternalHttpClient, ProblemException } from '@cadenway/nest-common';
 import { assertNoActiveTransaction } from '@cadenway/nest-common/database';
 
 import type { VerifiedEmailAuthority } from '../../../../application/ports/outbound/identity/invitations/verified-email-authority.port.js';
@@ -7,8 +7,13 @@ import { EmailAddress } from '../../../../domain/value-objects/email/email-addre
 
 /** Resolves just the actor's current verified email from the service that owns it. */
 export class IdentityVerifiedEmailAuthority implements VerifiedEmailAuthority {
+  // #region Constructor
+  /** Binds the signed Identity client when the authority is configured. */
   public constructor(private readonly identity: InternalHttpClient | null) {}
+  // #endregion
 
+  // #region Methods
+  /** Reads the verified email from Identity for the current operation. */
   public async find(userId: string): Promise<EmailAddress | null> {
     assertNoActiveTransaction();
     try {
@@ -49,4 +54,5 @@ export class IdentityVerifiedEmailAuthority implements VerifiedEmailAuthority {
     }
     throw new ProblemException({ status: 503, code: 'upstream.unavailable' });
   }
+  // #endregion
 }
