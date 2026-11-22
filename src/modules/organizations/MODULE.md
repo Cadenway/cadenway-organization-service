@@ -267,20 +267,15 @@ Ops protects the stream between the Organization exporter and the Task importer.
   events of one account apply one after the other. The acceptance of an invitation and the
   creation of an organization hold the entry of their actor in share mode (`select … for share`)
   until they commit, before they write a membership: a deletion under way is waited for, then
-  leaves no verified address (`invitation.not-found`) nor synchronized account
+  leaves a tombstone (`invitation.not-found`) and no synchronized account
   (`user.not-synchronized`), and a deletion that comes later waits for them and finds the new
   membership (the owner of a new organization refuses it).
-- The directory decides which account accepts an invitation, so a failing event is not given up
-  before 24 hours (decision 3 of the P2b security follow-ups): the three directory consumers retry
-  on `DIRECTORY_REDELIVERY` (`application/models/directory/`), 1 s, 5 s, 30 s, 2 min, 10 min,
-  30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter, the schedule
-  the README of `@cadenway/nest-messaging` gives for security projections. The two consumers of P2c
-  use the same schedule: the address decides which account accepts an invitation, and the
-  deletion stops the access of the account to its organizations (identity-service stops it on
-  `member.removed.v1`). So does the consumer of P2c-2: the owner and the admins read the two-step
-  verification of their members from it, a security signal a lost event would misreport. The kit
-  applies it with `nak(delay)` and sets `max_deliver` to 32 on each consumer when the service
-  starts, in place.
+- The directory tracks account status, member display and two-step verification. Its consumers
+  retry on `DIRECTORY_REDELIVERY` (`application/models/directory/`): 1 s, 5 s, 30 s, 2 min, 10 min,
+  30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter. The same
+  schedule protects the deletion event, which removes the account's memberships and emits
+  `member.removed.v1`. The kit applies the schedule with `nak(delay)` and sets `max_deliver` to 32
+  on each consumer at startup.
   **A rollout of this schedule, or of any change to it, must replace every replica**: a replica
   still on the previous limit (5 deliveries) treats its own last delivery as final and can use up
   the remaining deliveries at once, and sets `max_deliver` back when it restarts.
@@ -417,8 +412,9 @@ The Search readers open their snapshots directly with the kit's transaction runn
   organization before an invitation (the resend: organization, then the invitation), so the locks
   are always taken in that order. The count is a statement of its own after the lock, so it sees
   what the previous holder committed under READ COMMITTED, the isolation the kit's runners open; a
-  runner opened at REPEATABLE READ would break the check. The creation writes the ledger of an
-  organization nobody else can see yet and takes no lock. A request waiting on the lock longer
+  runner opened at REPEATABLE READ would break the check. Creation takes the sender budget lock
+  when it sends mail. It needs no tenant budget lock because its new organization is private to
+  the transaction. A request waiting on the lock longer
   than the `lock_timeout` of the application role (5 s) fails with a 500.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
   - the creation of an organization: the organization does not exist before it and PostgreSQL
@@ -427,8 +423,8 @@ The Search readers open their snapshots directly with the kit's transaction runn
     system transaction) and reads the directory entry of the actor, held in share mode until it
     commits;
   - the list of the organizations of the actor: a read-only query filtered on `members.user_id`;
-  - the invitations addressed to the actor: a read-only query filtered on the verified address
-    of the actor's directory entry;
+  - the invitations addressed to the actor: a read-only query filtered on the current verified
+    address from Identity, provided the directory entry is active;
   - the first checks of an answer to an invitation: a read-only lookup of one invitation by id
     and of the actor's directory entry;
   - `GET /internal/v1/search-organizations`: a `REPEATABLE READ READ ONLY` export of at most 100
@@ -532,10 +528,10 @@ Any failure rolls back the business rows and the outbox rows together
   - a verified address moves between accounts with `user.email-changed.v1` and comes free again
     with `user.deleted.v1`. The versions order the events of one account only, so while the change
     of the account that leaves an address is not applied yet (retried, or a dead letter), the
-    account that takes it and the one that left it can both hold it verified, and both list and
-    answer its invitations. identity-service never lets two accounts verify one address, so the
-    window lasts as long as the event of the leaving account waits; a unique address would turn it
-    into a projection that fails until then, which this module does not do;
+    account that takes it and the one that left it can both appear verified in the projection.
+    Identity verifies one owner per address, and invitation reads and answers use that current
+    proof. The directory allows the temporary duplicate so it can apply each account's events
+    independently;
   - the deletion of an owner is refused and becomes a dead letter rather than applied without the
     owner membership: the event contradicts the contract, so identity-service and this service
     disagree on who owns the organization; applying it in part would hide that and leave an
