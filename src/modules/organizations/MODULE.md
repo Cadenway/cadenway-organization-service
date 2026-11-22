@@ -92,11 +92,12 @@ From `openapi/internal/organization-service.yaml` of the installed `@cadenway/co
 `api-gateway`, actor `user`. "Required" routes act on the organization of the internal token in its
 tenant transaction; "none" routes ignore it.
 
-Search uses two private, uncacheable routes. `GET /internal/v1/search-organizations` requires
-the Search system identity without an organization claim and exports only organization IDs.
+`GET /internal/v1/search-organizations` serves Search and Identity. It requires the signing
+service's own system identity without an organization claim and exports only organization IDs.
 It resumes within the authenticated upper bound of the first page.
-`GET /internal/v1/search-membership` requires an authenticated user and organization delegated
-by Search. One tenant snapshot returns the active membership ID, role and membership version.
+`GET /internal/v1/search-membership` requires a signed user actor and organization. One tenant
+snapshot returns the active membership ID, role and membership version. Task and Realtime can
+read this proof only. Identity, Task and Realtime send neither a delegated role nor scopes.
 
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
@@ -426,8 +427,8 @@ The Search readers open their snapshots directly with the kit's transaction runn
   - the first checks of an answer to an invitation: a read-only lookup of one invitation by id
     and of the actor's directory entry;
   - `GET /internal/v1/search-organizations`: a `REPEATABLE READ READ ONLY` export of at most 100
-    active organization IDs per page up to the first snapshot's high-water UUID. Only the
-    `search-service` system actor in a token with a null organization can open this transaction;
+    active organization IDs per page up to the first snapshot's high-water UUID. Search and
+    Identity use their own system actor and a token with a null organization;
   - the projection of the directory: one entry by its account id, in the transaction of the
     deduplicator;
   - the removal of a deleted account: its directory entry and its active memberships in every

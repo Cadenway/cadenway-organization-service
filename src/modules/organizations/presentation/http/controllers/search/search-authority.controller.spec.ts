@@ -1,4 +1,4 @@
-import type { InternalTokenVerifier } from '@cadenway/nest-common';
+import type { InternalPrincipal, InternalTokenVerifier } from '@cadenway/nest-common';
 import {
   InternalTokenGuard,
   runWithOrganizationContext,
@@ -35,6 +35,36 @@ const user = {
   scopes: [],
 };
 
+/** Returns the execution context that lets the kit attach a verified principal to a request. */
+function context(
+  handler: 'list' | 'membership',
+  request = { headers: { authorization: 'Bearer signed' } },
+) {
+  return {
+    getClass: () => SearchAuthorityController,
+    getHandler: () =>
+      Object.getOwnPropertyDescriptor(SearchAuthorityController.prototype, handler)
+        ?.value as unknown,
+    getType: () => 'http',
+    switchToHttp: () => ({ getRequest: () => request }),
+  } as unknown as ExecutionContext;
+}
+
+/** Gives direct controller tests the request state established by the shared token guard. */
+async function verifiedRequest(
+  handler: 'list' | 'membership',
+  principal: Pick<InternalPrincipal, 'actor' | 'organizationId' | 'role' | 'scopes' | 'issuer'>,
+) {
+  const request = { headers: { authorization: 'Bearer signed' } };
+  const verifier = { verify: vi.fn().mockResolvedValue(principal) };
+  const guard = new InternalTokenGuard(
+    verifier as unknown as InternalTokenVerifier,
+    new Reflector(),
+  );
+  await guard.canActivate(context(handler, request));
+  return request;
+}
+
 /** Builds the real use cases over controlled snapshot results. */
 function fixture(cursor = new SearchOrganizationCursor(Buffer.alloc(32, 7).toString('base64url'))) {
   const read = vi.fn<SearchOrganizationsReader['read']>();
@@ -48,80 +78,120 @@ function fixture(cursor = new SearchOrganizationCursor(Buffer.alloc(32, 7).toStr
 }
 
 describe('SearchAuthorityController', () => {
-  it('keeps the Search issuer requirement on both handler policies', async () => {
-    const verifier = { verify: vi.fn() };
-    const guard = new InternalTokenGuard(
-      verifier as unknown as InternalTokenVerifier,
-      new Reflector(),
-    );
-    const context = (handler: 'list' | 'membership') =>
-      ({
-        getClass: () => SearchAuthorityController,
-        getHandler: () =>
-          Object.getOwnPropertyDescriptor(SearchAuthorityController.prototype, handler)
-            ?.value as unknown,
-        getType: () => 'http',
-        switchToHttp: () => ({
-          getRequest: () => ({ headers: { authorization: 'Bearer signed' } }),
-        }),
-      }) as unknown as ExecutionContext;
-
-    verifier.verify.mockResolvedValue({ ...system, issuer: 'search-service' });
-    await expect(guard.canActivate(context('list'))).resolves.toBe(true);
-    await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
-      problem: { status: 403, code: 'auth.actor-not-allowed' },
-    });
-    verifier.verify.mockResolvedValue({ ...user, issuer: 'search-service' });
-    await expect(guard.canActivate(context('membership'))).resolves.toBe(true);
-    await expect(guard.canActivate(context('list'))).rejects.toMatchObject({
-      problem: { status: 403, code: 'auth.actor-not-allowed' },
-    });
-    verifier.verify.mockResolvedValueOnce({
-      ...user,
-      organizationId: null,
-      issuer: 'search-service',
-    });
-    await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
-      problem: { status: 403, code: 'auth.organization-required' },
-    });
-    verifier.verify.mockResolvedValueOnce({ ...system, issuer: 'api-gateway' });
-    await expect(guard.canActivate(context('list'))).rejects.toMatchObject({
-      problem: { status: 403, code: 'auth.issuer-not-allowed' },
-    });
-    verifier.verify.mockResolvedValueOnce({ ...user, issuer: 'api-gateway' });
-    await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
-      problem: { status: 403, code: 'auth.issuer-not-allowed' },
-    });
-  });
+  it.each(['search-service', 'identity-service'])(
+    'requires the expected actor and tenant for issuer %s',
+    async (issuer) => {
+      const verifier = { verify: vi.fn() };
+      const guard = new InternalTokenGuard(
+        verifier as unknown as InternalTokenVerifier,
+        new Reflector(),
+      );
+      verifier.verify.mockResolvedValue({ ...system, issuer });
+      await expect(guard.canActivate(context('list'))).resolves.toBe(true);
+      await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.actor-not-allowed' },
+      });
+      verifier.verify.mockResolvedValue({ ...user, issuer });
+      await expect(guard.canActivate(context('membership'))).resolves.toBe(true);
+      await expect(guard.canActivate(context('list'))).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.actor-not-allowed' },
+      });
+      verifier.verify.mockResolvedValueOnce({
+        ...user,
+        organizationId: null,
+        issuer,
+      });
+      await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.organization-required' },
+      });
+      verifier.verify.mockResolvedValueOnce({ ...system, issuer: 'api-gateway' });
+      await expect(guard.canActivate(context('list'))).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.issuer-not-allowed' },
+      });
+      verifier.verify.mockResolvedValueOnce({ ...user, issuer: 'api-gateway' });
+      await expect(guard.canActivate(context('membership'))).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.issuer-not-allowed' },
+      });
+    },
+  );
 
   it('refuses a tenant claim or different actor ID before opening the global snapshot', async () => {
     const { controller, read } = fixture();
-    await expect(
-      runWithOrganizationContext({ ...system, organizationId }, () =>
-        controller.list({ limit: 1 }),
-      ),
-    ).rejects.toMatchObject({ problem: { status: 403, code: 'auth.organization-not-allowed' } });
-    await expect(
-      runWithOrganizationContext(
-        { ...system, actor: { type: 'system', id: 'another-service' } },
-        () => controller.list({ limit: 1 }),
-      ),
-    ).rejects.toMatchObject({ problem: { status: 403, code: 'auth.actor-not-allowed' } });
+    const scoped = await verifiedRequest('list', {
+      ...system,
+      issuer: 'search-service',
+      organizationId,
+    });
+    await expect(controller.list({ limit: 1 }, scoped)).rejects.toMatchObject({
+      problem: { status: 403, code: 'auth.organization-not-allowed' },
+    });
+    const wrongActor = await verifiedRequest('list', { ...system, issuer: 'identity-service' });
+    await expect(controller.list({ limit: 1 }, wrongActor)).rejects.toMatchObject({
+      problem: { status: 403, code: 'auth.actor-not-allowed' },
+    });
     expect(read).not.toHaveBeenCalled();
   });
 
+  it.each(['task-service', 'realtime-gateway'])(
+    'limits %s to the signed membership read',
+    async (issuer) => {
+      const scope = { ...user, issuer, role: null };
+      const request = await verifiedRequest('membership', scope);
+      const { controller, findActive } = fixture();
+      findActive.mockResolvedValueOnce(null);
+      await expect(
+        runWithOrganizationContext(scope, () => controller.membership({}, request)),
+      ).rejects.toMatchObject({ problem: { status: 404, code: 'organization.not-found' } });
+      expect(findActive).toHaveBeenCalledExactlyOnceWith(organizationId, userId);
+
+      await expect(
+        verifiedRequest('list', {
+          ...system,
+          actor: { type: 'system', id: issuer },
+          issuer,
+        }),
+      ).rejects.toMatchObject({ problem: { status: 403, code: 'auth.issuer-not-allowed' } });
+    },
+  );
+
+  it.each([
+    { issuer: 'identity-service', role: 'admin', scopes: [] },
+    { issuer: 'identity-service', role: null, scopes: ['organizations:read'] },
+    { issuer: 'task-service', role: 'admin', scopes: [] },
+    { issuer: 'task-service', role: null, scopes: ['organizations:read'] },
+    { issuer: 'realtime-gateway', role: 'admin', scopes: [] },
+    { issuer: 'realtime-gateway', role: null, scopes: ['organizations:read'] },
+  ])(
+    'rejects delegated privileges from $issuer before reading membership',
+    async ({ issuer, role, scopes }) => {
+      const { controller, findActive } = fixture();
+      const request = await verifiedRequest('membership', {
+        ...user,
+        issuer,
+        role,
+        scopes,
+      });
+      await expect(controller.membership({}, request)).rejects.toMatchObject({
+        problem: { status: 403, code: 'auth.actor-not-allowed' },
+      });
+      expect(findActive).not.toHaveBeenCalled();
+    },
+  );
+
   it('opens the bounded snapshot with one lookahead ID and signs its original fence', async () => {
     const { controller, cursor, read } = fixture();
+    const request = await verifiedRequest('list', { ...system, issuer: 'search-service' });
     read.mockResolvedValueOnce({ upperId, items: [organizationId, upperId] });
-    const first = await runWithOrganizationContext(system, () => controller.list({ limit: 1 }));
+    const first = await controller.list({ limit: 1 }, request);
     const position = { upperId, afterId: organizationId };
 
     expect(read).toHaveBeenCalledWith(null, 2);
     expect(first).toEqual({ items: [organizationId], nextCursor: cursor.write(position) });
 
     read.mockResolvedValueOnce({ upperId, items: [upperId] });
-    const next = await runWithOrganizationContext(system, () =>
-      controller.list({ limit: 1, cursor: first.nextCursor ?? undefined }),
+    const next = await controller.list(
+      { limit: 1, cursor: first.nextCursor ?? undefined },
+      request,
     );
     expect(read).toHaveBeenLastCalledWith(position, 2);
     expect(next).toEqual({ items: [upperId], nextCursor: null });
@@ -129,9 +199,10 @@ describe('SearchAuthorityController', () => {
 
   it('returns the live membership stamp independently of the export key and token role', async () => {
     const { controller, findActive, read } = fixture(new SearchOrganizationCursor(undefined));
-    await expect(
-      runWithOrganizationContext(system, () => controller.list({ limit: 1 })),
-    ).rejects.toMatchObject({ problem: { status: 503, code: 'organization.unavailable' } });
+    const listRequest = await verifiedRequest('list', { ...system, issuer: 'search-service' });
+    await expect(controller.list({ limit: 1 }, listRequest)).rejects.toMatchObject({
+      problem: { status: 503, code: 'organization.unavailable' },
+    });
     expect(read).not.toHaveBeenCalled();
 
     findActive.mockResolvedValueOnce(
@@ -146,8 +217,12 @@ describe('SearchAuthorityController', () => {
         removedAt: null,
       }),
     );
+    const memberRequest = await verifiedRequest('membership', {
+      ...user,
+      issuer: 'search-service',
+    });
     await expect(
-      runWithOrganizationContext(user, () => controller.membership({})),
+      runWithOrganizationContext(user, () => controller.membership({}, memberRequest)),
     ).resolves.toEqual({
       memberId,
       role: 'admin',
@@ -158,13 +233,15 @@ describe('SearchAuthorityController', () => {
 
   it('distinguishes absence from failure to read the membership snapshot', async () => {
     const { controller, findActive } = fixture();
+    const scope = { ...user, role: null };
+    const request = await verifiedRequest('membership', { ...scope, issuer: 'identity-service' });
     findActive.mockResolvedValueOnce(null);
     await expect(
-      runWithOrganizationContext(user, () => controller.membership({})),
+      runWithOrganizationContext(scope, () => controller.membership({}, request)),
     ).rejects.toMatchObject({ problem: { status: 404, code: 'organization.not-found' } });
     findActive.mockRejectedValueOnce(new Error('Database error'));
     await expect(
-      runWithOrganizationContext(user, () => controller.membership({})),
+      runWithOrganizationContext(scope, () => controller.membership({}, request)),
     ).rejects.toMatchObject({ problem: { status: 503, code: 'organization.unavailable' } });
   });
 
