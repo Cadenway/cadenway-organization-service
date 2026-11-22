@@ -112,6 +112,10 @@ export class AcceptInvitation {
           // Lock the directory entry before the invitation so account deletion either leaves a
           // tombstone before this check or finds the membership after this transaction commits.
           await store.directory.findForShare(input.actorUserId);
+          const deletionAttempt = await store.directory.findDeletionAttempt(input.actorUserId);
+          if (deletionAttempt !== null) {
+            throw new OrganizationRefusal({ reason: 'invitation-not-found' });
+          }
           const invitation: Invitation = await assertAddressedToActor(
             store,
             await store.invitations.findForUpdate(organizationId, input.invitationId),

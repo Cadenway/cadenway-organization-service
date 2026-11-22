@@ -270,6 +270,13 @@ Ops protects the stream between the Organization exporter and the Task importer.
   leaves a tombstone (`invitation.not-found`) and no synchronized account
   (`user.not-synchronized`), and a deletion that comes later waits for them and finds the new
   membership (the owner of a new organization refuses it).
+- `ReserveAccountDeletion` uses a system transaction restricted to one account. It locks that
+  account's directory entry, checks its active owner memberships, and stores the first deletion
+  attempt in the nullable `directory_users.deletion_attempt_id` added by migration `0009`.
+  Organization creation and invitation acceptance check the reservation under their shared
+  directory lock. Retrying the same attempt reuses the reservation until the deletion event
+  commits. The internal Identity route remains unbound. Enable the caller only after migration
+  `0009` and the upgrade of every Organization writer that grants memberships.
 - The directory tracks account status, member display and two-step verification. Its consumers
   retry on `DIRECTORY_REDELIVERY` (`application/models/directory/`): 1 s, 5 s, 30 s, 2 min, 10 min,
   30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter. The same

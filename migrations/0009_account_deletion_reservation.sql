@@ -1,0 +1,1 @@
+ALTER TABLE "directory_users" ADD COLUMN "deletion_attempt_id" uuid;

@@ -11,9 +11,9 @@ import type { RoleCounts } from '../../../../projections/members/role-counts.pro
  * Interface MemberRepository
  *
  * @description
- * The memberships, bound to the transaction of a unit of work. Every method names its organization,
- * but `findActiveOfAccountForUpdate`, which names its account in a system transaction; only active
- * memberships are read, a removed one is kept for its version only.
+ * The memberships, bound to the transaction of a unit of work. Cross-organization account lookups
+ * name the account in a system transaction. Only active memberships are read, a removed one is
+ * kept for its version only.
  */
 export interface MemberRepository {
   // #region Methods
@@ -61,6 +61,9 @@ export interface MemberRepository {
    * @returns {Promise<readonly Member[]>} The memberships, none when the account belongs nowhere.
    */
   findActiveOfAccountForUpdate(userId: string): Promise<readonly Member[]>;
+
+  /** Current owned organizations in a system transaction under the account directory lock. */
+  listOwnedOrganizationIds(userId: string): Promise<readonly string[]>;
 
   /**
    * Method update

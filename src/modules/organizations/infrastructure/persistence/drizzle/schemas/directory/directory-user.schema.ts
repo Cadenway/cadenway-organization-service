@@ -35,6 +35,7 @@ export const directoryUsers = pgTable(
     twoStepVerificationEnabled: boolean('two_step_verification_enabled').notNull().default(false),
     twoStepVerificationVersion: integer('two_step_verification_version').notNull().default(0),
     deleted: boolean('deleted').notNull().default(false),
+    deletionAttemptId: uuid('deletion_attempt_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

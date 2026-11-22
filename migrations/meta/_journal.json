@@ -64,6 +64,13 @@
       "when": 1795365800405,
       "tag": "0008_invitation_sender_budget",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1795381226958,
+      "tag": "0009_account_deletion_reservation",
+      "breakpoints": true
     }
   ]
 }

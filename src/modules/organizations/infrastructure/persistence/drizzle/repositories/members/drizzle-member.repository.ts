@@ -251,6 +251,16 @@ export class DrizzleMemberRepository implements MemberRepository {
     return rows.map(toMember);
   }
 
+  /** Loads only active owner rows for the account, under the caller's directory row lock. */
+  public async listOwnedOrganizationIds(userId: string): Promise<readonly string[]> {
+    const rows = await this.db
+      .select({ organizationId: members.organizationId })
+      .from(members)
+      .where(and(eq(members.userId, userId), eq(members.role, 'owner'), isNull(members.removedAt)))
+      .orderBy(asc(members.organizationId));
+    return rows.map(({ organizationId }) => organizationId);
+  }
+
   /**
    * Method update
    *

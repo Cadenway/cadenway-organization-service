@@ -114,6 +114,10 @@ export class CreateOrganization {
           if (creator === null || creatorName === null || !creator.isSynchronized) {
             throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
           }
+          const deletionAttempt = await store.directory.findDeletionAttempt(input.actorUserId);
+          if (deletionAttempt !== null) {
+            throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
+          }
           const needed = addresses.filter(
             (address) => !creator.verifiedEmail?.equals(address),
           ).length;

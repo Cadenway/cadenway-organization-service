@@ -46,6 +46,15 @@ export interface DirectoryRepository {
    */
   lock(userId: string): Promise<DirectoryUser>;
 
+  /** Locks an existing account against granting new memberships, without creating an entry. */
+  findForUpdate(userId: string): Promise<DirectoryUser | null>;
+
+  /** Reads the deletion attempt already reserved under the held directory row lock. */
+  findDeletionAttempt(userId: string): Promise<string | null>;
+
+  /** Stores the first deletion attempt under the exclusive directory row lock. */
+  reserveDeletion(userId: string, attemptId: string): Promise<void>;
+
   /**
    * Method save
    *
