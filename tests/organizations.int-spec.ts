@@ -1109,10 +1109,8 @@ describe('organizations, members and invitations', () => {
       expect(early.status).toBe(404);
       expect(early.body).toMatchObject({ code: 'invitation.not-found' });
 
-      stack.publish('user.email-verified.v1', emailVerified(marc, 3));
-      await vi.waitFor(async () => {
-        expect((await directoryOf(marc))?.email_verified).toBe(true);
-      });
+      expect((await directoryOf(marc))?.email_verified).toBe(false);
+      stack.verifiedEmails.set(marc.id, 3, marc.email);
       const received = await call('get', `/internal/v1/users/${marc.id}/invitations`, marc, null);
       expect((received.body as ReceivedInvitationPage).items).toEqual([
         expect.objectContaining({
@@ -1129,6 +1127,12 @@ describe('organizations, members and invitations', () => {
       );
       expect(accepted.status).toBe(200);
       expect(accepted.body).toMatchObject({ role: 'member', memberCount: 4 });
+      expect((await directoryOf(marc))?.email_verified).toBe(false);
+
+      stack.publish('user.email-verified.v1', emailVerified(marc, 3));
+      await vi.waitFor(async () => {
+        expect((await directoryOf(marc))?.email_verified).toBe(true);
+      });
     });
   });
 

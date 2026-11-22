@@ -10,7 +10,7 @@ import type { OrganizationsUnitOfWork } from '../../ports/outbound/transactions/
  *
  * @description
  * Checks that an invitation is addressed to the current verified address from identity-service.
- * An absent local account or verified address answers like an unknown invitation
+ * An absent or deleted local account, or no current verified address, answers like an unknown invitation
  * (`invitation-not-found`), another address `invitation-email-mismatch`.
  *
  * @param {OrganizationsStore} store - The store of the transaction.
@@ -27,8 +27,7 @@ export async function assertAddressedToActor(
   currentEmail: EmailAddress | null,
 ): Promise<Invitation> {
   const user: DirectoryUser | null = await store.directory.find(actorUserId);
-  const email: EmailAddress | null = user?.verifiedEmail ?? null;
-  if (email === null || currentEmail === null || invitation === null) {
+  if (user === null || user.isDeleted || currentEmail === null || invitation === null) {
     throw new OrganizationRefusal({ reason: 'invitation-not-found' });
   }
   if (!invitation.isAddressedTo(currentEmail)) {

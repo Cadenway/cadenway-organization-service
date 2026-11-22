@@ -153,6 +153,13 @@ export class InviteMembers {
             input.organizationId,
             windowStart,
           );
+          const currentActor = await requireActorMembership(
+            store,
+            input.organizationId,
+            input.actorUserId,
+            'share',
+          );
+          assertManagesOrganization(currentActor.role);
           const planned: PlannedAddress[] = [];
           for (const address of addresses) {
             planned.push(await InviteMembers.plan(store, input.organizationId, address));

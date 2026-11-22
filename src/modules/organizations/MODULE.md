@@ -363,16 +363,15 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `sentAt` (the issue or the previous resend) answers `429 invitation.resend-throttled` with
   `details.resendAvailableAt`, `sentAt` plus one hour, checked after the invitation is found and
   pending (decision 1 of the P2b security follow-ups).
-- An organization causes at most 100 invitation emails in any 24 hours: each `invited` address of a
-  batch or of the creation and each resend takes one. Once the role is accepted, a batch whose
-  addresses to invite need more than what remains, or a resend with none left (after the hour
-  rule), answers `429 invitation.daily-limit-reached` with `details.remaining` (`0` or more) and
-  `details.nextAvailableAt` (the oldest email counted plus 24 hours), and writes, sends and emits
-  nothing. A batch that invites nobody is never refused. The creation is never refused (50
-  addresses at most) but counts.
-- An invitation is accepted or refused only by the account whose verified address, in the
-  directory, is the invited address (decision 5); the checks run in the order of the contract, and
-  the address is checked again under the lock of the invitation.
+- Both the organization and the sender allow at most 100 invitation emails in any 24 hours.
+  Each newly invited address and each resend takes one from both budgets. A creation, batch or
+  resend exceeding either allowance answers `429 invitation.daily-limit-reached` and writes,
+  sends and emits nothing. Batches with no new invitations consume no units.
+- Received invitations use the current verified address from Identity. The local directory
+  still tracks account existence and deletion. Acceptance and refusal check that the invitation
+  still matches the address from Identity under the invitation lock. These routes require
+  `IDENTITY_SERVICE_URL` and `ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK`; Identity must trust
+  the matching Organization issuer before rollout.
 - A cursor is unsigned: its id must be a UUID and its key the sort key of its list (an instant for
   the invitation lists), else `400 request.invalid`, the code of the contract. The kit answers a
   malformed cursor and a malformed `If-Match` with that code itself; this module answers it for
@@ -505,7 +504,8 @@ Any failure rolls back the business rows and the outbox rows together
   emails than remain is refused as a whole. No-op addresses and an organization created without
   invitations consume no units.
   - The sender budget is serialized first with a transaction advisory lock keyed by verified user
-    ID, followed by the organization row lock and any invitation row lock. Read committed
+    ID, followed by the organization row lock. Issue and resend then recheck the sender's role
+    under a share lock on the active membership before taking any invitation row lock. Read committed
     transactions count previous committed sends after obtaining each lock. The invitation,
     both ledger entries and the outbox record commit together.
   - Resend refusal order remains found, pending, the hour, then the allowance. The refusal
@@ -536,13 +536,6 @@ Any failure rolls back the business rows and the outbox rows together
     answer its invitations. identity-service never lets two accounts verify one address, so the
     window lasts as long as the event of the leaving account waits; a unique address would turn it
     into a projection that fails until then, which this module does not do;
-  - an account-deletion reservation takes the exclusive lock on the account directory entry,
-    checks current owner memberships and records the attempt. Organization creation and
-    membership admission take the shared lock and refuse reserved accounts. The reservation
-    survives retries and is only cleared when the deletion event commits. The use case is ready
-    to bind to the generated internal Identity authority route after the contract is installed.
-    Enable the Identity caller only after every Organization writer checks the reservation; a
-    writer from before migration 0009 can still grant a membership;
   - the deletion of an owner is refused and becomes a dead letter rather than applied without the
     owner membership: the event contradicts the contract, so identity-service and this service
     disagree on who owns the organization; applying it in part would hide that and leave an

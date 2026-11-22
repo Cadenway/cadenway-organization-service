@@ -74,9 +74,6 @@ interface Tables {
   /** Directory entries by account. */
   directory: Map<string, DirectoryUserState>;
 
-  /** Reservations for final account deletion. */
-  deletionAttempts: Map<string, string>;
-
   /** The fake ledger of invitation emails. */
   invitationEmails: RecordedEmail[];
 
@@ -124,7 +121,6 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
     seatEntitlements: new Map(),
     invitations: new Map(),
     directory: new Map(),
-    deletionAttempts: new Map(),
     invitationEmails: [],
     senderEmails: [],
     events: [],
@@ -218,7 +214,6 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
       seatEntitlements: new Map(this.tables.seatEntitlements),
       invitations: new Map(this.tables.invitations),
       directory: new Map(this.tables.directory),
-      deletionAttempts: new Map(this.tables.deletionAttempts),
       invitationEmails: [...this.tables.invitationEmails],
       senderEmails: [...this.tables.senderEmails],
       events: [...this.tables.events],
@@ -351,16 +346,6 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                 (member: MemberState) => member.userId === userId && member.removedAt === null,
               )
               .map((member: MemberState) => Member.restore(member)),
-          ),
-        listOwnedOrganizationIds: (userId: string): Promise<readonly string[]> =>
-          Promise.resolve(
-            [...tables.members.values()]
-              .filter(
-                (member) =>
-                  member.userId === userId && member.removedAt === null && member.role === 'owner',
-              )
-              .map(({ organizationId }) => organizationId)
-              .sort(),
           ),
         update: (member: Member): Promise<void> => {
           tables.members.set(member.id, member.snapshot);
@@ -601,18 +586,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
             state === undefined ? DirectoryUser.unknown(userId) : DirectoryUser.restore(state),
           );
         },
-        findForUpdate: (userId: string): Promise<DirectoryUser | null> => {
-          const state = tables.directory.get(userId);
-          return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
-        },
-        findDeletionAttempt: (userId: string): Promise<string | null> =>
-          Promise.resolve(tables.deletionAttempts.get(userId) ?? null),
-        reserveDeletion: (userId: string, attemptId: string): Promise<void> => {
-          tables.deletionAttempts.set(userId, attemptId);
-          return Promise.resolve();
-        },
         save: (user: DirectoryUser): Promise<void> => {
-          if (user.isDeleted) tables.deletionAttempts.delete(user.userId);
           tables.directory.set(user.userId, user.snapshot);
           return Promise.resolve();
         },

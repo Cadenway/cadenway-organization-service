@@ -87,8 +87,7 @@ export class ListReceivedInvitations {
     return this.unitOfWork.runAcrossOrganizations(
       async (store: OrganizationsStore): Promise<Page<ReceivedInvitationView>> => {
         const user: DirectoryUser | null = await store.directory.find(input.actorUserId);
-        const email: EmailAddress | null = user?.verifiedEmail ?? null;
-        if (email === null || currentEmail === null) {
+        if (user === null || user.isDeleted || currentEmail === null) {
           return { items: [], next: null };
         }
         return store.invitations.listReceived(currentEmail, now, input.after, input.limit);

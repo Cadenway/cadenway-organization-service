@@ -15,6 +15,7 @@ import type { OrganizationsStore } from '../../models/transactions/organizations
  * @param {OrganizationsStore} store - The store of the transaction.
  * @param {string} organizationId - The organization of the request.
  * @param {string} actorUserId - The actor of the request.
+ * @param {'share'} lock - Optionally blocks concurrent revocation until commit.
  * @returns {Promise<Member>} The membership of the actor.
  * @throws {OrganizationRefusal} `organization-not-found`.
  */
@@ -22,10 +23,12 @@ export async function requireActorMembership(
   store: OrganizationsStore,
   organizationId: string,
   actorUserId: string,
+  lock?: 'share',
 ): Promise<Member> {
   const membership: Member | null = await store.members.findActiveOfUser(
     organizationId,
     actorUserId,
+    lock,
   );
   if (membership === null) {
     throw new OrganizationRefusal({ reason: 'organization-not-found' });

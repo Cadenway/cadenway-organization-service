@@ -1,10 +1,9 @@
 import { runWithOrganizationContext } from '@cadenway/nest-common';
-import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest-common/database';
+import { TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { Invitation } from '../src/modules/organizations/domain/aggregates/invitation/invitation.aggregate.js';
 import { EmailAddress } from '../src/modules/organizations/domain/value-objects/email/email-address.value-object.js';
-import { DrizzleDirectoryRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/directory/drizzle-directory.repository.js';
 import { DrizzleInvitationEmailRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-email.repository.js';
 import { DrizzleInvitationRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation.repository.js';
 import { DrizzleMemberRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/members/drizzle-member.repository.js';
@@ -65,39 +64,22 @@ describe('Organization security transaction controls', () => {
     );
   });
 
-  it('preserves a durable directory reservation across reads until the deletion commits', async () => {
-    const system = new SystemTransactionRunner(stack.migrator);
-    const account = newId();
-    const attempt = '019a6c30-7a8b-7c9d-8e0f-1a2b3c4d8e91';
-    await stack.system('insert into directory_users (user_id) values ($1)', [account]);
-
-    await system.run(async ({ db }) => {
-      const directory = new DrizzleDirectoryRepository(db);
-      const members = new DrizzleMemberRepository(db);
-      await expect(members.listOwnedOrganizationIds(owner)).resolves.toEqual(
-        [firstOrg, secondOrg].sort(),
-      );
-      await expect(members.listOwnedOrganizationIds(account)).resolves.toEqual([]);
-      await expect(directory.findForUpdate(account)).resolves.not.toBeNull();
-      await directory.reserveDeletion(account, attempt);
-    });
-
-    await system.run(async ({ db }) => {
-      const directory = new DrizzleDirectoryRepository(db);
-      const entry = await directory.findForShare(account);
-      expect(entry?.isDeleted).toBe(false);
-      await expect(directory.findDeletionAttempt(account)).resolves.toBe(attempt);
-    });
-
-    await system.run(async ({ db }) => {
-      const directory = new DrizzleDirectoryRepository(db);
-      const entry = await directory.lock(account);
-      await directory.save(entry.applyDeletion(1));
-    });
-    await system.run(async ({ db }) => {
-      const directory = new DrizzleDirectoryRepository(db);
-      await expect(directory.findDeletionAttempt(account)).resolves.toBeNull();
-    });
+  it('holds the current invitation sender role against updates until commit', async () => {
+    await runWithOrganizationContext(
+      { organizationId: firstOrg, actor: { type: 'user', id: admin }, role: null, scopes: [] },
+      () =>
+        tenant.run(async ({ db }) => {
+          const members = new DrizzleMemberRepository(db);
+          const sender = await members.findActiveOfUser(firstOrg, admin, 'share');
+          expect(sender?.role).toBe('admin');
+          await expect(
+            stack.system(
+              'select id from members where organization_id = $1 and id = $2 for no key update skip locked',
+              [firstOrg, adminMembership],
+            ),
+          ).resolves.toEqual([]);
+        }),
+    );
   });
 
   it('serializes one sender across two tenant transactions and clears the ledger scope after commit', async () => {

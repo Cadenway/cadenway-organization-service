@@ -185,10 +185,15 @@ export class DrizzleMemberRepository implements MemberRepository {
    *
    * @param {string} organizationId - The organization.
    * @param {string} userId - The account.
+   * @param {'share'} lock - Optionally holds the role and membership active until the commit.
    * @returns {Promise<Member | null>} The membership, or `null`.
    */
-  public async findActiveOfUser(organizationId: string, userId: string): Promise<Member | null> {
-    const rows: MemberRow[] = await this.db
+  public async findActiveOfUser(
+    organizationId: string,
+    userId: string,
+    lock?: 'share',
+  ): Promise<Member | null> {
+    const query = this.db
       .select()
       .from(members)
       .where(
@@ -199,6 +204,7 @@ export class DrizzleMemberRepository implements MemberRepository {
         ),
       )
       .limit(1);
+    const rows: MemberRow[] = await (lock === undefined ? query : query.for(lock));
     const row: MemberRow | undefined = rows[0];
     return row === undefined ? null : toMember(row);
   }
@@ -243,16 +249,6 @@ export class DrizzleMemberRepository implements MemberRepository {
       .orderBy(asc(members.organizationId), asc(members.id))
       .for('update');
     return rows.map(toMember);
-  }
-
-  /** Loads only active owner rows for the account, under the caller's directory row lock. */
-  public async listOwnedOrganizationIds(userId: string): Promise<readonly string[]> {
-    const rows = await this.db
-      .select({ organizationId: members.organizationId })
-      .from(members)
-      .where(and(eq(members.userId, userId), eq(members.role, 'owner'), isNull(members.removedAt)))
-      .orderBy(asc(members.organizationId));
-    return rows.map(({ organizationId }) => organizationId);
   }
 
   /**

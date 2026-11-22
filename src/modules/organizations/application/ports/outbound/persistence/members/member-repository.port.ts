@@ -36,9 +36,10 @@ export interface MemberRepository {
    *
    * @param {string} organizationId - The organization.
    * @param {string} userId - The account.
+   * @param {'share'} lock - Optionally blocks role changes and removals until commit.
    * @returns {Promise<Member | null>} The membership, or `null` when the account is not a member.
    */
-  findActiveOfUser(organizationId: string, userId: string): Promise<Member | null>;
+  findActiveOfUser(organizationId: string, userId: string, lock?: 'share'): Promise<Member | null>;
 
   /** Locks the actor and target memberships in ID order and returns their current states. */
   lockActorAndTarget(
@@ -60,9 +61,6 @@ export interface MemberRepository {
    * @returns {Promise<readonly Member[]>} The memberships, none when the account belongs nowhere.
    */
   findActiveOfAccountForUpdate(userId: string): Promise<readonly Member[]>;
-
-  /** Current owned organizations in a system transaction under the account directory lock. */
-  listOwnedOrganizationIds(userId: string): Promise<readonly string[]>;
 
   /**
    * Method update

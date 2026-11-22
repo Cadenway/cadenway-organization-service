@@ -112,6 +112,13 @@ export class ResendInvitation {
             input.organizationId,
             windowStart,
           );
+          const currentActor = await requireActorMembership(
+            store,
+            input.organizationId,
+            input.actorUserId,
+            'share',
+          );
+          assertManagesOrganization(currentActor.role);
           const invitation: Invitation | null = await store.invitations.findForUpdate(
             input.organizationId,
             input.invitationId,
