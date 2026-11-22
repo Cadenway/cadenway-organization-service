@@ -132,16 +132,42 @@ describe('SearchAuthorityController', () => {
     expect(read).not.toHaveBeenCalled();
   });
 
+  it.each(['task-service', 'realtime-gateway'])(
+    'limits %s to the signed membership read',
+    async (issuer) => {
+      const scope = { ...user, issuer, role: null };
+      const request = await verifiedRequest('membership', scope);
+      const { controller, findActive } = fixture();
+      findActive.mockResolvedValueOnce(null);
+      await expect(
+        runWithOrganizationContext(scope, () => controller.membership({}, request)),
+      ).rejects.toMatchObject({ problem: { status: 404, code: 'organization.not-found' } });
+      expect(findActive).toHaveBeenCalledExactlyOnceWith(organizationId, userId);
+
+      await expect(
+        verifiedRequest('list', {
+          ...system,
+          actor: { type: 'system', id: issuer },
+          issuer,
+        }),
+      ).rejects.toMatchObject({ problem: { status: 403, code: 'auth.issuer-not-allowed' } });
+    },
+  );
+
   it.each([
-    { role: 'admin', scopes: [] },
-    { role: null, scopes: ['organizations:read'] },
+    { issuer: 'identity-service', role: 'admin', scopes: [] },
+    { issuer: 'identity-service', role: null, scopes: ['organizations:read'] },
+    { issuer: 'task-service', role: 'admin', scopes: [] },
+    { issuer: 'task-service', role: null, scopes: ['organizations:read'] },
+    { issuer: 'realtime-gateway', role: 'admin', scopes: [] },
+    { issuer: 'realtime-gateway', role: null, scopes: ['organizations:read'] },
   ])(
-    'rejects delegated Identity privileges before reading membership',
-    async ({ role, scopes }) => {
+    'rejects delegated privileges from $issuer before reading membership',
+    async ({ issuer, role, scopes }) => {
       const { controller, findActive } = fixture();
       const request = await verifiedRequest('membership', {
         ...user,
-        issuer: 'identity-service',
+        issuer,
         role,
         scopes,
       });

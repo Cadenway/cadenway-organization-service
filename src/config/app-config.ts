@@ -38,8 +38,8 @@ const optionalCursorSecret = z.preprocess(
  *   without them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it. An optional
- *   issuer-specific fallback supplies public Search, Identity, Billing and Notification keys when
- *   the map has no corresponding issuer.
+ *   issuer-specific fallback supplies public Search, Identity, Task, Realtime, Billing and
+ *   Notification keys when the map has no corresponding issuer.
  * - `SEARCH_PROJECTION_CURSOR_SECRET` and `BILLING_AUTHORITY_CURSOR_SECRET`: stable keys for their
  *   respective export cursors, as 32 bytes in canonical base64url.
  * - `ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED`: enables the Billing durable independently of
@@ -76,6 +76,8 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...internalTokenVerifierConfigShape,
     SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
@@ -94,6 +96,8 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       {
         SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: searchKeys,
         IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: identityKeys,
+        TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: taskKeys,
+        REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS: realtimeKeys,
         BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: billingKeys,
         NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: notificationKeys,
         SEARCH_PROJECTION_CURSOR_SECRET: searchCursorSecret,
@@ -106,6 +110,8 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       const fallbacks = [
         ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', searchKeys],
         ['identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', identityKeys],
+        ['task-service', 'TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', taskKeys],
+        ['realtime-gateway', 'REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS', realtimeKeys],
         ['billing-service', 'BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', billingKeys],
         [
           'notification-service',
