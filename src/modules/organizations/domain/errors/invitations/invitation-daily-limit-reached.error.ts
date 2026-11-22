@@ -4,7 +4,7 @@ import { DomainError } from '../organizations/domain.error.js';
  * Class InvitationDailyLimitReachedError
  *
  * @description
- * A batch or a resend that needs more invitation emails than the organization has left of its
+ * An invitation command that needs more emails than the sender or organization has left of its
  * allowance over the last 24 hours (`invitation.daily-limit-reached`, with `details.remaining` and
  * `details.nextAvailableAt`). The request is refused as a whole (decision 1 of the P2b security
  * follow-ups).
@@ -15,7 +15,7 @@ export class InvitationDailyLimitReachedError extends DomainError {
    * Property remaining
    *
    * @description
-   * The invitation emails the organization can still cause now, `0` or more.
+   * The invitation emails the request can still send now, `0` or more.
    *
    * @type {number}
    * @readonly
@@ -41,12 +41,12 @@ export class InvitationDailyLimitReachedError extends DomainError {
    * @description
    * Refuses the request.
    *
-   * @param {number} remaining - The emails the organization can still cause now.
+   * @param {number} remaining - The emails the request can still send now.
    * @param {Date} nextAvailableAt - When the allowance grows again.
    * @constructor
    */
   public constructor(remaining: number, nextAvailableAt: Date) {
-    super('The organization reached its daily allowance of invitation emails.');
+    super('The daily allowance of invitation emails has been reached.');
     this.remaining = remaining;
     this.nextAvailableAt = nextAvailableAt;
   }

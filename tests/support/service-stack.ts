@@ -13,6 +13,7 @@ import { AppModule } from '../../src/app.module.js';
 import { appConfigSchema } from '../../src/config/app-config.js';
 import { installOrganizationAuthorityCachePolicy } from '../../src/infrastructure/http/organization-authority-cache-policy.js';
 import { installOrganizationLogoCachePolicy } from '../../src/infrastructure/http/organization-logo-cache-policy.js';
+import { IdentityEmailAuthorityFixture } from './identity-email-authority.fixture.js';
 
 // The service as main.ts assembles it, on the disposable PostgreSQL and NATS of compose.dev.yaml
 // started as a throwaway Compose project on free ports, as tests/service-wiring.int-spec.ts does:
@@ -81,6 +82,8 @@ function keyPair(): {
 
 /** The dependencies, the migrations and, once started, the application. */
 export class ServiceStack {
+  public readonly verifiedEmails = new IdentityEmailAuthorityFixture();
+
   /** Throwaway project name: it never touches the developer's own stacks. */
   private readonly project: string;
 
@@ -194,6 +197,7 @@ export class ServiceStack {
    * event again, as a requeue past the duplicate window of the stream would.
    */
   public publish(name: string, payload: { readonly id: string }, messageId?: string): void {
+    this.verifiedEmails.observe(name, payload);
     this.nats(
       'pub',
       '--jetstream',
@@ -265,6 +269,12 @@ export class ServiceStack {
    * @returns The application.
    */
   public async startApplication(): Promise<NestExpressApplication> {
+    const identityKey = keyPair();
+    vi.stubEnv('IDENTITY_SERVICE_URL', await this.verifiedEmails.start(identityKey.publicJwk));
+    vi.stubEnv(
+      'ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK',
+      JSON.stringify(identityKey.privateJwk),
+    );
     vi.stubEnv('PORT', '3011');
     vi.stubEnv('LOG_PRETTY', 'false');
     vi.stubEnv('DATABASE_URL', this.url('organization_app'));
@@ -322,6 +332,7 @@ export class ServiceStack {
   public async stop(): Promise<void> {
     try {
       await this.application?.close();
+      await this.verifiedEmails.stop();
       await this.migrator.end();
     } finally {
       vi.unstubAllEnvs();

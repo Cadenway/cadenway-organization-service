@@ -57,6 +57,20 @@
       "when": 1795279057464,
       "tag": "0007_organization_seat_entitlements",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1795365800405,
+      "tag": "0008_invitation_sender_budget",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1795366191172,
+      "tag": "0009_account_deletion_reservation",
+      "breakpoints": true
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import type { Page } from '../../../../models/pagination/page.model.js';
 import type { InvitationView } from '../../../../projections/invitations/invitation-view.projection.js';
 import type { ReceivedInvitationView } from '../../../../projections/invitations/received-invitation-view.projection.js';
@@ -28,7 +29,7 @@ describe('the invitation lifecycle', () => {
   beforeEach(async () => {
     scenario = await atelierNord();
     scenario.store.withAccount(MARC.id, 'Marc Roux', MARC.email);
-    accept = new AcceptInvitation(scenario.store, scenario.clock);
+    accept = new AcceptInvitation(scenario.store, scenario.clock, scenario.store);
     const batch: InviteMembersOutput = await new InviteMembers(
       scenario.store,
       scenario.clock,
@@ -66,7 +67,7 @@ describe('the invitation lifecycle', () => {
     for (const id of ['extra-one', 'extra-two']) {
       scenario.store.tables.members.set(id, { ...member, id, userId: id });
     }
-    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, scenario.store, true);
 
     await expect(
       acceptance.execute({ actorUserId: MARC.id, userId: MARC.id, invitationId }),
@@ -86,7 +87,7 @@ describe('the invitation lifecycle', () => {
       id: 'extra-one',
       userId: 'extra-one',
     });
-    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, scenario.store, true);
     const joined = await acceptance.execute({
       actorUserId: MARC.id,
       userId: MARC.id,
@@ -109,7 +110,7 @@ describe('the invitation lifecycle', () => {
     });
 
     await expect(
-      new AcceptInvitation(scenario.store, scenario.clock, true).execute({
+      new AcceptInvitation(scenario.store, scenario.clock, scenario.store, true).execute({
         actorUserId: MARC.id,
         userId: MARC.id,
         invitationId,
@@ -128,7 +129,7 @@ describe('the invitation lifecycle', () => {
       scenario.store.tables.members.set(id, { ...member, id, userId: id });
     }
     scenario.store.tables.invitations.set(invitationId, { ...invitation, role: 'guest' });
-    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, true);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, scenario.store, true);
     const joined = await acceptance.execute({
       actorUserId: MARC.id,
       userId: MARC.id,
@@ -160,12 +161,75 @@ describe('the invitation lifecycle', () => {
     const received: Page<ReceivedInvitationView> = await new ListReceivedInvitations(
       scenario.store,
       scenario.clock,
+      scenario.store,
     ).execute({ actorUserId: MARC.id, userId: MARC.id, after: null, limit: 50 });
 
     expect(received.items).toEqual([]);
     await expect(
       accept.execute({ actorUserId: MARC.id, userId: MARC.id, invitationId }),
     ).rejects.toMatchObject({ refusal: { reason: 'invitation-not-found' } });
+  });
+
+  it('hides and refuses invitations for a previously verified address while the directory is stale', async () => {
+    const authority = { find: () => Promise.resolve(EmailAddress.parse('marc.new@example.com')) };
+    const received = new ListReceivedInvitations(scenario.store, scenario.clock, authority);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, authority);
+    const refusal = new RefuseInvitation(scenario.store, scenario.clock, authority);
+    const actor = { actorUserId: MARC.id, userId: MARC.id, invitationId };
+
+    await expect(
+      received.execute({ actorUserId: MARC.id, userId: MARC.id, after: null, limit: 50 }),
+    ).resolves.toEqual({ items: [], next: null });
+    await expect(acceptance.execute(actor)).rejects.toMatchObject({
+      refusal: { reason: 'invitation-email-mismatch' },
+    });
+    await expect(refusal.execute(actor)).rejects.toMatchObject({
+      refusal: { reason: 'invitation-email-mismatch' },
+    });
+    expect(scenario.store.tables.invitations.get(invitationId)?.status).toBe('pending');
+    expect(scenario.store.eventsNamed('member.joined.v1')).toEqual([]);
+  });
+
+  it('fails closed when the verified address authority is unavailable', async () => {
+    const unavailable = new Error('Identity unavailable');
+    const authority = { find: () => Promise.reject(unavailable) };
+    const received = new ListReceivedInvitations(scenario.store, scenario.clock, authority);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, authority);
+    const refusal = new RefuseInvitation(scenario.store, scenario.clock, authority);
+    const actor = { actorUserId: MARC.id, userId: MARC.id, invitationId };
+
+    await expect(
+      received.execute({ actorUserId: MARC.id, userId: MARC.id, after: null, limit: 50 }),
+    ).rejects.toBe(unavailable);
+    await expect(acceptance.execute(actor)).rejects.toBe(unavailable);
+    await expect(refusal.execute(actor)).rejects.toBe(unavailable);
+    expect(scenario.store.tables.invitations.get(invitationId)?.status).toBe('pending');
+    expect(scenario.store.eventsNamed('member.joined.v1')).toEqual([]);
+  });
+
+  it('uses the current verified address when the directory still holds the former one', async () => {
+    const currentEmail = EmailAddress.parse('marc.new@example.com');
+    const authority = { find: () => Promise.resolve(currentEmail) };
+    const batch = await new InviteMembers(scenario.store, scenario.clock).execute({
+      actorUserId: CAMILLE.id,
+      organizationId: scenario.organizationId,
+      emails: [currentEmail.value],
+      role: 'member',
+    });
+    const currentInvitationId = batch.invitations[0]?.invitationId ?? '';
+    const received = new ListReceivedInvitations(scenario.store, scenario.clock, authority);
+    const acceptance = new AcceptInvitation(scenario.store, scenario.clock, authority);
+
+    await expect(
+      received.execute({ actorUserId: MARC.id, userId: MARC.id, after: null, limit: 50 }),
+    ).resolves.toMatchObject({ items: [{ id: currentInvitationId }] });
+    await expect(
+      acceptance.execute({
+        actorUserId: MARC.id,
+        userId: MARC.id,
+        invitationId: currentInvitationId,
+      }),
+    ).resolves.toMatchObject({ role: 'member' });
   });
 
   it('resends an expired invitation for 7 more days, then lets it be accepted', async () => {
@@ -191,7 +255,11 @@ describe('the invitation lifecycle', () => {
   });
 
   it('refuses once, and never accepts a revoked or refused invitation', async () => {
-    const refuse: RefuseInvitation = new RefuseInvitation(scenario.store, scenario.clock);
+    const refuse: RefuseInvitation = new RefuseInvitation(
+      scenario.store,
+      scenario.clock,
+      scenario.store,
+    );
     const revoke: RevokeInvitation = new RevokeInvitation(scenario.store, scenario.clock);
     const resend: ResendInvitation = new ResendInvitation(scenario.store, scenario.clock);
     const owner = { actorUserId: CAMILLE.id, organizationId: scenario.organizationId };

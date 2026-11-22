@@ -203,34 +203,25 @@ export class DrizzleMemberRepository implements MemberRepository {
     return row === undefined ? null : toMember(row);
   }
 
-  /**
-   * Method findActiveForUpdate
-   *
-   * @description
-   * Loads and locks an active membership.
-   *
-   * @param {string} organizationId - The organization.
-   * @param {string} memberId - Id of the membership.
-   * @returns {Promise<Member | null>} The membership, or `null`.
-   */
-  public async findActiveForUpdate(
+  /** Locks the active actor and target rows in a stable order before permission is evaluated. */
+  public async lockActorAndTarget(
     organizationId: string,
+    actorUserId: string,
     memberId: string,
-  ): Promise<Member | null> {
+  ): Promise<readonly Member[]> {
     const rows: MemberRow[] = await this.db
       .select()
       .from(members)
       .where(
         and(
           eq(members.organizationId, organizationId),
-          eq(members.id, memberId),
           isNull(members.removedAt),
+          or(eq(members.userId, actorUserId), eq(members.id, memberId)),
         ),
       )
-      .limit(1)
+      .orderBy(asc(members.id))
       .for('update');
-    const row: MemberRow | undefined = rows[0];
-    return row === undefined ? null : toMember(row);
+    return rows.map(toMember);
   }
 
   /**
@@ -252,6 +243,16 @@ export class DrizzleMemberRepository implements MemberRepository {
       .orderBy(asc(members.organizationId), asc(members.id))
       .for('update');
     return rows.map(toMember);
+  }
+
+  /** Loads only active owner rows for the account, under the caller's directory row lock. */
+  public async listOwnedOrganizationIds(userId: string): Promise<readonly string[]> {
+    const rows = await this.db
+      .select({ organizationId: members.organizationId })
+      .from(members)
+      .where(and(eq(members.userId, userId), eq(members.role, 'owner'), isNull(members.removedAt)))
+      .orderBy(asc(members.organizationId));
+    return rows.map(({ organizationId }) => organizationId);
   }
 
   /**

@@ -47,6 +47,7 @@ providers of the module; no other module imports it.
 | `organization_logo_reservations` | (`organization_id`, `upload_id`), replay key scoped to organization and uploader | `organization_id`, policy forced                       |
 | `organization_seat_entitlements` | `organization_id`, one versioned Billing seat projection                         | `organization_id`, policy forced                       |
 | `invitation_emails`              | `id`; one row per invitation email sent                                          | `organization_id`, policy forced                       |
+| `invitation_sender_emails`       | `id`; one row per email, with a sender ID and timestamp only                     | `sender_id`, policy forced                             |
 | `directory_users`                | `user_id`, the id identity-service gave the account                              | None: an account belongs to no organization, no policy |
 
 Created by `migrations/0001_organizations_members_invitations.sql` and
@@ -70,6 +71,12 @@ resend of an organization deletes its rows sent 24 hours ago or more, under the 
 the table holds 100 rows at most per organization, and no job purges it, so an organization that
 stops inviting keeps its last rows. Their foreign keys are `no action`: the deletion of an
 organization or of an invitation, a later phase, deletes its ledger rows first.
+
+`migrations/0008_invitation_sender_budget.sql` adds the account-scoped ledger. It records the
+verified account that actually sent each email, including a resend by a different administrator.
+The account's next send drops expired rows under its transaction lock. The tenant ledger retains
+its existing semantics and earlier entries. The sender ledger starts counting with the first
+version that writes it, since earlier entries do not identify the sender of each email.
 
 `0005_organization_logo` adds the nullable opaque `organizations.logo_id`, an independent
 `logo_generation` and tenant-owned upload reservations. A reservation binds the uploader,
@@ -96,8 +103,9 @@ Search and Identity use two private, uncacheable routes. `GET /internal/v1/searc
 requires the signing service's own system identity without an organization claim and exports only
 organization IDs. It resumes within the authenticated upper bound of the first page.
 `GET /internal/v1/search-membership` requires a signed user actor and organization. One tenant
-snapshot returns the active membership ID, role and membership version. Identity calls these
-routes without a delegated role or scopes.
+snapshot returns the active membership ID, role and membership version. Task and Realtime can
+call only this membership route. Identity, Task and Realtime sign it without a delegated role
+or scopes.
 
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
@@ -192,11 +200,15 @@ Revoking and refusing emit nothing; a patch or a role change that moves nothing 
 The removals of a deleted account carry the actor `{ type: 'system', id: 'organization-service' }`
 (`asyncapi/organization-service.yaml`), one event per organization, appended in the system
 transaction of the removal.
-The language of `invitation.issued.v1` is the default language of the organization. No rebuild
-use case exists yet: identity-service, the one consumer of the membership events today, reads
-the seven days the stream holds when it starts; a consumer that needs the memberships beyond them
-(the permissions already allow `rebuild.*.member`) needs a rebuild item schema in
-`@cadenway/contracts` and a re-emission use case here, with `RebuildEmitter`.
+The language of `invitation.issued.v1` is the default language of the organization.
+
+For offline Task restoration, `node --import @cadenway/nest-common/register
+dist/modules/organizations/infrastructure/adapters/membership-export/export-memberships.js`
+streams active membership generations and tombstones from the Organization database in bounded
+pages. The command uses one read-only repeatable-read transaction under the service role and
+outputs only the organization, membership and account IDs, role, version and timestamps. It
+writes its closing count only after the database snapshot has closed. Ops runs this command
+locally and protects the stream between the two service commands.
 
 ## Events consumed
 
@@ -480,25 +492,23 @@ Any failure rolls back the business rows and the outbox rows together
   `@cadenway/nest-common` 0.6.0 (decision 5 of the P2b security follow-ups); this module no longer
   maps the former kit codes. The generated query validators of `@cadenway/contracts` 0.6.0 read
   `limit` from its text, so the module keeps only its splitting of `role`.
-- The invitation email limits, decision 1 of the P2b security follow-ups, as
-  `openapi/internal/organization-service.yaml` of `@cadenway/contracts` 0.6.0 describes them (the
-  user may revise them): one email an hour per invitation, counted from its `sentAt`; 100 per
-  organization in any 24 hours, issues, creation invitations and resends together; a batch over
-  what remains refused as a whole. Choices made here:
-  - the ledger `invitation_emails` counts the emails, since `sentAt` is overwritten by a resend;
-    it holds no address, and its rows are purged by the next batch or resend of their
-    organization rather than by a job;
-  - the check is serialized per organization by a row lock on the organization, not an advisory
-    lock (no shared key space to coordinate) nor a constraint (a count over a window is no
-    constraint);
-  - the order of the refusals of a resend follows the contract: found, pending, the hour, then
-    the allowance;
-  - `Retry-After` is computed when the refusal is answered, from the instant of the details, as
-    identity-service does.
-  - Known limit, as the contract defines the hour per invitation: revoking an invitation and
-    inviting the address again sends a new email at once, within the daily allowance, and each new
-    organization starts with its own 100. A per-address hour and a limit on creations need the
-    contract first; reported to cadenway-api-contracts and the gateway.
+- Each invitation permits one resend an hour. Invitation emails consume both the organization's
+  and the sender's independent budgets of 100 in any 24 hours. Creation invitations, new
+  invitations and resends count together. An invitation batch or a creation requiring more
+  emails than remain is refused as a whole. No-op addresses and an organization created without
+  invitations consume no units.
+  - The sender budget is serialized first with a transaction advisory lock keyed by verified user
+    ID, followed by the organization row lock and any invitation row lock. Read committed
+    transactions count previous committed sends after obtaining each lock. The invitation,
+    both ledger entries and the outbox record commit together.
+  - Resend refusal order remains found, pending, the hour, then the allowance. The refusal
+    reports the smaller remaining allowance. If both allowances have the same remaining
+    balance, it reports the later time that one place becomes available in both. `Retry-After`
+    is calculated when responding from the indicated time.
+  - Revoking and reinviting uses a different invitation ID and still consumes the shared
+    sender and organization budgets.
+- Role changes and removals lock the actor and target memberships in member ID order before
+  making authorization decisions. The same row supplies both roles when the actor is the target.
 - The account changes of P2c, decision 9 of its brief (the user may revise them):
   - `user.email-changed.v1` updates the address of the directory, verified, by the version of the
     account, like the other directory events;
@@ -519,6 +529,13 @@ Any failure rolls back the business rows and the outbox rows together
     answer its invitations. identity-service never lets two accounts verify one address, so the
     window lasts as long as the event of the leaving account waits; a unique address would turn it
     into a projection that fails until then, which this module does not do;
+  - an account-deletion reservation takes the exclusive lock on the account directory entry,
+    checks current owner memberships and records the attempt. Organization creation and
+    membership admission take the shared lock and refuse reserved accounts. The reservation
+    survives retries and is only cleared when the deletion event commits. The use case is ready
+    to bind to the generated internal Identity authority route after the contract is installed.
+    Enable the Identity caller only after every Organization writer checks the reservation; a
+    writer from before migration 0009 can still grant a membership;
   - the deletion of an owner is refused and becomes a dead letter rather than applied without the
     owner membership: the event contradicts the contract, so identity-service and this service
     disagree on who owns the organization; applying it in part would hide that and leave an

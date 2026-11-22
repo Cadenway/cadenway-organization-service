@@ -3,6 +3,7 @@ import type { EmailAddress } from '../../../../../domain/value-objects/email/ema
 import type { Page } from '../../../../models/pagination/page.model.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
+import type { VerifiedEmailAuthority } from '../../../../ports/outbound/identity/invitations/verified-email-authority.port.js';
 import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { ReceivedInvitationView } from '../../../../projections/invitations/received-invitation-view.projection.js';
@@ -12,8 +13,8 @@ import type { ListReceivedInvitationsInput } from './list-received-invitations.i
  * Class ListReceivedInvitations
  *
  * @description
- * Lists the pending invitations, not expired, addressed to the verified address the user directory
- * holds for the actor, from every organization, the most recently sent first
+ * Lists the pending invitations, not expired, addressed to the actor's current verified address
+ * from identity-service, from every organization, the most recently sent first
  * (`GET /internal/v1/users/{userId}/invitations`). A read across organizations: it runs in a
  * read-only system transaction whose queries filter on the actor and on that address (a bounded
  * exception of `MODULE.md`, decision 9 of P2b). Without a verified address yet, the list is empty;
@@ -53,9 +54,14 @@ export class ListReceivedInvitations {
    *
    * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
    * @param {Clock} clock - The time of the list.
+   * @param {VerifiedEmailAuthority} verifiedEmails - The current verified account address.
    * @constructor
    */
-  public constructor(unitOfWork: OrganizationsUnitOfWork, clock: Clock) {
+  public constructor(
+    unitOfWork: OrganizationsUnitOfWork,
+    clock: Clock,
+    private readonly verifiedEmails: VerifiedEmailAuthority,
+  ) {
     this.unitOfWork = unitOfWork;
     this.clock = clock;
   }
@@ -72,19 +78,20 @@ export class ListReceivedInvitations {
    * @returns {Promise<Page<ReceivedInvitationView>>} The page.
    * @throws {OrganizationRefusal} `user-not-found`.
    */
-  public execute(input: ListReceivedInvitationsInput): Promise<Page<ReceivedInvitationView>> {
+  public async execute(input: ListReceivedInvitationsInput): Promise<Page<ReceivedInvitationView>> {
     if (input.userId !== input.actorUserId) {
-      return Promise.reject(new OrganizationRefusal({ reason: 'user-not-found' }));
+      throw new OrganizationRefusal({ reason: 'user-not-found' });
     }
+    const currentEmail: EmailAddress | null = await this.verifiedEmails.find(input.actorUserId);
     const now: Date = this.clock.now();
     return this.unitOfWork.runAcrossOrganizations(
       async (store: OrganizationsStore): Promise<Page<ReceivedInvitationView>> => {
         const user: DirectoryUser | null = await store.directory.find(input.actorUserId);
         const email: EmailAddress | null = user?.verifiedEmail ?? null;
-        if (email === null) {
+        if (email === null || currentEmail === null) {
           return { items: [], next: null };
         }
-        return store.invitations.listReceived(email, now, input.after, input.limit);
+        return store.invitations.listReceived(currentEmail, now, input.after, input.limit);
       },
       { readOnly: true },
     );

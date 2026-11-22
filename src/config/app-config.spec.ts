@@ -77,6 +77,8 @@ describe('appConfigSchema', () => {
   it.each([
     ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
     ['identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
+    ['task-service', 'TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'],
+    ['realtime-gateway', 'REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS'],
   ] as const)(
     'loads rotating public keys for %s and a canonical cursor secret',
     (issuer, variable) => {
@@ -135,6 +137,8 @@ describe('appConfigSchema', () => {
 
       expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('search-service');
       expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('identity-service');
+      expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('task-service');
+      expect(config.INTERNAL_TOKEN_TRUSTED_ISSUERS).not.toHaveProperty('realtime-gateway');
       expect(config).not.toHaveProperty('SEARCH_PROJECTION_CURSOR_SECRET');
     },
   );

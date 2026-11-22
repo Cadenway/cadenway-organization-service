@@ -1,5 +1,13 @@
-import { baseConfigShape, internalTokenVerifierConfigShape } from '@cadenway/nest-common';
-import type { BaseConfig, InternalTokenVerifierConfig } from '@cadenway/nest-common';
+import {
+  baseConfigShape,
+  internalTokenSignerConfigShape,
+  internalTokenVerifierConfigShape,
+} from '@cadenway/nest-common';
+import type {
+  BaseConfig,
+  InternalTokenSignerConfig,
+  InternalTokenVerifierConfig,
+} from '@cadenway/nest-common';
 import { databaseConfigShape } from '@cadenway/nest-common/database';
 import type { DatabaseConfig } from '@cadenway/nest-common/database';
 import { messagingConfigShape } from '@cadenway/nest-messaging';
@@ -38,8 +46,8 @@ const optionalCursorSecret = z.preprocess(
  *   without them.
  * - `INTERNAL_TOKEN_AUDIENCE` and `INTERNAL_TOKEN_TRUSTED_ISSUERS`: the `aud` this service accepts
  *   and the public keys of the backends allowed to call it. An optional
- *   issuer-specific fallback supplies public Search, Identity, Billing and Notification keys when
- *   the map has no corresponding issuer.
+ *   issuer-specific fallback supplies public Search, Identity, Task, Realtime, Billing and
+ *   Notification keys when the map has no corresponding issuer.
  * - `SEARCH_PROJECTION_CURSOR_SECRET` and `BILLING_AUTHORITY_CURSOR_SECRET`: stable keys for their
  *   respective export cursors, as 32 bytes in canonical base64url.
  * - `ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED`: enables the Billing durable independently of
@@ -53,6 +61,8 @@ export type AppConfig = BaseConfig &
   InternalTokenVerifierConfig & {
     readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
     readonly BILLING_AUTHORITY_CURSOR_SECRET?: string;
+    readonly IDENTITY_SERVICE_URL?: string;
+    readonly ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK?: InternalTokenSignerConfig['INTERNAL_TOKEN_PRIVATE_JWK'];
     readonly ORGANIZATION_SEAT_QUOTA_ENABLED: boolean;
     readonly ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: boolean;
   };
@@ -74,8 +84,13 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     ...databaseConfigShape,
     ...messagingConfigShape,
     ...internalTokenVerifierConfigShape,
+    IDENTITY_SERVICE_URL: z.url({ protocol: /^https?$/u }).optional(),
+    ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK:
+      internalTokenSignerConfigShape.INTERNAL_TOKEN_PRIVATE_JWK.optional(),
     SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
+    REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: z.string().trim().optional(),
     SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
@@ -89,11 +104,22 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       .default('false')
       .transform((value) => value === 'true'),
   })
+  .refine(
+    (config) =>
+      (config.IDENTITY_SERVICE_URL === undefined) ===
+      (config.ORGANIZATION_SERVICE_INTERNAL_TOKEN_PRIVATE_JWK === undefined),
+    {
+      path: ['IDENTITY_SERVICE_URL'],
+      error: 'Configure the Identity URL and Organization signing key together.',
+    },
+  )
   .transform(
     (
       {
         SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: searchKeys,
         IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: identityKeys,
+        TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: taskKeys,
+        REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS: realtimeKeys,
         BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: billingKeys,
         NOTIFICATION_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS: notificationKeys,
         SEARCH_PROJECTION_CURSOR_SECRET: searchCursorSecret,
@@ -106,6 +132,8 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
       const fallbacks = [
         ['search-service', 'SEARCH_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', searchKeys],
         ['identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', identityKeys],
+        ['task-service', 'TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', taskKeys],
+        ['realtime-gateway', 'REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS', realtimeKeys],
         ['billing-service', 'BILLING_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', billingKeys],
         [
           'notification-service',

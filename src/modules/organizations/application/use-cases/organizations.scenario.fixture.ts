@@ -86,7 +86,7 @@ export async function atelierNord(): Promise<AtelierNord> {
   });
   const organizationId: string = created.organization.id;
   const invite: InviteMembers = new InviteMembers(store, clock);
-  const accept: AcceptInvitation = new AcceptInvitation(store, clock);
+  const accept: AcceptInvitation = new AcceptInvitation(store, clock, store);
   for (const [person, role] of [
     [INES, 'admin'],
     [HUGO, 'member'],

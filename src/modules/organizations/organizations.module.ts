@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { subscriptionChangedHandlerProvider } from './composition/providers/adapters/billing/subscription-changed-handler.provider.js';
 import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
+import { verifiedEmailAuthorityProvider } from './composition/providers/adapters/invitations/verified-email-authority.provider.js';
 import { unitOfWorkProvider } from './composition/providers/adapters/organizations/unit-of-work.provider.js';
 import { applySeatEntitlementProvider } from './composition/providers/use-cases/billing/apply-seat-entitlement.provider.js';
 import { billingAuthorityProviders } from './composition/providers/use-cases/billing/billing-authority.provider.js';
@@ -97,6 +98,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     resendInvitationProvider,
     revokeInvitationProvider,
     listReceivedInvitationsProvider,
+    verifiedEmailAuthorityProvider,
     acceptInvitationProvider,
     refuseInvitationProvider,
     projectUserSignUpProvider,

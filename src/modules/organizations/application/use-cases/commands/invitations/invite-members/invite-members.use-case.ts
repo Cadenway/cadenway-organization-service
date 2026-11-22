@@ -3,7 +3,7 @@ import type { Member } from '../../../../../domain/aggregates/member/member.aggr
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
 import { distinctAddresses } from '../../../../../domain/policies/invitations/invitation-batch.policy.js';
 import {
-  assertInvitationEmailsAvailable,
+  assertInvitationBatchAvailable,
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
@@ -144,15 +144,21 @@ export class InviteMembers {
           if (organization === null) {
             throw new OrganizationRefusal({ reason: 'organization-not-found' });
           }
+          const windowStart = invitationEmailWindowStart(now);
+          const senderUsage = await store.invitationEmails.lockSenderUsage(
+            input.actorUserId,
+            windowStart,
+          );
           const usage: InvitationEmailUsage = await store.invitationEmails.lockUsage(
             input.organizationId,
-            invitationEmailWindowStart(now),
+            windowStart,
           );
           const planned: PlannedAddress[] = [];
           for (const address of addresses) {
             planned.push(await InviteMembers.plan(store, input.organizationId, address));
           }
-          assertInvitationEmailsAvailable(
+          assertInvitationBatchAvailable(
+            senderUsage,
             usage,
             planned.filter((entry: PlannedAddress) => entry.decided === null).length,
             now,
@@ -253,7 +259,7 @@ export class InviteMembers {
         invitationId: concurrent?.id ?? null,
       };
     }
-    await store.invitationEmails.record(invitation);
+    await store.invitationEmails.record(invitation, input.actorUserId);
     await store.events.invitationIssued(invitation, mail);
     return { email: address.value, outcome: 'invited', invitationId: invitation.id };
   }

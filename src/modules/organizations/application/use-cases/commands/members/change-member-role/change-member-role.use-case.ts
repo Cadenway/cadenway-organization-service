@@ -1,5 +1,4 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
-import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import { takesSeat } from '../../../../../domain/policies/members/seat.policy.js';
 import { toMemberViewFor } from '../../../../mappers/members/member-view.mapper.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
@@ -7,7 +6,7 @@ import { OrganizationRefusal } from '../../../../models/refusals/organization-re
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { MemberView } from '../../../../projections/members/member-view.projection.js';
-import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
+import { requireManagingMembership } from '../../../../services/members/actor-membership.service.js';
 import { requireAvailableSeat } from '../../../../services/members/seat-limit.service.js';
 import { assertVersionMatches } from '../../../../services/versions/version-check.service.js';
 import type { ChangeMemberRoleInput } from './change-member-role.input.js';
@@ -72,19 +71,7 @@ export class ChangeMemberRole {
     try {
       return await this.unitOfWork.runInRequestOrganization(
         async (store: OrganizationsStore): Promise<MemberView> => {
-          const actor: Member = await requireActorMembership(
-            store,
-            input.organizationId,
-            input.actorUserId,
-          );
-          assertManagesOrganization(actor.role);
-          const member: Member | null = await store.members.findActiveForUpdate(
-            input.organizationId,
-            input.memberId,
-          );
-          if (member === null) {
-            throw new OrganizationRefusal({ reason: 'member-not-found' });
-          }
+          const { actor, member } = await requireManagingMembership(store, input);
           assertVersionMatches(input.expectedVersion, member.snapshot.version);
           const changed: Member = member.changeRole(input.role);
           if (changed !== member) {

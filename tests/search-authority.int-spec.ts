@@ -28,17 +28,31 @@ describe('Organization Search authority persistence', () => {
   let stack: ServiceStack | undefined;
   let app: NestExpressApplication;
   let identity: InternalTokenSigner;
+  const membersOnlySigners = new Map<string, InternalTokenSigner>();
   let searchOrganizations: ListSearchOrganizations;
 
-  beforeAll(async () => {
+  /** Creates a disposable issuer and configures only its verification key. */
+  async function addIssuer(issuer: string, variable: string): Promise<InternalTokenSigner> {
     const { x, d } = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
     if (x === undefined || d === undefined) throw new Error('Node returned no test signing key.');
-    const publicJwk: Ed25519PublicJwk = { kty: 'OKP', crv: 'Ed25519', x, kid: 'test-identity' };
-    identity = await InternalTokenSigner.create({
-      issuer: 'identity-service',
+    const publicJwk: Ed25519PublicJwk = { kty: 'OKP', crv: 'Ed25519', x, kid: `test-${issuer}` };
+    vi.stubEnv(variable, JSON.stringify(publicJwk));
+    return InternalTokenSigner.create({
+      issuer,
       privateJwk: { ...publicJwk, d },
     });
-    vi.stubEnv('IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS', JSON.stringify(publicJwk));
+  }
+
+  beforeAll(async () => {
+    identity = await addIssuer('identity-service', 'IDENTITY_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS');
+    membersOnlySigners.set(
+      'task-service',
+      await addIssuer('task-service', 'TASK_SERVICE_INTERNAL_TOKEN_PUBLIC_JWKS'),
+    );
+    membersOnlySigners.set(
+      'realtime-gateway',
+      await addIssuer('realtime-gateway', 'REALTIME_GATEWAY_INTERNAL_TOKEN_PUBLIC_JWKS'),
+    );
     vi.stubEnv('SEARCH_PROJECTION_CURSOR_SECRET', Buffer.alloc(32, 7).toString('base64url'));
     stack = await ServiceStack.start('search-authority');
     app = await stack.startApplication();
@@ -195,4 +209,29 @@ describe('Organization Search authority persistence', () => {
     expect(wrongAudience.body).toMatchObject({ status: 401, code: 'auth.token-invalid' });
     expect(otherRoute.body).toMatchObject({ status: 403, code: 'auth.issuer-not-allowed' });
   });
+
+  it.each(['task-service', 'realtime-gateway'])(
+    'confines the %s signer to live membership',
+    async (issuer) => {
+      const signer = membersOnlySigners.get(issuer);
+      if (signer === undefined) throw new Error('Test authority issuer is absent.');
+      const delegated = { actor: { type: 'user', id: userId } as const, organizationId: firstId };
+      const bearer = await signer.sign('organization-service', delegated);
+      const proof = await request(app.getHttpServer())
+        .get('/internal/v1/search-membership')
+        .set('Authorization', `Bearer ${bearer}`);
+      expect(proof.status).toBe(200);
+      expect(proof.headers['cache-control']).toBe('private, no-store');
+      expect(GetSearchMembershipInternalResponse.safeParse(proof.body).success).toBe(true);
+
+      const system = await signer.sign('organization-service', {
+        actor: { type: 'system', id: issuer },
+        organizationId: null,
+      });
+      const exportResponse = await request(app.getHttpServer())
+        .get('/internal/v1/search-organizations')
+        .set('Authorization', `Bearer ${system}`);
+      expect(exportResponse.body).toMatchObject({ status: 403, code: 'auth.issuer-not-allowed' });
+    },
+  );
 });

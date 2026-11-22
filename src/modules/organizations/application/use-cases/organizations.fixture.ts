@@ -23,6 +23,7 @@ import type { Page } from '../models/pagination/page.model.js';
 import type { PagePosition } from '../models/pagination/page-position.model.js';
 import type { OrganizationsStore } from '../models/transactions/organizations-store.model.js';
 import type { Clock } from '../ports/outbound/time/organizations/clock.port.js';
+import type { VerifiedEmailAuthority } from '../ports/outbound/identity/invitations/verified-email-authority.port.js';
 import type { OrganizationsUnitOfWork } from '../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { InvitationView } from '../projections/invitations/invitation-view.projection.js';
 import type { ReceivedInvitationView } from '../projections/invitations/received-invitation-view.projection.js';
@@ -73,8 +74,14 @@ interface Tables {
   /** Directory entries by account. */
   directory: Map<string, DirectoryUserState>;
 
+  /** Reservations for final account deletion. */
+  deletionAttempts: Map<string, string>;
+
   /** The fake ledger of invitation emails. */
   invitationEmails: RecordedEmail[];
+
+  /** The fake sender ledger, independent of tenant retention. */
+  senderEmails: { readonly senderId: string; readonly sentAt: Date }[];
 
   /** The fake outbox. */
   events: RecordedEvent[];
@@ -108,7 +115,7 @@ function pageOf<TItem>(
  * resolves. `requestOrganizationId` plays the organization of the request context; reads in a
  * transaction of an organization see its rows only, as row-level security would.
  */
-export class InMemoryOrganizations implements OrganizationsUnitOfWork {
+export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedEmailAuthority {
   // #region Properties
   /** The committed data. */
   public tables: Tables = {
@@ -117,7 +124,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
     seatEntitlements: new Map(),
     invitations: new Map(),
     directory: new Map(),
+    deletionAttempts: new Map(),
     invitationEmails: [],
+    senderEmails: [],
     events: [],
   };
 
@@ -126,6 +135,16 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
   // #endregion
 
   // #region Methods
+  /** Returns the verified account address in the test authority. */
+  public find(userId: string): Promise<EmailAddress | null> {
+    const user: DirectoryUserState | undefined = this.tables.directory.get(userId);
+    return Promise.resolve(
+      user === undefined || user.deleted || !user.emailVerified || user.email === null
+        ? null
+        : EmailAddress.parse(user.email),
+    );
+  }
+
   /** Runs the work on a copy of the data, committed when it resolves. */
   public runInRequestOrganization<TResult>(
     work: (store: OrganizationsStore) => Promise<TResult>,
@@ -199,7 +218,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       seatEntitlements: new Map(this.tables.seatEntitlements),
       invitations: new Map(this.tables.invitations),
       directory: new Map(this.tables.directory),
+      deletionAttempts: new Map(this.tables.deletionAttempts),
       invitationEmails: [...this.tables.invitationEmails],
+      senderEmails: [...this.tables.senderEmails],
       events: [...this.tables.events],
     };
     const result: TResult = await work(this.storeOf(tables));
@@ -313,12 +334,16 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
           );
           return Promise.resolve(state === undefined ? null : Member.restore(state));
         },
-        findActiveForUpdate: (organizationId: string, memberId: string): Promise<Member | null> => {
-          const state: MemberState | undefined = activeMembers(organizationId).find(
-            (member: MemberState) => member.id === memberId,
-          );
-          return Promise.resolve(state === undefined ? null : Member.restore(state));
-        },
+        lockActorAndTarget: (
+          organizationId: string,
+          actorUserId: string,
+          memberId: string,
+        ): Promise<readonly Member[]> =>
+          Promise.resolve(
+            activeMembers(organizationId)
+              .filter((row: MemberState) => row.userId === actorUserId || row.id === memberId)
+              .map((row: MemberState) => Member.restore(row)),
+          ),
         findActiveOfAccountForUpdate: (userId: string): Promise<readonly Member[]> =>
           Promise.resolve(
             [...tables.members.values()]
@@ -326,6 +351,16 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
                 (member: MemberState) => member.userId === userId && member.removedAt === null,
               )
               .map((member: MemberState) => Member.restore(member)),
+          ),
+        listOwnedOrganizationIds: (userId: string): Promise<readonly string[]> =>
+          Promise.resolve(
+            [...tables.members.values()]
+              .filter(
+                (member) =>
+                  member.userId === userId && member.removedAt === null && member.role === 'owner',
+              )
+              .map(({ organizationId }) => organizationId)
+              .sort(),
           ),
         update: (member: Member): Promise<void> => {
           tables.members.set(member.id, member.snapshot);
@@ -530,12 +565,24 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
             oldestSentAt: counted.length === 0 ? null : new Date(oldest),
           });
         },
-        record: (invitation: Invitation): Promise<void> => {
+        lockSenderUsage: (senderId: string, windowStart: Date): Promise<InvitationEmailUsage> => {
+          tables.senderEmails = tables.senderEmails.filter(
+            (entry) => entry.senderId !== senderId || entry.sentAt > windowStart,
+          );
+          const counted = tables.senderEmails.filter((entry) => entry.senderId === senderId);
+          const oldest = Math.min(...counted.map((entry) => entry.sentAt.getTime()));
+          return Promise.resolve({
+            count: counted.length,
+            oldestSentAt: counted.length === 0 ? null : new Date(oldest),
+          });
+        },
+        record: (invitation: Invitation, senderId: string): Promise<void> => {
           tables.invitationEmails.push({
             organizationId: invitation.snapshot.organizationId,
             invitationId: invitation.id,
             sentAt: invitation.snapshot.sentAt,
           });
+          tables.senderEmails.push({ senderId, sentAt: invitation.snapshot.sentAt });
           return Promise.resolve();
         },
       },
@@ -554,7 +601,18 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
             state === undefined ? DirectoryUser.unknown(userId) : DirectoryUser.restore(state),
           );
         },
+        findForUpdate: (userId: string): Promise<DirectoryUser | null> => {
+          const state = tables.directory.get(userId);
+          return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
+        },
+        findDeletionAttempt: (userId: string): Promise<string | null> =>
+          Promise.resolve(tables.deletionAttempts.get(userId) ?? null),
+        reserveDeletion: (userId: string, attemptId: string): Promise<void> => {
+          tables.deletionAttempts.set(userId, attemptId);
+          return Promise.resolve();
+        },
         save: (user: DirectoryUser): Promise<void> => {
+          if (user.isDeleted) tables.deletionAttempts.delete(user.userId);
           tables.directory.set(user.userId, user.snapshot);
           return Promise.resolve();
         },
