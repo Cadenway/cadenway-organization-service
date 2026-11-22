@@ -1,6 +1,6 @@
 import { requireOrganizationId } from '@cadenway/nest-common';
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { and, eq, lte, lt } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 
 import type { SeatEntitlementRepository } from '../../../../../application/ports/outbound/persistence/billing/seat-entitlement-repository.port.js';
 import type { SeatEntitlement } from '../../../../../domain/value-objects/billing/seat-entitlement.value-object.js';
@@ -29,25 +29,36 @@ export class DrizzleSeatEntitlementRepository implements SeatEntitlementReposito
     return rows[0] ?? null;
   }
 
-  /** Atomically accepts a newer projection whose seat limit does not decrease. */
-  public async writeNext(organizationId: string, entitlement: SeatEntitlement): Promise<boolean> {
+  /** Writes a newer projection only if the version classified under the lock still matches. */
+  public async writeNext(
+    organizationId: string,
+    expectedVersion: number,
+    entitlement: SeatEntitlement,
+  ): Promise<boolean> {
     this.assertTenant(organizationId);
+    if (entitlement.version <= expectedVersion) return false;
+    if (expectedVersion === 0) {
+      const rows = await this.db
+        .insert(organizationSeatEntitlements)
+        .values({ organizationId, ...entitlement })
+        .onConflictDoNothing({ target: organizationSeatEntitlements.organizationId })
+        .returning({ organizationId: organizationSeatEntitlements.organizationId });
+      return rows.length === 1;
+    }
     const rows = await this.db
-      .insert(organizationSeatEntitlements)
-      .values({ organizationId, ...entitlement })
-      .onConflictDoUpdate({
-        target: organizationSeatEntitlements.organizationId,
-        set: {
-          plan: entitlement.plan,
-          seatLimit: entitlement.seatLimit,
-          version: entitlement.version,
-          updatedAt: new Date(),
-        },
-        setWhere: and(
-          lt(organizationSeatEntitlements.version, entitlement.version),
-          lte(organizationSeatEntitlements.seatLimit, entitlement.seatLimit),
-        ),
+      .update(organizationSeatEntitlements)
+      .set({
+        plan: entitlement.plan,
+        seatLimit: entitlement.seatLimit,
+        version: entitlement.version,
+        updatedAt: new Date(),
       })
+      .where(
+        and(
+          eq(organizationSeatEntitlements.organizationId, organizationId),
+          eq(organizationSeatEntitlements.version, expectedVersion),
+        ),
+      )
       .returning({ organizationId: organizationSeatEntitlements.organizationId });
     return rows.length === 1;
   }

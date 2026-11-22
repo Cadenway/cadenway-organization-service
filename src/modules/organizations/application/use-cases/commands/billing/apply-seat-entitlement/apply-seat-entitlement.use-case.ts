@@ -22,11 +22,12 @@ export class ApplySeatEntitlement {
     return this.unitOfWork.runInRequestOrganization(async (store) => {
       await store.members.lockSeatAdmission(input.organizationId);
       const current = await readSeatEntitlement(store, input.organizationId);
-      const decision = decideSeatEntitlement(current, input.entitlement);
+      const decision = decideSeatEntitlement(current, input.entitlement, input.storageByteLimit);
       if (decision !== 'advance') return decision;
 
       const applied = await store.seatEntitlements.writeNext(
         input.organizationId,
+        current.version,
         input.entitlement,
       );
       if (!applied) throw new Error('Seat entitlement changed while the admission lock was held.');

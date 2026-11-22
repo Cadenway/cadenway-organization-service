@@ -121,10 +121,11 @@ their roles on acceptance. Pending invitations and active guests do not take sea
 mutation emits no fact.
 
 The internal `ApplySeatEntitlement` operation uses the same lock to classify a verified Billing
-snapshot and apply it atomically using a one-row compare-and-set. It keeps the projection for
-identical replays and refuses older versions, conflicting same-version values and decreases.
-A higher version can change the plan while keeping its limit. Delivery and recovery adapters
-require the published Billing contracts.
+snapshot and apply it atomically using a one-row compare-and-set on the version classified.
+It keeps the projection for identical replays and refuses older or conflicting same-version
+values. Only a newer canonical Free snapshot of five seats and 2,000,000,000 bytes can decrease
+the seat limit. This remains true if the consumer missed an intervening plan version. Existing
+members keep their access if the organization is over the reduced limit.
 
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -305,13 +306,13 @@ of received invitations.
 and can enable projection before quota enforcement. Deploy the exact consumer permissions and
 reserve publication of `evt.subscription.changed.v1` for Billing before enabling the flag.
 The published schema and the required `system` actor `billing-service` are validated before
-opening the tenant transaction. The projector receives the tenant ID, plan, seat limit and
-version from the validated envelope. The plan identifier remains extensible.
+opening the tenant transaction. The projector uses the full limits to validate a Free snapshot
+and stores the plan, seat limit and version. The plan identifier remains extensible.
 
 The durable starts from retained deliveries and resumes its position when restarted. The kit
 commits its event-ID record with the projection in the same tenant transaction. The projection
-independently fences duplicated, stale, conflicting or decreasing snapshots under the seat
-admission lock. A handler failure retries on 32 deliveries over about 25 hours and 43 minutes.
+independently fences duplicated, stale or conflicting snapshots under the seat admission lock.
+A handler failure retries on 32 deliveries over about 25 hours and 43 minutes.
 A malformed envelope goes straight to the dead-letter path. An operator may replay a valid
 dead letter after resolving the delivery failure. A malformed envelope requires a correction
 at the producer. Replaying retained messages covers the `EVENTS` retention window. Recovery
