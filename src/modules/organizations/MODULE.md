@@ -182,6 +182,21 @@ the seven days the stream holds when it starts; a consumer that needs the member
 (the permissions already allow `rebuild.*.member`) needs a rebuild item schema in
 `@cadenway/contracts` and a re-emission use case here, with `RebuildEmitter`.
 
+## Offline membership export
+
+For offline Task restoration, the following command streams active membership generations and
+tombstones from the Organization database in pages of 500.
+
+```sh
+node --import @cadenway/nest-common/register \
+  dist/modules/organizations/infrastructure/adapters/membership-export/export-memberships.js
+```
+
+The command uses one read-only repeatable-read transaction under the service role. Its
+newline-delimited JSON records include the organization, membership and account IDs, role,
+version and timestamps. The closing count is written after the database snapshot closes.
+Ops protects the stream between the Organization exporter and the Task importer.
+
 ## Events consumed
 
 | Event                                   | Durable consumer                                     | Effect                          |
