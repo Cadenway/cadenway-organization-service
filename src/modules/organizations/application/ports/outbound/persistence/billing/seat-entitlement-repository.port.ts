@@ -6,7 +6,11 @@ export interface SeatEntitlementRepository {
   /** Reads the committed projection, or null for a tenant on the legacy baseline. */
   find(organizationId: string): Promise<SeatEntitlement | null>;
 
-  /** Applies a newer nondecreasing limit by compare-and-set, with the admission lock held. */
-  writeNext(organizationId: string, entitlement: SeatEntitlement): Promise<boolean>;
+  /** Applies a validated snapshot if the version read under the admission lock still matches. */
+  writeNext(
+    organizationId: string,
+    expectedVersion: number,
+    entitlement: SeatEntitlement,
+  ): Promise<boolean>;
   // #endregion
 }

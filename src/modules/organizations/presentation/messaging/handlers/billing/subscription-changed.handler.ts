@@ -39,10 +39,11 @@ export class SubscriptionChangedHandler implements OnApplicationBootstrap {
         delaysMs: [1_000, 5_000, 30_000, 120_000, 600_000, 1_800_000, 3_600_000],
         maxDeliveries: 32,
       },
-      handle: async ({ organizationId, plan, seatLimit, version }) => {
+      handle: async ({ organizationId, plan, seatLimit, storageByteLimit, version }) => {
         await this.applySeatEntitlement.execute({
           organizationId,
           entitlement: { plan, seatLimit, version },
+          storageByteLimit,
         });
       },
     });

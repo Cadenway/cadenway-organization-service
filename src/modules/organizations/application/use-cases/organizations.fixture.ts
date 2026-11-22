@@ -379,12 +379,13 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork {
       seatEntitlements: {
         find: (organizationId: string): Promise<SeatEntitlement | null> =>
           Promise.resolve(tables.seatEntitlements.get(organizationId) ?? null),
-        writeNext: (organizationId: string, entitlement: SeatEntitlement): Promise<boolean> => {
-          const current = tables.seatEntitlements.get(organizationId);
-          if (
-            current !== undefined &&
-            (current.version >= entitlement.version || current.seatLimit > entitlement.seatLimit)
-          ) {
+        writeNext: (
+          organizationId: string,
+          expectedVersion: number,
+          entitlement: SeatEntitlement,
+        ): Promise<boolean> => {
+          const currentVersion = tables.seatEntitlements.get(organizationId)?.version ?? 0;
+          if (currentVersion !== expectedVersion || entitlement.version <= expectedVersion) {
             return Promise.resolve(false);
           }
           tables.seatEntitlements.set(organizationId, entitlement);

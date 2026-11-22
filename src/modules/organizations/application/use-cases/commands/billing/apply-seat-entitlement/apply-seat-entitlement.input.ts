@@ -8,5 +8,8 @@ export interface ApplySeatEntitlementInput {
 
   /** Validated seat values for that organization. */
   readonly entitlement: SeatEntitlement;
+
+  /** Completes the Billing snapshot for validation of the canonical Free allowance. */
+  readonly storageByteLimit: number;
   // #endregion
 }

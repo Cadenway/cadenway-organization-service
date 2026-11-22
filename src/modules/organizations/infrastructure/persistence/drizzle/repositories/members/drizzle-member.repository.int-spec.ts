@@ -137,7 +137,7 @@ describe('Seat admission persistence', () => {
     let settled = false;
     const entitlement = { version: 2, plan: 'team', seatLimit: 8 };
     const projection = runWithOrganizationContext(context, () =>
-      apply.execute({ organizationId, entitlement }),
+      apply.execute({ organizationId, entitlement, storageByteLimit: 100_000_000_000 }),
     ).then((result) => {
       settled = true;
       return result;
@@ -156,10 +156,13 @@ describe('Seat admission persistence', () => {
         const seats = new DrizzleSeatEntitlementRepository(db);
         await expect(seats.find(organizationId)).resolves.toEqual(entitlement);
         await expect(
-          seats.writeNext(organizationId, { ...entitlement, version: 1, seatLimit: 9 }),
+          seats.writeNext(organizationId, 2, { ...entitlement, version: 1, seatLimit: 9 }),
         ).resolves.toBe(false);
         await expect(
-          seats.writeNext(organizationId, { ...entitlement, version: 3, seatLimit: 7 }),
+          seats.writeNext(organizationId, 0, { ...entitlement, version: 3, seatLimit: 7 }),
+        ).resolves.toBe(false);
+        await expect(
+          seats.writeNext(organizationId, 1, { ...entitlement, version: 3, seatLimit: 7 }),
         ).resolves.toBe(false);
         await expect(seats.find(organizationId)).resolves.toEqual(entitlement);
       }),

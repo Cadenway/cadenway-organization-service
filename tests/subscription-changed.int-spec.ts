@@ -3,6 +3,8 @@ import {
   subscriptionChangedV1Schema,
 } from '@cadenway/contracts/events/billing-service';
 import type { SubscriptionChangedV1 } from '@cadenway/contracts/events/billing-service';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { newId, ServiceStack } from './support/service-stack.js';
@@ -14,6 +16,7 @@ function snapshot(
   version: number,
   seatLimit: number,
   plan = 'team',
+  storageByteLimit = 100_000_000_000,
 ): SubscriptionChangedV1 {
   return subscriptionChangedV1Schema.parse({
     id: newId(),
@@ -23,7 +26,7 @@ function snapshot(
     version,
     plan,
     seatLimit,
-    storageByteLimit: 100_000_000_000,
+    storageByteLimit,
   });
 }
 
@@ -32,6 +35,7 @@ describe('Billing seat entitlement subscription', () => {
   const lumen = newId();
   const retained = snapshot(atelier, 2, 18);
   let stack: ServiceStack;
+  let app: NestExpressApplication;
 
   async function addOrganization(id: string, name: string, slug: string): Promise<void> {
     await stack.system(
@@ -76,7 +80,8 @@ describe('Billing seat entitlement subscription', () => {
     await addOrganization(lumen, 'Coopérative Lumen', 'cooperative-lumen');
     stack.publish(SUBSCRIPTION_CHANGED_V1, retained);
     vi.stubEnv('ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED', 'true');
-    await stack.startApplication();
+    vi.stubEnv('ORGANIZATION_SEAT_QUOTA_ENABLED', 'true');
+    app = await stack.startApplication();
     await drained(1);
   });
 
@@ -156,6 +161,122 @@ describe('Billing seat entitlement subscription', () => {
     );
     expect(rows).toEqual([{ plan, version: 2, seat_limit: 20 }]);
     expect(await processed(event.id)).toEqual([{ event_id: event.id }]);
+  });
+
+  it('returns to Free under the seat lock without removing existing members', async () => {
+    const organizationId = newId();
+    const ownerUserId = newId();
+    const guestUserId = newId();
+    const guestMemberId = newId();
+    const memberUserIds = Array.from({ length: 5 }, () => newId());
+    await stack.system(
+      `insert into organizations
+        (id, name, name_key, slug, default_language, team_size, primary_use, owner_user_id)
+       values ($1, 'Atelier Gratuit', 'atelier gratuit', 'atelier-gratuit', 'fr', '1-5', 'other', $2)`,
+      [organizationId, ownerUserId],
+    );
+    await stack.system(
+      `insert into directory_users (user_id, name, name_key, email)
+       select id, 'Membre', 'membre', id::text || '@example.test'
+       from unnest($1::uuid[]) as id`,
+      [[ownerUserId, guestUserId, ...memberUserIds]],
+    );
+    await stack.system(
+      `insert into members (id, organization_id, user_id, role, joined_at)
+       values ($1, $2, $3, 'owner', now()), ($4, $2, $5, 'guest', now())`,
+      [newId(), organizationId, ownerUserId, guestMemberId, guestUserId],
+    );
+    for (const memberUserId of memberUserIds) {
+      await stack.system(
+        `insert into members (id, organization_id, user_id, role, joined_at)
+         values ($1, $2, $3, 'member', now())`,
+        [newId(), organizationId, memberUserId],
+      );
+    }
+    const team = snapshot(organizationId, 1, 18);
+    const free = snapshot(organizationId, 2, 5, 'free', 2_000_000_000);
+    let deliveries = stack.consumer(durable).delivered.consumer_seq;
+    stack.publish(SUBSCRIPTION_CHANGED_V1, team);
+    await drained(++deliveries);
+    const wrongStorage = snapshot(organizationId, 2, 5, 'free');
+    stack.publish(SUBSCRIPTION_CHANGED_V1, wrongStorage);
+    await drained(++deliveries);
+    expect(await projections()).toContainEqual({
+      organization_id: organizationId,
+      version: 1,
+      seat_limit: 18,
+    });
+
+    // Hold the same advisory lock as seat admission while the real JetStream handler starts.
+    const blocker = await stack.migrator.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query(
+        `select pg_advisory_xact_lock(hashtextextended('organization-seat-admission:' || $1::uuid::text, 0))`,
+        [organizationId],
+      );
+      const blockerPid = await blocker.query<{ pid: number }>('select pg_backend_pid() as pid');
+      const pid = blockerPid.rows[0]?.pid;
+      if (pid === undefined) throw new Error('The seat lock holder has no PostgreSQL process ID.');
+      stack.publish(SUBSCRIPTION_CHANGED_V1, free);
+      await vi.waitFor(
+        async () => {
+          expect(stack.consumer(durable).num_ack_pending).toBe(1);
+          const waiters = await stack.system<{ count: number }>(
+            'select count(*)::int as count from pg_stat_activity where $1 = any(pg_blocking_pids(pid))',
+            [pid],
+          );
+          expect(waiters[0]?.count).toBeGreaterThanOrEqual(1);
+        },
+        { timeout: 4_000, interval: 100 },
+      );
+      expect(await processed(free.id)).toEqual([]);
+    } finally {
+      await blocker.query('commit');
+      blocker.release();
+    }
+    await drained(++deliveries);
+    expect(await projections()).toContainEqual({
+      organization_id: organizationId,
+      version: 2,
+      seat_limit: 5,
+    });
+    expect(await processed(free.id)).toEqual([{ event_id: free.id }]);
+
+    const replay = snapshot(organizationId, 2, 5, 'free', 2_000_000_000);
+    const stale = snapshot(organizationId, 1, 18);
+    const conflicting = snapshot(organizationId, 2, 18);
+    const noncanonical = snapshot(organizationId, 3, 4, 'free', 2_000_000_000);
+    stack.publish(SUBSCRIPTION_CHANGED_V1, free, newId());
+    stack.publish(SUBSCRIPTION_CHANGED_V1, replay);
+    stack.publish(SUBSCRIPTION_CHANGED_V1, stale);
+    stack.publish(SUBSCRIPTION_CHANGED_V1, conflicting);
+    stack.publish(SUBSCRIPTION_CHANGED_V1, noncanonical);
+    deliveries += 5;
+    await drained(deliveries);
+    expect(await projections()).toContainEqual({
+      organization_id: organizationId,
+      version: 2,
+      seat_limit: 5,
+    });
+    expect(
+      await stack.system<{ role: string; count: number }>(
+        `select role, count(*)::int as count from members
+       where organization_id = $1 and removed_at is null group by role order by role`,
+        [organizationId],
+      ),
+    ).toEqual([
+      { role: 'guest', count: 1 },
+      { role: 'member', count: 5 },
+      { role: 'owner', count: 1 },
+    ]);
+    const promotion = await request(app.getHttpServer())
+      .patch(`/internal/v1/members/${guestMemberId}`)
+      .set('Authorization', await stack.bearer(ownerUserId, organizationId))
+      .set('If-Match', '"1"')
+      .send({ role: 'member' });
+    expect(promotion.status).toBe(409);
+    expect(promotion.body).toMatchObject({ code: 'organization.seat-quota-exceeded' });
   });
 
   it('rolls back the event ID on an uncommitted projection and retries the same delivery', async () => {
