@@ -202,13 +202,20 @@ The removals of a deleted account carry the actor `{ type: 'system', id: 'organi
 transaction of the removal.
 The language of `invitation.issued.v1` is the default language of the organization.
 
-For offline Task restoration, `node --import @cadenway/nest-common/register
-dist/modules/organizations/infrastructure/adapters/membership-export/export-memberships.js`
-streams active membership generations and tombstones from the Organization database in bounded
-pages. The command uses one read-only repeatable-read transaction under the service role and
-outputs only the organization, membership and account IDs, role, version and timestamps. It
-writes its closing count only after the database snapshot has closed. Ops runs this command
-locally and protects the stream between the two service commands.
+## Offline membership export
+
+For offline Task restoration, the following command streams active membership generations and
+tombstones from the Organization database in pages of 500.
+
+```sh
+node --import @cadenway/nest-common/register \
+  dist/modules/organizations/infrastructure/adapters/membership-export/export-memberships.js
+```
+
+The command uses one read-only repeatable-read transaction under the service role. Its
+newline-delimited JSON records include the organization, membership and account IDs, role,
+version and timestamps. The closing count is written after the database snapshot closes.
+Ops protects the stream between the Organization exporter and the Task importer.
 
 ## Events consumed
 

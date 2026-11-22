@@ -295,13 +295,19 @@ describe('Billing seat entitlement subscription', () => {
     expect(await processed(event.id)).toEqual([]);
 
     await addOrganization(organizationId, 'Studio Minuit', 'studio-minuit');
-    await drained(before + 3);
+    // The second delivery can still reach PostgreSQL after the organization is created.
+    await vi.waitFor(
+      async () => {
+        expect(await processed(event.id)).toEqual([{ event_id: event.id }]);
+      },
+      { timeout: 20_000, interval: 250 },
+    );
+    await drained(before + 2);
 
     expect(await projections()).toContainEqual({
       organization_id: organizationId,
       version: 1,
       seat_limit: 10,
     });
-    expect(await processed(event.id)).toEqual([{ event_id: event.id }]);
   });
 });
