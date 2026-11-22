@@ -71,6 +71,7 @@ const businessTables = [
   'invitations',
   'members',
   'organization_logo_reservations',
+  'organization_seat_entitlements',
   'organizations',
 ] as const;
 
@@ -80,9 +81,10 @@ const allTables = [...platformTables, ...businessTables].sort();
 /**
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
  * invitation emails, the former members of the user directory, its two-step verification, then
- * the logo reference and upload reservations.
+ * the logo reference and upload reservations, the billing membership index and the seat
+ * entitlement projection.
  */
-const migrationCount = 7;
+const migrationCount = 8;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -408,6 +410,11 @@ describe('organization-service wiring', () => {
         relrowsecurity: true,
         relforcerowsecurity: true,
       },
+      {
+        relname: 'organization_seat_entitlements',
+        relrowsecurity: true,
+        relforcerowsecurity: true,
+      },
       { relname: 'organizations', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'outbox_events', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'processed_events', relrowsecurity: false, relforcerowsecurity: false },
@@ -421,6 +428,10 @@ describe('organization-service wiring', () => {
       {
         tablename: 'organization_logo_reservations',
         policyname: 'organization_logo_reservations_organization_isolation',
+      },
+      {
+        tablename: 'organization_seat_entitlements',
+        policyname: 'organization_seat_entitlements_organization_isolation',
       },
       { tablename: 'organizations', policyname: 'organizations_organization_isolation' },
       { tablename: 'outbox_events', policyname: 'outbox_events_organization_isolation' },
@@ -662,6 +673,9 @@ describe('organization-service wiring', () => {
     ).toBe(false);
     expect(brokerAccepts(organization, 'stream', 'info', 'EVENTS')).toBe(false);
     expect(brokerAccepts(organization, 'pub', 'evt.task.wiring-probe', 'refused')).toBe(false);
+    expect(brokerAccepts(organization, 'pub', 'evt.subscription.changed.v1', 'refused')).toBe(
+      false,
+    );
     expect(
       brokerAccepts({ NATS_USER: '', NATS_PASSWORD: '' }, 'pub', 'evt.organization.x', 'x'),
     ).toBe(false);
@@ -718,6 +732,21 @@ describe('organization-service wiring', () => {
       brokerAccepts({}, 'consumer', 'info', 'EVENTS', 'organization-service__wiring-probe'),
     ).toBe(false);
 
+    expect(
+      brokerAccepts(
+        organization,
+        ...inbox,
+        'consumer',
+        'add',
+        'EVENTS',
+        'organization-service__project-seat-entitlement',
+        '--filter',
+        'evt.user.signed-up.v1',
+        '--pull',
+        '--defaults',
+      ),
+    ).toBe(false);
+
     // A handler whose consumer cadenway-ops does not grant cannot start.
     await expect(
       service()
@@ -729,6 +758,18 @@ describe('organization-service wiring', () => {
           handle: (): Promise<void> => Promise.resolve(),
         }),
     ).rejects.toThrow();
+  });
+
+  it('leaves the Billing seat entitlement durable unprovisioned by default', () => {
+    expect(
+      brokerAccepts(
+        {},
+        'consumer',
+        'info',
+        'EVENTS',
+        'organization-service__project-seat-entitlement',
+      ),
+    ).toBe(false);
   });
 
   it('stops being ready while NATS is down, and is ready again once it is back', async () => {

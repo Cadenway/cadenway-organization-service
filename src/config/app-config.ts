@@ -42,6 +42,8 @@ const optionalCursorSecret = z.preprocess(
  *   no corresponding issuer.
  * - `SEARCH_PROJECTION_CURSOR_SECRET` and `BILLING_AUTHORITY_CURSOR_SECRET`: stable keys for their
  *   respective export cursors, as 32 bytes in canonical base64url.
+ * - `ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED`: enables the Billing durable independently of
+ *   seat admission enforcement. Defaults to false until the broker permissions are deployed.
  *
  * `OTEL_EXPORTER_OTLP_ENDPOINT` is read by `telemetry.ts`, before the application exists.
  */
@@ -52,6 +54,7 @@ export type AppConfig = BaseConfig &
     readonly SEARCH_PROJECTION_CURSOR_SECRET?: string;
     readonly BILLING_AUTHORITY_CURSOR_SECRET?: string;
     readonly ORGANIZATION_SEAT_QUOTA_ENABLED: boolean;
+    readonly ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: boolean;
   };
 
 /**
@@ -77,6 +80,10 @@ export const appConfigSchema: z.ZodType<AppConfig> = z
     SEARCH_PROJECTION_CURSOR_SECRET: optionalCursorSecret,
     BILLING_AUTHORITY_CURSOR_SECRET: optionalCursorSecret,
     ORGANIZATION_SEAT_QUOTA_ENABLED: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+    ORGANIZATION_SEAT_ENTITLEMENT_EVENTS_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
       .transform((value) => value === 'true'),
