@@ -3,6 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { InternalTokenSigner, runWithOrganizationContext } from '@cadenway/nest-common';
 import type { Ed25519PublicJwk } from '@cadenway/nest-common';
 import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest-common/database';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -23,6 +24,8 @@ describe('Organization security transaction controls', () => {
   const ownerMembership = newId();
   const adminMembership = newId();
   let stack: ServiceStack;
+  let app: NestExpressApplication;
+  let identity: InternalTokenSigner;
   let tenant: TenantTransactionRunner;
 
   beforeAll(async () => {
@@ -41,6 +44,19 @@ describe('Organization security transaction controls', () => {
               (uuidv7(), $6, $4, 'owner', now())`,
       [ownerMembership, adminMembership, firstOrg, owner, admin, secondOrg],
     );
+    const key = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+    if (key.x === undefined || key.d === undefined) throw new Error('Missing test key material.');
+    const publicJwk: Ed25519PublicJwk = {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: key.x,
+      kid: 'test-account-deletion-authority',
+    };
+    app = await stack.startApplication({ 'identity-service': [publicJwk] });
+    identity = await InternalTokenSigner.create({
+      issuer: 'identity-service',
+      privateJwk: { ...publicJwk, d: key.d },
+    });
   });
 
   afterAll(async () => {
@@ -78,21 +94,8 @@ describe('Organization security transaction controls', () => {
   });
 
   it('accepts only the unscoped Identity signer, remembers the attempt and refuses an owner', async () => {
-    const key = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
-    if (key.x === undefined || key.d === undefined) throw new Error('Missing test key material.');
-    const publicJwk: Ed25519PublicJwk = {
-      kty: 'OKP',
-      crv: 'Ed25519',
-      x: key.x,
-      kid: 'test-account-deletion-authority',
-    };
-    const app = await stack.startApplication({ 'identity-service': [publicJwk] });
-    const signer = await InternalTokenSigner.create({
-      issuer: 'identity-service',
-      privateJwk: { ...publicJwk, d: key.d },
-    });
     const authorization = async (organizationId: string | null): Promise<string> =>
-      `Bearer ${await signer.sign('organization-service', {
+      `Bearer ${await identity.sign('organization-service', {
         actor: { type: 'system', id: 'identity-service' },
         organizationId,
       })}`;
@@ -207,6 +210,58 @@ describe('Organization security transaction controls', () => {
       const directory = new DrizzleDirectoryRepository(db);
       await expect(directory.findDeletionAttempt(account)).resolves.toBeNull();
     });
+  });
+
+  it('prevents a legacy membership write from granting access after a deletion reservation', async () => {
+    const account = newId();
+    const attempt = newId();
+    const existingMembership = newId();
+    const deletedAccount = newId();
+    const availableAccount = newId();
+    await stack.system(
+      'insert into directory_users (user_id, deleted) values ($1, false), ($2, true), ($3, false)',
+      [account, deletedAccount, availableAccount],
+    );
+    await stack.system(
+      `insert into members (id, organization_id, user_id, role, joined_at, removed_at)
+       values ($1, $2, $3, 'member', now(), now())`,
+      [existingMembership, firstOrg, account],
+    );
+    const system = new SystemTransactionRunner(stack.migrator);
+    await system.run(async ({ db }) => {
+      const directory = new DrizzleDirectoryRepository(db);
+      await directory.findForUpdate(account);
+      await directory.reserveDeletion(account, attempt);
+    });
+
+    const runner = app.get(TenantTransactionRunner);
+    const grant = (userId: string) =>
+      runWithOrganizationContext(
+        { organizationId: secondOrg, actor: { type: 'user', id: userId }, role: null, scopes: [] },
+        () =>
+          runner.run(({ client }) =>
+            client.query(
+              `insert into members (organization_id, user_id, role, joined_at)
+               values ($1, $2, 'member', now())`,
+              [secondOrg, userId],
+            ),
+          ),
+      );
+    const denied = { code: '23514', constraint: 'members_require_available_account' };
+    await expect(grant(account)).rejects.toMatchObject(denied);
+    await expect(grant(deletedAccount)).rejects.toMatchObject(denied);
+    await expect(
+      runWithOrganizationContext(
+        { organizationId: firstOrg, actor: { type: 'user', id: owner }, role: null, scopes: [] },
+        () =>
+          runner.run(({ client }) =>
+            client.query('update members set removed_at = null where id = $1', [
+              existingMembership,
+            ]),
+          ),
+      ),
+    ).rejects.toMatchObject(denied);
+    await expect(grant(availableAccount)).resolves.toMatchObject({ rowCount: 1 });
   });
 
   it('serializes one sender across two tenant transactions and clears the ledger scope after commit', async () => {

@@ -78,6 +78,13 @@
       "when": 1795423979224,
       "tag": "0010_outbox_leases",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1795425072698,
+      "tag": "0011_enforce_membership_deletion_reservations",
+      "breakpoints": true
     }
   ]
 }

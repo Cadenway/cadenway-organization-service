@@ -279,11 +279,14 @@ Ops protects the stream between the Organization exporter and the Task importer.
   account's directory entry, checks its active owner memberships, and stores the first deletion
   attempt in the nullable `directory_users.deletion_attempt_id` added by migration `0009`.
   Organization creation and invitation acceptance check the reservation under their shared
-  directory lock. Retrying the same attempt reuses the reservation until the deletion event
+  directory lock. Migration `0011` also rejects new active memberships, restorations of removed
+  memberships and promotions to owner for reserved or deleted accounts. The trigger holds the same
+  directory lock so the check also covers writes from a previous application image. Retrying the
+  same attempt reuses the reservation until the deletion event
   commits. The unscoped Identity system actor calls
   `PUT /internal/v1/users/{userId}/account-deletion-reservations/{attemptId}`. Every response is
-  private and uncacheable. Enable the caller only after migration
-  `0009` and the upgrade of every Organization writer that grants memberships. Keep a
+  private and uncacheable. Enable the caller after migration `0011` and the Organization endpoint
+  are available. Keep a
   reservation-aware Organization rollback image once Identity can reserve attempts. Before
   restoring either service database, pause and drain the Identity deletion workers. Reconcile
   outstanding claims and reservations against the restored authority before resuming deletion.
