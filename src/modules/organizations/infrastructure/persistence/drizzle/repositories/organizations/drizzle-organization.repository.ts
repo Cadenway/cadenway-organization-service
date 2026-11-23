@@ -8,6 +8,7 @@ import type { OrganizationRepository } from '../../../../../application/ports/ou
 import type { MyOrganizationView } from '../../../../../application/projections/organizations/my-organization-view.projection.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
 import { SlugTakenError } from '../../../../../domain/errors/organizations/slug-taken.error.js';
+import { FREE_SEAT_ENTITLEMENT } from '../../../../../domain/value-objects/billing/seat-entitlement.value-object.js';
 import type { Role } from '../../../../../domain/value-objects/members/role.value-object.js';
 import type { OrganizationDraft } from '../../../../../domain/value-objects/organizations/organization-draft.value-object.js';
 import type { OrganizationState } from '../../../../../domain/value-objects/organizations/organization-state.value-object.js';
@@ -17,6 +18,7 @@ import { toOrganization } from '../../mappers/organizations/organization.mapper.
 import type { OrganizationRow } from '../../mappers/organizations/organization.mapper.js';
 import { toPage } from '../../mappers/pagination/page.mapper.js';
 import { violatedUniqueConstraint } from '../../mappers/postgres/unique-violation.mapper.js';
+import { organizationSeatEntitlements } from '../../schemas/billing/organization-seat-entitlement.schema.js';
 import { members } from '../../schemas/members/member.schema.js';
 import { organizations } from '../../schemas/organizations/organization.schema.js';
 
@@ -307,13 +309,17 @@ export class DrizzleOrganizationRepository implements OrganizationRepository {
         name: organizations.name,
         nameKey: organizations.nameKey,
         slug: organizations.slug,
-        plan: organizations.plan,
+        plan: sql<string>`coalesce(${organizationSeatEntitlements.plan}, ${FREE_SEAT_ENTITLEMENT.plan})`,
         role: members.role,
         joinedAt: members.joinedAt,
         memberCount: seats,
       })
       .from(members)
       .innerJoin(organizations, eq(organizations.id, members.organizationId))
+      .leftJoin(
+        organizationSeatEntitlements,
+        eq(organizationSeatEntitlements.organizationId, organizations.id),
+      )
       .where(
         and(
           eq(members.userId, userId),
@@ -339,6 +345,15 @@ export class DrizzleOrganizationRepository implements OrganizationRepository {
       }),
       (row: MyOrganizationRow): PagePosition => ({ key: row.nameKey, id: row.id }),
     );
+  }
+
+  /** Reads the tenant and its billable seats in one database snapshot. */
+  public async countActiveSeats(organizationId: string): Promise<number | null> {
+    const [row] = await this.db
+      .select({ count: toSeatCount(this.db, organizations.id) })
+      .from(organizations)
+      .where(eq(organizations.id, organizationId));
+    return row?.count ?? null;
   }
   // #endregion
 }

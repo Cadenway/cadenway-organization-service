@@ -27,6 +27,7 @@ import { listMembersProvider } from './composition/providers/use-cases/members/l
 import { lookupMemberNamesProvider } from './composition/providers/use-cases/members/lookup-member-names.provider.js';
 import { removeDeletedUserProvider } from './composition/providers/use-cases/members/remove-deleted-user.provider.js';
 import { removeMemberProvider } from './composition/providers/use-cases/members/remove-member.provider.js';
+import { reserveAccountDeletionProvider } from './composition/providers/use-cases/members/reserve-account-deletion.provider.js';
 import { createOrganizationProvider } from './composition/providers/use-cases/organizations/create-organization.provider.js';
 import { getCurrentOrganizationProvider } from './composition/providers/use-cases/organizations/get-current-organization.provider.js';
 import { listMyOrganizationsProvider } from './composition/providers/use-cases/organizations/list-my-organizations.provider.js';
@@ -41,6 +42,7 @@ import { InvitationsController } from './presentation/http/controllers/invitatio
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { OrganizationLogoController } from './presentation/http/controllers/logo/organization-logo.controller.js';
 import { MembersController } from './presentation/http/controllers/members/members.controller.js';
+import { AccountDeletionReservationsController } from './presentation/http/controllers/members/account-deletion-reservations.controller.js';
 import { MemberNamesController } from './presentation/http/controllers/members/member-names.controller.js';
 import { OrganizationsController } from './presentation/http/controllers/organizations/organizations.controller.js';
 import { SearchAuthorityController } from './presentation/http/controllers/search/search-authority.controller.js';
@@ -65,6 +67,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     OrganizationsController,
     OrganizationLogoController,
     MembersController,
+    AccountDeletionReservationsController,
     MemberNamesController,
     InvitationsController,
     ReceivedInvitationsController,
@@ -107,6 +110,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     projectEmailChangeProvider,
     projectTwoStepVerificationChangeProvider,
     removeDeletedUserProvider,
+    reserveAccountDeletionProvider,
     subscriptionChangedHandlerProvider,
     UserSignedUpHandler,
     UserEmailVerifiedHandler,

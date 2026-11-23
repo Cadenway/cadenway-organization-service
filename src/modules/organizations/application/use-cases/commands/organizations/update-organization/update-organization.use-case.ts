@@ -1,5 +1,6 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import { readSeatEntitlement } from '../../../../services/members/seat-limit.service.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import type { OrganizationUpdate } from '../../../../../domain/value-objects/organizations/organization-update.value-object.js';
 import { toOrganizationView } from '../../../../mappers/organizations/organization-view.mapper.js';
@@ -95,6 +96,7 @@ export class UpdateOrganization {
             update.organization,
             actor.role,
             await store.members.countSeats(input.organizationId),
+            (await readSeatEntitlement(store, input.organizationId)).plan,
           );
         },
       );

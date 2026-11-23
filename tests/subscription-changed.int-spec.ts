@@ -196,11 +196,31 @@ describe('Billing seat entitlement subscription', () => {
     const team = snapshot(organizationId, 1, 18);
     const free = snapshot(organizationId, 2, 5, 'free', 2_000_000_000);
     let deliveries = stack.consumer(durable).delivered.consumer_seq;
+    const authorization = await stack.bearer(ownerUserId, organizationId);
+    async function expectPlan(plan: string): Promise<void> {
+      const profile = await request(app.getHttpServer())
+        .get('/internal/v1/organization')
+        .set('Authorization', authorization)
+        .set('If-None-Match', '*');
+      expect(profile.status).toBe(200);
+      expect(profile.headers['cache-control']).toBe('private, no-store');
+      expect(profile.body).toMatchObject({ id: organizationId, plan });
+      const list = await request(app.getHttpServer())
+        .get('/internal/v1/organizations')
+        .set('Authorization', authorization)
+        .set('If-None-Match', '*');
+      expect(list.status).toBe(200);
+      expect(list.headers['cache-control']).toBe('private, no-store');
+      expect(list.body).toMatchObject({ items: [{ id: organizationId, plan }] });
+    }
+    await expectPlan('free');
     stack.publish(SUBSCRIPTION_CHANGED_V1, team);
     await drained(++deliveries);
+    await expectPlan('team');
     const wrongStorage = snapshot(organizationId, 2, 5, 'free');
     stack.publish(SUBSCRIPTION_CHANGED_V1, wrongStorage);
     await drained(++deliveries);
+    await expectPlan('team');
     expect(await projections()).toContainEqual({
       organization_id: organizationId,
       version: 1,
@@ -242,6 +262,7 @@ describe('Billing seat entitlement subscription', () => {
       seat_limit: 5,
     });
     expect(await processed(free.id)).toEqual([{ event_id: free.id }]);
+    await expectPlan('free');
 
     const replay = snapshot(organizationId, 2, 5, 'free', 2_000_000_000);
     const stale = snapshot(organizationId, 1, 18);

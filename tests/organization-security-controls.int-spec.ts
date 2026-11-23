@@ -1,5 +1,9 @@
-import { runWithOrganizationContext } from '@cadenway/nest-common';
+import { generateKeyPairSync } from 'node:crypto';
+
+import { InternalTokenSigner, runWithOrganizationContext } from '@cadenway/nest-common';
+import type { Ed25519PublicJwk } from '@cadenway/nest-common';
 import { SystemTransactionRunner, TenantTransactionRunner } from '@cadenway/nest-common/database';
+import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { Invitation } from '../src/modules/organizations/domain/aggregates/invitation/invitation.aggregate.js';
@@ -8,6 +12,7 @@ import { DrizzleDirectoryRepository } from '../src/modules/organizations/infrast
 import { DrizzleInvitationEmailRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-email.repository.js';
 import { DrizzleInvitationRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation.repository.js';
 import { DrizzleMemberRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/members/drizzle-member.repository.js';
+import { DrizzleOrganizationRepository } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/organizations/drizzle-organization.repository.js';
 import { newId, ServiceStack } from './support/service-stack.js';
 
 describe('Organization security transaction controls', () => {
@@ -40,6 +45,92 @@ describe('Organization security transaction controls', () => {
 
   afterAll(async () => {
     await stack.stop();
+  });
+
+  it('counts only active seats in the current tenant after more than one page of history', async () => {
+    const organizationId = newId();
+    const historicalOwner = newId();
+    await stack.system(
+      `insert into organizations
+        (id, name, name_key, slug, default_language, team_size, primary_use, owner_user_id)
+       values ($1, 'Atelier Histoires', 'atelier histoires', 'atelier-histoires', 'fr', '1-5', 'other', $2)`,
+      [organizationId, historicalOwner],
+    );
+    await stack.system(
+      `insert into members (organization_id, user_id, role, joined_at, removed_at)
+       select $1::uuid, uuidv7(), 'guest', now(), null::timestamptz from generate_series(1, 56)
+       union all
+       select $1::uuid, uuidv7(), 'member', now(), now() from generate_series(1, 55)
+       union all
+       select $1::uuid, $2::uuid, 'owner', now(), null::timestamptz`,
+      [organizationId, historicalOwner],
+    );
+
+    await runWithOrganizationContext(
+      { organizationId, actor: { type: 'system', id: 'billing-service' }, role: null, scopes: [] },
+      () =>
+        tenant.run(async ({ db }) => {
+          const organizations = new DrizzleOrganizationRepository(db);
+          await expect(organizations.countActiveSeats(organizationId)).resolves.toBe(1);
+          await expect(organizations.countActiveSeats(firstOrg)).resolves.toBeNull();
+        }),
+    );
+  });
+
+  it('accepts only the unscoped Identity signer, remembers the attempt and refuses an owner', async () => {
+    const key = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+    if (key.x === undefined || key.d === undefined) throw new Error('Missing test key material.');
+    const publicJwk: Ed25519PublicJwk = {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: key.x,
+      kid: 'test-account-deletion-authority',
+    };
+    const app = await stack.startApplication({ 'identity-service': [publicJwk] });
+    const signer = await InternalTokenSigner.create({
+      issuer: 'identity-service',
+      privateJwk: { ...publicJwk, d: key.d },
+    });
+    const authorization = async (organizationId: string | null): Promise<string> =>
+      `Bearer ${await signer.sign('organization-service', {
+        actor: { type: 'system', id: 'identity-service' },
+        organizationId,
+      })}`;
+    const adapter = request(app.getHttpServer());
+    const account = newId();
+    const attempt = '019a6c30-7a8b-7c9d-8e0f-1a2b3c4d8e91';
+    const differentAttempt = '019a6c30-7a8b-7c9d-8e0f-1a2b3c4d8e92';
+    const route = (userId: string, id = attempt): string =>
+      `/internal/v1/users/${userId}/account-deletion-reservations/${id}`;
+    await stack.system('insert into directory_users (user_id) values ($1), ($2)', [account, owner]);
+    const bearer = await authorization(null);
+
+    const wrongIssuer = await adapter
+      .put(route(account))
+      .set('Authorization', await stack.bearer(owner, firstOrg));
+    expect(wrongIssuer.status).toBe(403);
+    expect(wrongIssuer.headers['cache-control']).toBe('private, no-store');
+    const scoped = await adapter
+      .put(route(account))
+      .set('Authorization', await authorization(firstOrg));
+    expect(scoped.status).toBe(403);
+    expect(scoped.body).toMatchObject({ code: 'auth.organization-not-allowed' });
+    const created = await adapter.put(route(account)).set('Authorization', bearer);
+    expect(created.status).toBe(201);
+    expect(created.headers['cache-control']).toBe('private, no-store');
+    expect(created.text).toBe('');
+    await adapter.put(route(account)).set('Authorization', bearer).expect(204);
+    const conflict = await adapter
+      .put(route(account, differentAttempt))
+      .set('Authorization', bearer);
+    expect(conflict.status).toBe(409);
+    expect(conflict.body).toMatchObject({ code: 'account.deletion-reservation-conflict' });
+    const refusesOwner = await adapter.put(route(owner)).set('Authorization', bearer);
+    expect(refusesOwner.status).toBe(409);
+    expect(refusesOwner.body).toMatchObject({
+      code: 'account.organization-owner',
+      details: { organizationIds: [firstOrg, secondOrg].sort() },
+    });
   });
 
   it('returns both current tenant memberships and takes both row locks before the decision', async () => {

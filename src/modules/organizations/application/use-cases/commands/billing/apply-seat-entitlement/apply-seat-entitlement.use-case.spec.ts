@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { FREE_SEAT_ENTITLEMENT } from '../../../../../domain/value-objects/billing/seat-entitlement.value-object.js';
-import { atelierNord } from '../../../organizations.scenario.fixture.js';
+import { atelierNord, CAMILLE } from '../../../organizations.scenario.fixture.js';
+import { GetCurrentOrganization } from '../../../queries/organizations/get-current-organization/get-current-organization.use-case.js';
+import { ListMyOrganizations } from '../../../queries/organizations/list-my-organizations/list-my-organizations.use-case.js';
 import { ApplySeatEntitlement } from './apply-seat-entitlement.use-case.js';
 
 const freeStorageByteLimit = 2_000_000_000;
@@ -30,6 +32,17 @@ describe('ApplySeatEntitlement', () => {
   it('applies a canonical Free snapshot when an intermediate plan change was missed', async () => {
     const { organizationId, store } = await atelierNord();
     const projection = new ApplySeatEntitlement(store);
+    const profile = new GetCurrentOrganization(store);
+    const list = new ListMyOrganizations(store);
+    const actorUserId = CAMILLE.id;
+    const readPlan = (): Promise<readonly string[]> =>
+      Promise.all([
+        profile.execute({ organizationId, actorUserId }).then((view) => view.plan),
+        list
+          .execute({ actorUserId, after: null, limit: 5 })
+          .then((page) => page.items[0]?.plan ?? ''),
+      ]);
+    await expect(readPlan()).resolves.toEqual(['free', 'free']);
     await expect(
       projection.execute({
         organizationId,
@@ -37,10 +50,12 @@ describe('ApplySeatEntitlement', () => {
         storageByteLimit: teamStorageByteLimit,
       }),
     ).resolves.toBe('applied');
+    await expect(readPlan()).resolves.toEqual(['enterprise', 'enterprise']);
 
     const entitlement = { ...FREE_SEAT_ENTITLEMENT, version: 3 };
     const input = { organizationId, entitlement, storageByteLimit: freeStorageByteLimit };
     await expect(projection.execute(input)).resolves.toBe('applied');
+    await expect(readPlan()).resolves.toEqual(['free', 'free']);
     await expect(projection.execute(input)).resolves.toBe('unchanged');
     await expect(
       projection.execute({

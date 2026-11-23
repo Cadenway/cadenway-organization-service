@@ -14,7 +14,10 @@ import {
   assertAddressedToActor,
   findAddressedInvitation,
 } from '../../../../services/invitations/addressed-invitation.service.js';
-import { requireAvailableSeat } from '../../../../services/members/seat-limit.service.js';
+import {
+  readSeatEntitlement,
+  requireAvailableSeat,
+} from '../../../../services/members/seat-limit.service.js';
 import type { AcceptInvitationInput } from './accept-invitation.input.js';
 
 /**
@@ -134,7 +137,7 @@ export class AcceptInvitation {
             slug: organization.snapshot.slug,
             role: member.role,
             memberCount: await store.members.countSeats(organizationId),
-            plan: organization.snapshot.plan,
+            plan: (await readSeatEntitlement(store, organizationId)).plan,
             joinedAt: member.snapshot.joinedAt,
           };
         },

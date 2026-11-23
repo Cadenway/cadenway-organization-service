@@ -268,7 +268,9 @@ export class ServiceStack {
    *
    * @returns The application.
    */
-  public async startApplication(): Promise<NestExpressApplication> {
+  public async startApplication(
+    trustedAuthorities: Readonly<Record<string, readonly Ed25519PublicJwk[]>> = {},
+  ): Promise<NestExpressApplication> {
     const identityKey = keyPair();
     vi.stubEnv('IDENTITY_SERVICE_URL', await this.verifiedEmails.start(identityKey.publicJwk));
     vi.stubEnv(
@@ -284,7 +286,7 @@ export class ServiceStack {
     vi.stubEnv('INTERNAL_TOKEN_AUDIENCE', 'organization-service');
     vi.stubEnv(
       'INTERNAL_TOKEN_TRUSTED_ISSUERS',
-      JSON.stringify({ 'api-gateway': [this.gateway.publicJwk] }),
+      JSON.stringify({ ...trustedAuthorities, 'api-gateway': [this.gateway.publicJwk] }),
     );
     const config = loadConfig(appConfigSchema);
     const app = await createApplication(AppModule, {

@@ -5,6 +5,7 @@ import { Organization } from '../../domain/aggregates/organization/organization.
 import { SlugTakenError } from '../../domain/errors/organizations/slug-taken.error.js';
 import { takesSeat } from '../../domain/policies/members/seat.policy.js';
 import type { SeatEntitlement } from '../../domain/value-objects/billing/seat-entitlement.value-object.js';
+import { FREE_SEAT_ENTITLEMENT } from '../../domain/value-objects/billing/seat-entitlement.value-object.js';
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
@@ -290,6 +291,8 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           tables.organizations.set(organization.id, organization.snapshot);
           return Promise.resolve();
         },
+        countActiveSeats: (organizationId: string): Promise<number | null> =>
+          Promise.resolve(tables.organizations.has(organizationId) ? seats(organizationId) : null),
         listOfUser: (
           userId: string,
           after: PagePosition | null,
@@ -311,7 +314,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                         slug: organization.slug,
                         role: member.role,
                         memberCount: seats(organization.id),
-                        plan: organization.plan,
+                        plan: (
+                          tables.seatEntitlements.get(organization.id) ?? FREE_SEAT_ENTITLEMENT
+                        ).plan,
                         joinedAt: member.joinedAt,
                       },
                       position: { key: searchKeyOf(organization.name), id: organization.id },
