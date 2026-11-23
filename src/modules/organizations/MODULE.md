@@ -110,6 +110,8 @@ or scopes.
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
 with an organization claim and returns the active and removed member versions for that tenant.
+`GET /internal/v1/billing-active-seats` uses the same scoped identity to return the current
+billable count in one read. Checkout is independent of the retained membership history.
 Notification uses `GET /internal/v1/quota-notification-recipients` and
 `POST /internal/v1/quota-notification-recipients/lookup` with its system identity and an
 organization claim. The list pages the current owners and administrators. The lookup rechecks

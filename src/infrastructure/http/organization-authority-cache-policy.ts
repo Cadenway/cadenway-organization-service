@@ -6,7 +6,7 @@ export function installOrganizationAuthorityCachePolicy(
   app: Pick<NestExpressApplication, 'use'>,
 ): void {
   const path =
-    /^\/internal\/v1\/(?:organizations?|search-(?:organizations|membership)|billing-(?:organizations|memberships)|quota-notification-recipients(?:\/lookup)?|automation-recipients\/check|users\/[^/]+\/account-deletion-reservations\/[^/]+)\/?$/iu;
+    /^\/internal\/v1\/(?:organizations?|search-(?:organizations|membership)|billing-(?:organizations|memberships|active-seats)|quota-notification-recipients(?:\/lookup)?|automation-recipients\/check|users\/[^/]+\/account-deletion-reservations\/[^/]+)\/?$/iu;
   app.use(path, (request: Request, response: Response, next: NextFunction): void => {
     response.setHeader('Cache-Control', 'private, no-store');
     if (request.method === 'GET' || request.method === 'HEAD') {
