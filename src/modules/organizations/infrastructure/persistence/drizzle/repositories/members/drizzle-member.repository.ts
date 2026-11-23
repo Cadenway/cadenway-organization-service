@@ -251,13 +251,14 @@ export class DrizzleMemberRepository implements MemberRepository {
     return rows.map(toMember);
   }
 
-  /** Loads only active owner rows for the account, under the caller's directory row lock. */
-  public async listOwnedOrganizationIds(userId: string): Promise<readonly string[]> {
+  /** Bounds the evidence sent to Identity to active owner rows for the account. */
+  public async listOwnedOrganizationIds(userId: string, limit: number): Promise<readonly string[]> {
     const rows = await this.db
       .select({ organizationId: members.organizationId })
       .from(members)
       .where(and(eq(members.userId, userId), eq(members.role, 'owner'), isNull(members.removedAt)))
-      .orderBy(asc(members.organizationId));
+      .orderBy(asc(members.organizationId))
+      .limit(limit);
     return rows.map(({ organizationId }) => organizationId);
   }
 

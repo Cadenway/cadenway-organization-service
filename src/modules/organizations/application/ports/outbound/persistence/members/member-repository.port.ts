@@ -62,8 +62,8 @@ export interface MemberRepository {
    */
   findActiveOfAccountForUpdate(userId: string): Promise<readonly Member[]>;
 
-  /** Current owned organizations in a system transaction under the account directory lock. */
-  listOwnedOrganizationIds(userId: string): Promise<readonly string[]>;
+  /** A bounded list of current owned organizations under the account directory lock. */
+  listOwnedOrganizationIds(userId: string, limit: number): Promise<readonly string[]>;
 
   /**
    * Method update

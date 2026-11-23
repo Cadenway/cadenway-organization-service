@@ -136,6 +136,48 @@ describe('Organization security transaction controls', () => {
     });
   });
 
+  it('returns bounded owner evidence to Identity for an account with many organizations', async () => {
+    const account = newId();
+    await stack.system('insert into directory_users (user_id) values ($1)', [account]);
+    const owned = await stack.system<{ id: string }>(
+      `insert into organizations
+        (name, name_key, slug, default_language, team_size, primary_use, owner_user_id)
+       select 'Atelier ' || n, 'atelier ' || n, 'atelier-proprietaire-' || n,
+              'fr', '1-5', 'other', $1 from generate_series(1, 112) as g(n)
+       returning id`,
+      [account],
+    );
+    await stack.system(
+      `insert into members (organization_id, user_id, role, joined_at)
+       select id, $1, 'owner', now() from organizations where owner_user_id = $1`,
+      [account],
+    );
+    const token = await identity.sign('organization-service', {
+      actor: { type: 'system', id: 'identity-service' },
+      organizationId: null,
+    });
+
+    const response = await request(app.getHttpServer())
+      .put(
+        `/internal/v1/users/${account}/account-deletion-reservations/019a6c30-7a8b-7c9d-8e0f-1a2b3c4d8e91`,
+      )
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(owned).toHaveLength(112);
+    expect(response.status).toBe(409);
+    expect(response.headers['cache-control']).toBe('private, no-store');
+    expect(response.body).toMatchObject({
+      code: 'account.organization-owner',
+      details: {
+        organizationIds: owned
+          .map(({ id }) => id)
+          .sort()
+          .slice(0, 100),
+      },
+    });
+    expect(Buffer.byteLength(response.text)).toBeLessThan(64 * 1024);
+  });
+
   it('returns both current tenant memberships and takes both row locks before the decision', async () => {
     await runWithOrganizationContext(
       { organizationId: firstOrg, actor: { type: 'user', id: owner }, role: null, scopes: [] },
@@ -186,10 +228,10 @@ describe('Organization security transaction controls', () => {
     await system.run(async ({ db }) => {
       const directory = new DrizzleDirectoryRepository(db);
       const members = new DrizzleMemberRepository(db);
-      await expect(members.listOwnedOrganizationIds(owner)).resolves.toEqual(
+      await expect(members.listOwnedOrganizationIds(owner, 100)).resolves.toEqual(
         [firstOrg, secondOrg].sort(),
       );
-      await expect(members.listOwnedOrganizationIds(account)).resolves.toEqual([]);
+      await expect(members.listOwnedOrganizationIds(account, 100)).resolves.toEqual([]);
       await expect(directory.findForUpdate(account)).resolves.not.toBeNull();
       await directory.reserveDeletion(account, attempt);
     });

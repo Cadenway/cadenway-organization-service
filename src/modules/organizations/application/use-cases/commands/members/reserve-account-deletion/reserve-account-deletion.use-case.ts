@@ -2,6 +2,8 @@ import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transac
 
 import type { ReserveAccountDeletionOutput } from './reserve-account-deletion.output.js';
 
+const maximumOwnershipProofs = 100;
+
 /** Reserves an attempt against the same locked directory entry used by membership grants. */
 export class ReserveAccountDeletion {
   // #region Constructor
@@ -22,7 +24,10 @@ export class ReserveAccountDeletion {
           return { status: previous === attemptId.toLowerCase() ? 'reused' : 'conflict' };
         }
 
-        const organizationIds = await store.members.listOwnedOrganizationIds(userId);
+        const organizationIds = await store.members.listOwnedOrganizationIds(
+          userId,
+          maximumOwnershipProofs,
+        );
         if (organizationIds.length > 0) return { status: 'owner', organizationIds };
         await store.directory.reserveDeletion(userId, attemptId);
         return { status: 'created' };

@@ -357,7 +357,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
               )
               .map((member: MemberState) => Member.restore(member)),
           ),
-        listOwnedOrganizationIds: (userId: string): Promise<readonly string[]> =>
+        listOwnedOrganizationIds: (userId: string, limit: number): Promise<readonly string[]> =>
           Promise.resolve(
             [...tables.members.values()]
               .filter(
@@ -365,7 +365,8 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                   member.userId === userId && member.removedAt === null && member.role === 'owner',
               )
               .map(({ organizationId }) => organizationId)
-              .sort(),
+              .sort()
+              .slice(0, limit),
           ),
         update: (member: Member): Promise<void> => {
           tables.members.set(member.id, member.snapshot);

@@ -282,12 +282,12 @@ Ops protects the stream between the Organization exporter and the Task importer.
   directory lock. Migration `0011` also rejects new active memberships, restorations of removed
   memberships and promotions to owner for reserved or deleted accounts. The trigger holds the same
   directory lock so the check also covers writes from a previous application image. Retrying the
-  same attempt reuses the reservation until the deletion event
-  commits. The unscoped Identity system actor calls
+  same attempt reuses the reservation until the deletion event commits. A definitive owner refusal
+  includes up to 100 ordered organization IDs as evidence. The unscoped Identity system actor calls
   `PUT /internal/v1/users/{userId}/account-deletion-reservations/{attemptId}`. Every response is
   private and uncacheable. Enable the caller after migration `0011` and the Organization endpoint
-  are available. Keep a
-  reservation-aware Organization rollback image once Identity can reserve attempts. Before
+  are available. Keep a reservation-aware Organization rollback image once Identity can reserve
+  attempts. Before
   restoring either service database, pause and drain the Identity deletion workers. Reconcile
   outstanding claims and reservations against the restored authority before resuming deletion.
 - The directory tracks account status, member display and two-step verification. Its consumers
