@@ -14,7 +14,10 @@ import {
   assertAddressedToActor,
   findAddressedInvitation,
 } from '../../../../services/invitations/addressed-invitation.service.js';
-import { requireAvailableSeat } from '../../../../services/members/seat-limit.service.js';
+import {
+  readSeatEntitlement,
+  requireAvailableSeat,
+} from '../../../../services/members/seat-limit.service.js';
 import type { AcceptInvitationInput } from './accept-invitation.input.js';
 
 /**
@@ -112,6 +115,10 @@ export class AcceptInvitation {
           // Lock the directory entry before the invitation so account deletion either leaves a
           // tombstone before this check or finds the membership after this transaction commits.
           await store.directory.findForShare(input.actorUserId);
+          const deletionAttempt = await store.directory.findDeletionAttempt(input.actorUserId);
+          if (deletionAttempt !== null) {
+            throw new OrganizationRefusal({ reason: 'invitation-not-found' });
+          }
           const invitation: Invitation = await assertAddressedToActor(
             store,
             await store.invitations.findForUpdate(organizationId, input.invitationId),
@@ -130,7 +137,7 @@ export class AcceptInvitation {
             slug: organization.snapshot.slug,
             role: member.role,
             memberCount: await store.members.countSeats(organizationId),
-            plan: organization.snapshot.plan,
+            plan: (await readSeatEntitlement(store, organizationId)).plan,
             joinedAt: member.snapshot.joinedAt,
           };
         },

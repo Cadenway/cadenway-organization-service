@@ -5,6 +5,7 @@ import { Organization } from '../../domain/aggregates/organization/organization.
 import { SlugTakenError } from '../../domain/errors/organizations/slug-taken.error.js';
 import { takesSeat } from '../../domain/policies/members/seat.policy.js';
 import type { SeatEntitlement } from '../../domain/value-objects/billing/seat-entitlement.value-object.js';
+import { FREE_SEAT_ENTITLEMENT } from '../../domain/value-objects/billing/seat-entitlement.value-object.js';
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
@@ -74,6 +75,9 @@ interface Tables {
   /** Directory entries by account. */
   directory: Map<string, DirectoryUserState>;
 
+  /** Reservations for final account deletion. */
+  deletionAttempts: Map<string, string>;
+
   /** The fake ledger of invitation emails. */
   invitationEmails: RecordedEmail[];
 
@@ -121,6 +125,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
     seatEntitlements: new Map(),
     invitations: new Map(),
     directory: new Map(),
+    deletionAttempts: new Map(),
     invitationEmails: [],
     senderEmails: [],
     events: [],
@@ -214,6 +219,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
       seatEntitlements: new Map(this.tables.seatEntitlements),
       invitations: new Map(this.tables.invitations),
       directory: new Map(this.tables.directory),
+      deletionAttempts: new Map(this.tables.deletionAttempts),
       invitationEmails: [...this.tables.invitationEmails],
       senderEmails: [...this.tables.senderEmails],
       events: [...this.tables.events],
@@ -285,6 +291,8 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           tables.organizations.set(organization.id, organization.snapshot);
           return Promise.resolve();
         },
+        countActiveSeats: (organizationId: string): Promise<number | null> =>
+          Promise.resolve(tables.organizations.has(organizationId) ? seats(organizationId) : null),
         listOfUser: (
           userId: string,
           after: PagePosition | null,
@@ -306,7 +314,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                         slug: organization.slug,
                         role: member.role,
                         memberCount: seats(organization.id),
-                        plan: organization.plan,
+                        plan: (
+                          tables.seatEntitlements.get(organization.id) ?? FREE_SEAT_ENTITLEMENT
+                        ).plan,
                         joinedAt: member.joinedAt,
                       },
                       position: { key: searchKeyOf(organization.name), id: organization.id },
@@ -346,6 +356,17 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                 (member: MemberState) => member.userId === userId && member.removedAt === null,
               )
               .map((member: MemberState) => Member.restore(member)),
+          ),
+        listOwnedOrganizationIds: (userId: string, limit: number): Promise<readonly string[]> =>
+          Promise.resolve(
+            [...tables.members.values()]
+              .filter(
+                (member) =>
+                  member.userId === userId && member.removedAt === null && member.role === 'owner',
+              )
+              .map(({ organizationId }) => organizationId)
+              .sort()
+              .slice(0, limit),
           ),
         update: (member: Member): Promise<void> => {
           tables.members.set(member.id, member.snapshot);
@@ -586,7 +607,18 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
             state === undefined ? DirectoryUser.unknown(userId) : DirectoryUser.restore(state),
           );
         },
+        findForUpdate: (userId: string): Promise<DirectoryUser | null> => {
+          const state = tables.directory.get(userId);
+          return Promise.resolve(state === undefined ? null : DirectoryUser.restore(state));
+        },
+        findDeletionAttempt: (userId: string): Promise<string | null> =>
+          Promise.resolve(tables.deletionAttempts.get(userId) ?? null),
+        reserveDeletion: (userId: string, attemptId: string): Promise<void> => {
+          tables.deletionAttempts.set(userId, attemptId);
+          return Promise.resolve();
+        },
         save: (user: DirectoryUser): Promise<void> => {
+          if (user.isDeleted) tables.deletionAttempts.delete(user.userId);
           tables.directory.set(user.userId, user.snapshot);
           return Promise.resolve();
         },

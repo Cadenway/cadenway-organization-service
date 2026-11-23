@@ -13,12 +13,14 @@ import type { OrganizationView } from '../../projections/organizations/organizat
  * @param {Organization} organization - The organization.
  * @param {Role} role - Role of the reader in it.
  * @param {number} memberCount - Members that take a seat.
+ * @param {string} plan - The effective Billing plan.
  * @returns {OrganizationView} The view.
  */
 export function toOrganizationView(
   organization: Organization,
   role: Role,
   memberCount: number,
+  plan: string,
 ): OrganizationView {
   const state: OrganizationState = organization.snapshot;
   return {
@@ -29,7 +31,7 @@ export function toOrganizationView(
     website: state.website,
     logoId: state.logoId ?? null,
     defaultLanguage: state.defaultLanguage,
-    plan: state.plan,
+    plan,
     memberCount,
     role,
     createdAt: state.createdAt,

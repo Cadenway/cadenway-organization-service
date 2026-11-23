@@ -1,10 +1,12 @@
 import type {
+  BillingActiveSeatCount,
   BillingMembershipPage,
   BillingOrganizationPage,
 } from '@cadenway/contracts/types/internal/organization-service';
 import { getOrganizationContext, InternalAccess, ProblemException } from '@cadenway/nest-common';
 import { Controller, Get, Header, Query } from '@nestjs/common';
 
+import { GetBillingActiveSeatCount } from '../../../../application/use-cases/queries/billing/get-billing-active-seat-count/get-billing-active-seat-count.use-case.js';
 import { ListBillingMemberships } from '../../../../application/use-cases/queries/billing/list-billing-memberships/list-billing-memberships.use-case.js';
 import { ListSearchOrganizations } from '../../../../application/use-cases/queries/search/list-search-organizations/list-search-organizations.use-case.js';
 import { BillingMembershipsQuery } from '../../dto/input/billing/billing-memberships-query.dto.js';
@@ -23,6 +25,7 @@ export class BillingAuthorityController {
     private readonly organizations: ListSearchOrganizations,
     private readonly memberships: ListBillingMemberships,
     private readonly cursor: BillingAuthorityCursor,
+    private readonly activeSeats: GetBillingActiveSeatCount,
   ) {}
   // #endregion
 
@@ -88,6 +91,24 @@ export class BillingAuthorityController {
         items: [...page.items],
         nextCursor: this.cursor.write(page.nextPosition, 'memberships', organizationId),
       };
+    });
+  }
+
+  /** Counts current billable memberships in the tenant selected by the verified Billing token. */
+  @Get('billing-active-seats')
+  @InternalAccess({ organization: 'required' })
+  @Header('Cache-Control', 'private, no-store')
+  public async getActiveSeatCount(): Promise<BillingActiveSeatCount> {
+    const context = getOrganizationContext();
+    if (context?.actor.type !== 'system' || context.actor.id !== 'billing-service') {
+      throw new ProblemException({ status: 403, code: 'auth.actor-not-allowed' });
+    }
+    const organizationId = toOrganizationId();
+    return answerSearchAuthority(async () => {
+      const activeSeatCount = await this.activeSeats.execute(organizationId);
+      if (activeSeatCount === null)
+        throw new ProblemException({ status: 404, code: 'organization.not-found' });
+      return { activeSeatCount };
     });
   }
   // #endregion

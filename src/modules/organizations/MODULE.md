@@ -6,7 +6,7 @@ Organizations and who belongs to them, for P2b of the plan and the account chang
 P2c-2:
 
 - organizations: profile ("Profil de l'organisation": name, address slug, description, website,
-  default language and logo), the plan `free` until billing exists, the answers of the creation form
+  default language and logo), the effective plan projected from Billing, the answers of the creation form
   and the owner;
 - members: one membership per account and organization with its role (`owner`, `admin`, `member`,
   `guest`), kept after a removal with its last version;
@@ -110,6 +110,8 @@ or scopes.
 Billing uses `GET /internal/v1/billing-organizations` with the Billing system identity and no
 organization claim. `GET /internal/v1/billing-memberships` requires the Billing identity
 with an organization claim and returns the active and removed member versions for that tenant.
+`GET /internal/v1/billing-active-seats` uses the same scoped identity to return the current
+billable count in one read. Checkout is independent of the retained membership history.
 Notification uses `GET /internal/v1/quota-notification-recipients` and
 `POST /internal/v1/quota-notification-recipients/lookup` with its system identity and an
 organization claim. The list pages the current owners and administrators. The lookup rechecks
@@ -128,6 +130,11 @@ current projected limit and counts active owners, admins and members. It returns
 `409 organization.seat-quota-exceeded` when no seat remains. Existing active memberships keep
 their roles on acceptance. Pending invitations and active guests do not take seats. A refused
 mutation emits no fact.
+
+Organization profiles, the organization's list entry and accepted invitations read the
+current Billing plan from the same seat entitlement table. An organization without a projection
+starts on Free. The original organization row keeps its creation plan for older images and
+does not take part in these reads.
 
 The internal `ApplySeatEntitlement` operation uses the same lock to classify a verified Billing
 snapshot and apply it atomically using a one-row compare-and-set on the version classified.
@@ -270,6 +277,21 @@ Ops protects the stream between the Organization exporter and the Task importer.
   leaves a tombstone (`invitation.not-found`) and no synchronized account
   (`user.not-synchronized`), and a deletion that comes later waits for them and finds the new
   membership (the owner of a new organization refuses it).
+- `ReserveAccountDeletion` uses a system transaction restricted to one account. It locks that
+  account's directory entry, checks its active owner memberships, and stores the first deletion
+  attempt in the nullable `directory_users.deletion_attempt_id` added by migration `0009`.
+  Organization creation and invitation acceptance check the reservation under their shared
+  directory lock. Migration `0011` also rejects new active memberships, restorations of removed
+  memberships and promotions to owner for reserved or deleted accounts. The trigger holds the same
+  directory lock so the check also covers writes from a previous application image. Retrying the
+  same attempt reuses the reservation until the deletion event commits. A definitive owner refusal
+  includes up to 100 ordered organization IDs as evidence. The unscoped Identity system actor calls
+  `PUT /internal/v1/users/{userId}/account-deletion-reservations/{attemptId}`. Every response is
+  private and uncacheable. Enable the caller after migration `0011` and the Organization endpoint
+  are available. Keep a reservation-aware Organization rollback image once Identity can reserve
+  attempts. Before
+  restoring either service database, pause and drain the Identity deletion workers. Reconcile
+  outstanding claims and reservations against the restored authority before resuming deletion.
 - The directory tracks account status, member display and two-step verification. Its consumers
   retry on `DIRECTORY_REDELIVERY` (`application/models/directory/`): 1 s, 5 s, 30 s, 2 min, 10 min,
   30 min, then every hour, 32 deliveries, about 25 h 43 min before the dead letter. The same

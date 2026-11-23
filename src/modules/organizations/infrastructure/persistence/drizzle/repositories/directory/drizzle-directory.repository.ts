@@ -1,5 +1,5 @@
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 
 import type { DirectoryRepository } from '../../../../../application/ports/outbound/persistence/directory/directory-repository.port.js';
 import type { DirectoryUser } from '../../../../../domain/aggregates/directory-user/directory-user.aggregate.js';
@@ -112,6 +112,42 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
     return toDirectoryUser(row);
   }
 
+  /** Acquires the exclusive directory lock without creating a row. */
+  public async findForUpdate(userId: string): Promise<DirectoryUser | null> {
+    const [row] = await this.db
+      .select()
+      .from(directoryUsers)
+      .where(eq(directoryUsers.userId, userId))
+      .for('update');
+    return row === undefined ? null : toDirectoryUser(row);
+  }
+
+  /** Reads the reservation while the caller holds a shared or exclusive directory lock. */
+  public async findDeletionAttempt(userId: string): Promise<string | null> {
+    const [row] = await this.db
+      .select({ attemptId: directoryUsers.deletionAttemptId })
+      .from(directoryUsers)
+      .where(eq(directoryUsers.userId, userId));
+    return row?.attemptId ?? null;
+  }
+
+  /** Writes the first reservation without replacing a different attempt. */
+  public async reserveDeletion(userId: string, attemptId: string): Promise<void> {
+    const changed = await this.db
+      .update(directoryUsers)
+      .set({ deletionAttemptId: attemptId })
+      .where(
+        and(
+          eq(directoryUsers.userId, userId),
+          eq(directoryUsers.deleted, false),
+          isNull(directoryUsers.deletionAttemptId),
+        ),
+      )
+      .returning({ userId: directoryUsers.userId });
+    if (changed.length !== 1)
+      throw new Error('The locked account cannot be reserved for deletion.');
+  }
+
   /**
    * Method save
    *
@@ -135,6 +171,7 @@ export class DrizzleDirectoryRepository implements DirectoryRepository {
         twoStepVerificationEnabled: state.twoStepVerificationEnabled,
         twoStepVerificationVersion: state.twoStepVerificationVersion,
         deleted: state.deleted,
+        deletionAttemptId: state.deleted ? null : undefined,
         updatedAt: sql`now()`,
       })
       .where(eq(directoryUsers.userId, state.userId));

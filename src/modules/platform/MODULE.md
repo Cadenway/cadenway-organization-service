@@ -32,6 +32,12 @@ Created by `migrations/0000_platform_tables.sql`, owned by the migrator role
 `organization_migrator`. The application role `organization_app` reads and writes their rows and
 holds no DDL right on them.
 
+Migration `0010_outbox_leases.sql` adds the nullable outbox lease fields and their checks.
+The dedicated migrator session finalizes the concurrent expiry index and validates the checks
+after Drizzle commits. Re-running the migrator resumes finalization after interruption. The
+existing relay continues to publish with its original status transitions. Keep the expanded
+schema when rolling back the application.
+
 ## API
 
 None. The `Idempotency-Key` interceptor of `DatabaseModule` (`idempotency: true`) stores the key and

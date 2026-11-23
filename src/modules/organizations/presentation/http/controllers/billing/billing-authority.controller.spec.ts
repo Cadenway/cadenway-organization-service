@@ -1,7 +1,9 @@
 import { runWithOrganizationContext } from '@cadenway/nest-common';
 import { describe, expect, it, vi } from 'vitest';
 
+import { GetBillingActiveSeatCount } from '../../../../application/use-cases/queries/billing/get-billing-active-seat-count/get-billing-active-seat-count.use-case.js';
 import { ListBillingMemberships } from '../../../../application/use-cases/queries/billing/list-billing-memberships/list-billing-memberships.use-case.js';
+import { InMemoryOrganizations } from '../../../../application/use-cases/organizations.fixture.js';
 import { ListSearchOrganizations } from '../../../../application/use-cases/queries/search/list-search-organizations/list-search-organizations.use-case.js';
 import { BillingAuthorityCursor } from '../../mappers/billing/billing-authority-cursor.mapper.js';
 import { BillingAuthorityController } from './billing-authority.controller.js';
@@ -29,6 +31,7 @@ describe('BillingAuthorityController', () => {
       new ListSearchOrganizations({ read: vi.fn() }),
       new ListBillingMemberships({ read }),
       new BillingAuthorityCursor(Buffer.alloc(32, 7).toString('base64url')),
+      new GetBillingActiveSeatCount(new InMemoryOrganizations()),
     );
 
     const response = await runWithOrganizationContext(context, () =>
@@ -49,6 +52,7 @@ describe('BillingAuthorityController', () => {
       new ListSearchOrganizations({ read: vi.fn() }),
       new ListBillingMemberships({ read: vi.fn().mockResolvedValue(null) }),
       new BillingAuthorityCursor(Buffer.alloc(32, 7).toString('base64url')),
+      new GetBillingActiveSeatCount(new InMemoryOrganizations()),
     );
     await expect(
       runWithOrganizationContext(context, () => controller.listMemberships({ limit: 10 })),

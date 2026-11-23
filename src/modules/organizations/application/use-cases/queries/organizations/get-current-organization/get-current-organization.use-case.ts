@@ -1,5 +1,6 @@
 import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import { readSeatEntitlement } from '../../../../services/members/seat-limit.service.js';
 import { toOrganizationView } from '../../../../mappers/organizations/organization-view.mapper.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
@@ -74,6 +75,7 @@ export class GetCurrentOrganization {
           organization,
           actor.role,
           await store.members.countSeats(input.organizationId),
+          (await readSeatEntitlement(store, input.organizationId)).plan,
         );
       },
       { readOnly: true },

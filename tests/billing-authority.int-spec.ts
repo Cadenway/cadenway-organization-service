@@ -2,6 +2,7 @@ import { generateKeyPairSync } from 'node:crypto';
 
 import {
   CheckAutomationRecipientInternalResponse,
+  GetBillingActiveSeatCountInternalResponse,
   ListBillingMembershipsInternalResponse,
   ListBillingOrganizationsInternalResponse,
   ListQuotaNotificationRecipientsInternalResponse,
@@ -170,6 +171,45 @@ describe('signed Billing and quota notification authorities', () => {
       lookup.body as unknown,
     );
     expect(lookupBody.items).toEqual([ownerId]);
+  });
+
+  it('counts current seats in one signed read after more than a page of membership history', async () => {
+    await stack.system(
+      `insert into members (organization_id, user_id, role, joined_at, removed_at)
+       select $1::uuid, uuidv7(), 'guest', now(), null::timestamptz from generate_series(1, 56)
+       union all
+       select $1::uuid, uuidv7(), 'member', now(), now() from generate_series(1, 55)
+       union all
+       select id, owner_user_id, 'owner', now(), null::timestamptz
+         from organizations where id = $1::uuid`,
+      [otherOrganizationId],
+    );
+    const tenant = await token(billing, 'billing-service', otherOrganizationId);
+    const route = '/internal/v1/billing-active-seats';
+
+    const counted = await request(app.getHttpServer())
+      .get(route)
+      .set('Authorization', tenant)
+      .set('If-None-Match', '*');
+    expect(counted.status).toBe(200);
+    expect(counted.headers['cache-control']).toBe('private, no-store');
+    expect(GetBillingActiveSeatCountInternalResponse.parse(counted.body as unknown)).toEqual({
+      activeSeatCount: 1,
+    });
+
+    const wrongIssuer = await token(notification, 'notification-service', otherOrganizationId);
+    const unscoped = await token(billing, 'billing-service', null);
+    const unknownTenant = await token(billing, 'billing-service', newId());
+    const responses = await Promise.all([
+      request(app.getHttpServer()).get(route),
+      request(app.getHttpServer()).get(route).set('Authorization', wrongIssuer),
+      request(app.getHttpServer()).get(route).set('Authorization', unscoped),
+      request(app.getHttpServer()).get(route).set('Authorization', unknownTenant),
+    ]);
+    expect(responses.map(({ status }) => status)).toEqual([401, 403, 403, 404]);
+    for (const response of responses) {
+      expect(response.headers['cache-control']).toBe('private, no-store');
+    }
   });
 
   it('refuses missing, foreign and incorrectly scoped authorities without caching errors', async () => {

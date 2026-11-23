@@ -2,6 +2,7 @@ import type { DirectoryUser } from '../../../../../domain/aggregates/directory-u
 import { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
+import { FREE_SEAT_ENTITLEMENT } from '../../../../../domain/value-objects/billing/seat-entitlement.value-object.js';
 import { distinctAddresses } from '../../../../../domain/policies/invitations/invitation-batch.policy.js';
 import {
   assertInvitationEmailsAvailable,
@@ -114,6 +115,10 @@ export class CreateOrganization {
           if (creator === null || creatorName === null || !creator.isSynchronized) {
             throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
           }
+          const deletionAttempt = await store.directory.findDeletionAttempt(input.actorUserId);
+          if (deletionAttempt !== null) {
+            throw new OrganizationRefusal({ reason: 'user-not-synchronized' });
+          }
           const needed = addresses.filter(
             (address) => !creator.verifiedEmail?.equals(address),
           ).length;
@@ -141,7 +146,10 @@ export class CreateOrganization {
                   }),
             );
           }
-          return { organization: toOrganizationView(organization, 'owner', 1), invitations };
+          return {
+            organization: toOrganizationView(organization, 'owner', 1, FREE_SEAT_ENTITLEMENT.plan),
+            invitations,
+          };
         },
       );
     } catch (error) {

@@ -83,9 +83,9 @@ const allTables = [...platformTables, ...businessTables].sort();
  * Migrations of `migrations/`: the platform tables, the organizations module, the ledger of
  * invitation emails, the former members of the user directory, its two-step verification, then
  * the logo reference and upload reservations, the billing membership index and the seat
- * entitlement projection and the sender budget ledger.
+ * entitlement projection, the sender budget ledger, and the account deletion reservation and guard.
  */
-const migrationCount = 9;
+const migrationCount = 12;
 
 /**
  * Runs `docker compose` on the throwaway project.

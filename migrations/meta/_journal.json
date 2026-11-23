@@ -64,6 +64,27 @@
       "when": 1795365800405,
       "tag": "0008_invitation_sender_budget",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1795381226958,
+      "tag": "0009_account_deletion_reservation",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1795423979224,
+      "tag": "0010_outbox_leases",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1795425072698,
+      "tag": "0011_enforce_membership_deletion_reservations",
+      "breakpoints": true
     }
   ]
 }

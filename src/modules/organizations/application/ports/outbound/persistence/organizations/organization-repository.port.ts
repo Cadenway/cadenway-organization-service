@@ -36,6 +36,9 @@ export interface OrganizationRepository {
    */
   find(organizationId: string): Promise<Organization | null>;
 
+  /** Returns active billable seats, or null if the organization does not exist. */
+  countActiveSeats(organizationId: string): Promise<number | null>;
+
   /**
    * Method findForUpdate
    *
