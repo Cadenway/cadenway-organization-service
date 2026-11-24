@@ -5,6 +5,7 @@ import { InvalidOrganizationNameError } from '../../errors/organizations/invalid
 import { InvalidStoredStateError } from '../../errors/organizations/invalid-stored-state.error.js';
 import { InvalidWebsiteError } from '../../errors/organizations/invalid-website.error.js';
 import { SlugInvalidError } from '../../errors/organizations/slug-invalid.error.js';
+import { SlugReservedError } from '../../errors/organizations/slug-reserved.error.js';
 import type { OrganizationDraft } from '../../value-objects/organizations/organization-draft.value-object.js';
 import type { OrganizationUpdate } from '../../value-objects/organizations/organization-update.value-object.js';
 import { Organization } from './organization.aggregate.js';
@@ -63,6 +64,20 @@ describe('Organization', () => {
     );
   });
 
+  it('refuses a reserved address, given or derived from the name', () => {
+    const founding = { teamSize: '6-20', primaryUse: 'other', ownerUserId: CAMILLE_ID };
+
+    expect(() =>
+      Organization.found({ ...founding, name: 'Atelier Nord', slug: 'organizations' }, CREATED_AT),
+    ).toThrow(SlugReservedError);
+    expect(() => Organization.found({ ...founding, name: 'Home', slug: null }, CREATED_AT)).toThrow(
+      SlugReservedError,
+    );
+    expect(
+      Organization.found({ ...founding, name: 'Home', slug: 'atelier-home' }, CREATED_AT).slug,
+    ).toBe('atelier-home');
+  });
+
   it('refuses a name made only of spaces, or longer than 120 characters', () => {
     const founding = { slug: null, teamSize: '1-5', primaryUse: 'other', ownerUserId: CAMILLE_ID };
 
@@ -116,6 +131,24 @@ describe('Organization', () => {
       InvalidWebsiteError,
     );
     expect(() => organization.change({ slug: 'Atelier Nord' })).toThrow(SlugInvalidError);
+  });
+
+  it('refuses a new reserved address, and keeps a current one that became reserved', () => {
+    expect(() => atelierNord().change({ slug: 'account' })).toThrow(SlugReservedError);
+
+    const reserved: Organization = Organization.restore({
+      ...atelierNord().snapshot,
+      slug: 'home',
+    });
+    const update: OrganizationUpdate = reserved.change({
+      slug: 'home',
+      website: 'https://ateliernord.fr',
+    });
+
+    expect(update.changed).toEqual(['website']);
+    expect(update.organization.snapshot).toMatchObject({ slug: 'home', version: 2 });
+    expect(() => reserved.change({ slug: 'login' })).toThrow(SlugReservedError);
+    expect(reserved.change({ slug: 'atelier-nord' }).changed).toEqual(['slug']);
   });
 
   it('refuses a stored organization without a positive version', () => {

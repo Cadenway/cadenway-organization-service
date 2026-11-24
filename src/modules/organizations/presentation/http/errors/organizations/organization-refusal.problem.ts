@@ -92,6 +92,8 @@ function shapeOf(refusal: Refusal): ProblemShape {
       return { status: 409, code: 'organization.slug-taken', details: { slug: refusal.slug } };
     case 'slug-invalid':
       return { status: 422, code: 'organization.slug-invalid', details: { slug: refusal.slug } };
+    case 'slug-reserved':
+      return { status: 422, code: 'organization.slug-reserved', details: { slug: refusal.slug } };
     case 'version-mismatch':
       return {
         status: 412,

@@ -87,8 +87,8 @@ export class CreateOrganization {
    *
    * @param {CreateOrganizationInput} input - The form and its creator.
    * @returns {Promise<CreateOrganizationOutput>} The organization and the invitation outcomes.
-   * @throws {OrganizationRefusal} `invalid-field`, `slug-invalid`, `slug-taken` or
-   * `user-not-synchronized`.
+   * @throws {OrganizationRefusal} `invalid-field`, `slug-invalid`, `slug-reserved`, `slug-taken`
+   * or `user-not-synchronized`.
    */
   public async execute(input: CreateOrganizationInput): Promise<CreateOrganizationOutput> {
     try {

@@ -145,10 +145,10 @@ members keep their access if the organization is over the reduced limit.
 
 | Route                                                      | Organization | Success                 | Refusals                                                                                                                                                  |
 | ---------------------------------------------------------- | ------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /internal/v1/organizations`                          | None         | 201, `Location`, `ETag` | 400, 404 `user.not-synchronized`, 409 `organization.slug-taken`, 422 `organization.slug-invalid`                                                          |
+| `POST /internal/v1/organizations`                          | None         | 201, `Location`, `ETag` | 400, 404 `user.not-synchronized`, 409 `organization.slug-taken`, 422 `organization.slug-invalid` or `organization.slug-reserved`                          |
 | `GET /internal/v1/organizations`                           | None         | 200                     | 400                                                                                                                                                       |
 | `GET /internal/v1/organization`                            | Required     | 200, `ETag`             | 404 `organization.not-found`                                                                                                                              |
-| `PATCH /internal/v1/organization`                          | Required     | 200, `ETag`             | 400, 403 `organization.role-forbidden`, 404, 409 `organization.slug-taken`, 412 `request.version-mismatch`                                                |
+| `PATCH /internal/v1/organization`                          | Required     | 200, `ETag`             | 400, 403 `organization.role-forbidden`, 404, 409 `organization.slug-taken`, 412 `request.version-mismatch`, 422 `organization.slug-reserved`              |
 | `POST /internal/v1/organization/logo/uploads`              | Required     | 201, `Location`         | 400, 403, 404, 409 key reuse, 422 unsupported declaration or size                                                                                         |
 | `GET /internal/v1/organization/logo/uploads/{uploadId}`    | Required     | 200                     | 400, 403, 404, 409 expired or superseded                                                                                                                  |
 | `PUT /internal/v1/organization/logo`                       | Required     | 204, `ETag`             | 400, 403, 404, 409 expired or superseded, 412 `request.version-mismatch`                                                                                  |
@@ -366,6 +366,10 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
 - The address is derived from the name as the creation form does (accents removed, lowercase,
   other runs to `-`, dashes trimmed, cut to 63, a trailing dash of the cut dropped); fewer than 2
   characters answers 422; unique across organizations, decided by the unique index (decision 10).
+- An address, given or derived, that the web application keeps as the first path segment of its
+  own pages (the list of `Slug` in `openapi/public/organizations.yaml`) answers
+  `422 organization.slug-reserved`. A patch that sends the current address back keeps it, even
+  when it became reserved after it was chosen; no migration renames such an address.
 - A name is trimmed, 1 to 120 characters; a description has 280 characters at most; a website is
   an absolute http or https URL without credentials nor unencoded quotes, spaces or angle brackets
   (any other scheme, such as `javascript:`, is refused with 400).
@@ -471,6 +475,11 @@ Any failure rolls back the business rows and the outbox rows together
 
 ## Decisions
 
+- Reserved addresses (B19 of the webapp rebuild): a new code `organization.slug-reserved` rather
+  than a reason on `organization.slug-invalid`, so that a client that only knows the latter never
+  shows its length message for a reserved address. An address that becomes reserved after it was
+  chosen is kept, and a patch may send it back unchanged; no migration renames it. Count such
+  addresses in each environment before a release that reserves more.
 - The decisions of P2b this module applies, from the plan of the phase (the user may revise them):
   1. Roles `owner`, `admin`, `member`, `guest`; one owner, the creator; the owner and the admins
      update the organization, invite, change roles and remove members; nobody changes the role of

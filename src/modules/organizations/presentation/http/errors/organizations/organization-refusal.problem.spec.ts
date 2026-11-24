@@ -28,6 +28,12 @@ describe('answerRefusals', () => {
       [{ reason: 'role-forbidden' }, 403, 'organization.role-forbidden', undefined],
       [{ reason: 'slug-taken', slug: 'lumen' }, 409, 'organization.slug-taken', { slug: 'lumen' }],
       [{ reason: 'slug-invalid', slug: 'e' }, 422, 'organization.slug-invalid', { slug: 'e' }],
+      [
+        { reason: 'slug-reserved', slug: 'home' },
+        422,
+        'organization.slug-reserved',
+        { slug: 'home' },
+      ],
       [{ reason: 'version-mismatch', version: 4 }, 412, 'request.version-mismatch', { version: 4 }],
       [{ reason: 'member-not-found' }, 404, 'member.not-found', undefined],
       [{ reason: 'owner-protected' }, 422, 'member.owner-protected', undefined],

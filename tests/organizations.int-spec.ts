@@ -473,11 +473,18 @@ describe('organizations, members and invitations', () => {
       );
     });
 
-    it('refuses an address taken, too short or not valid, and a blank name', async () => {
+    it('refuses an address taken, too short, reserved or not valid, and a blank name', async () => {
       const taken = await call('post', '/internal/v1/organizations', ines, null, {
         name: 'Atelier  Nord !',
       });
       const short = await call('post', '/internal/v1/organizations', ines, null, { name: 'é' });
+      const derivedReserved = await call('post', '/internal/v1/organizations', ines, null, {
+        name: 'Home',
+      });
+      const givenReserved = await call('post', '/internal/v1/organizations', ines, null, {
+        name: 'Atelier Sud',
+        slug: 'login',
+      });
       const blank = await call('post', '/internal/v1/organizations', ines, null, { name: '   ' });
       const malformed = await call('post', '/internal/v1/organizations', ines, null, {
         name: 'Lumen',
@@ -493,6 +500,16 @@ describe('organizations, members and invitations', () => {
       expect(short.body).toMatchObject({
         code: 'organization.slug-invalid',
         details: { slug: 'e' },
+      });
+      expect(derivedReserved.status).toBe(422);
+      expect(derivedReserved.body).toMatchObject({
+        code: 'organization.slug-reserved',
+        details: { slug: 'home' },
+      });
+      expect(givenReserved.status).toBe(422);
+      expect(givenReserved.body).toMatchObject({
+        code: 'organization.slug-reserved',
+        details: { slug: 'login' },
       });
       expect(blank.status).toBe(400);
       expect(blank.body).toMatchObject({ code: 'request.invalid' });
@@ -585,6 +602,9 @@ describe('organizations, members and invitations', () => {
       const taken = await call('patch', '/internal/v1/organization', camille, atelierNordId, {
         slug: 'lumen',
       });
+      const reserved = await call('patch', '/internal/v1/organization', camille, atelierNordId, {
+        slug: 'account',
+      });
       const blank = await call('patch', '/internal/v1/organization', camille, atelierNordId, {
         name: '  ',
       });
@@ -608,6 +628,11 @@ describe('organizations, members and invitations', () => {
       expect(script.body).toMatchObject({ code: 'request.invalid' });
       expect(taken.status).toBe(409);
       expect(taken.body).toMatchObject({ code: 'organization.slug-taken' });
+      expect(reserved.status).toBe(422);
+      expect(reserved.body).toMatchObject({
+        code: 'organization.slug-reserved',
+        details: { slug: 'account' },
+      });
       expect(blank.status).toBe(400);
       expect(malformed.status).toBe(400);
       expect(malformed.body).toMatchObject({
@@ -2173,6 +2198,43 @@ describe('organizations, members and invitations', () => {
     expect(
       await outboxCount('organization.logo-changed.v1', 'organizationId', organizationId),
     ).toBe(2);
+  });
+
+  it('keeps a current address that became reserved and refuses moving to another one', async () => {
+    await vi.waitFor(
+      async () => {
+        expect(await directoryOf(camille)).toMatchObject({ email_verified: true });
+      },
+      { timeout: 15_000 },
+    );
+    const create = await call('post', '/internal/v1/organizations', camille, null, {
+      name: 'Studio Pivot',
+    });
+    expect(create.status).toBe(201);
+    const organizationId = (create.body as OrganizationCreated).organization.id;
+    await stack.system(`update organizations set slug = 'home' where id = $1`, [organizationId]);
+
+    const kept = await call('patch', '/internal/v1/organization', camille, organizationId, {
+      name: 'Studio Pivot Lyon',
+      slug: 'home',
+    });
+    const unchanged = await call('patch', '/internal/v1/organization', camille, organizationId, {
+      slug: 'home',
+    });
+    const moved = await call('patch', '/internal/v1/organization', camille, organizationId, {
+      slug: 'login',
+    });
+
+    expect(kept.status).toBe(200);
+    expect(kept.body).toMatchObject({ name: 'Studio Pivot Lyon', slug: 'home', version: 2 });
+    expect(unchanged.status).toBe(200);
+    expect(unchanged.body).toMatchObject({ slug: 'home', version: 2 });
+    expect(moved.status).toBe(422);
+    expect(moved.body).toMatchObject({
+      code: 'organization.slug-reserved',
+      details: { slug: 'login' },
+    });
+    expect(await outboxCount('organization.updated.v1', 'organizationId', organizationId)).toBe(1);
   });
 
   it('answers only the client errors each operation declares in the contract', () => {
