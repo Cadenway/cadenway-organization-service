@@ -129,4 +129,23 @@ describe('CreateOrganization', () => {
     );
     expect(store.tables.organizations.size).toBe(1);
   });
+
+  it('creates nothing for an address the web application reserves, given or derived', async () => {
+    const form = {
+      actorUserId: CAMILLE_ID,
+      teamSize: '6-20',
+      primaryUse: 'other',
+      inviteEmails: ['ines.robert@ateliernord.fr'],
+    };
+
+    await expect(create.execute({ ...form, name: 'Home', slug: null })).rejects.toMatchObject({
+      refusal: { reason: 'slug-reserved', slug: 'home' },
+    });
+    await expect(
+      create.execute({ ...form, name: 'Atelier Nord', slug: 'login' }),
+    ).rejects.toMatchObject({ refusal: { reason: 'slug-reserved', slug: 'login' } });
+    expect(store.tables.organizations.size).toBe(0);
+    expect(store.tables.invitationEmails).toEqual([]);
+    expect(store.tables.events).toEqual([]);
+  });
 });

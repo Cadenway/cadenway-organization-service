@@ -20,10 +20,10 @@ import type { UpdateOrganizationInput } from './update-organization.input.js';
  * Applies a JSON Merge Patch to the organization of the request (`PATCH /internal/v1/organization`)
  * in its tenant transaction. Checks, in order: the actor belongs to it (`organization-not-found`),
  * is its owner or an admin (`role-forbidden`), and made the change from its current version when
- * `If-Match` is given (`version-mismatch`); then the domain checks the patch and the unique index
- * the address (`slug-taken`). A patch that moves something writes the next version and appends
- * `organization.updated.v1` in the same transaction; one that moves nothing answers the same
- * version and appends nothing.
+ * `If-Match` is given (`version-mismatch`); then the domain checks the patch (`invalid-field`, a
+ * new address that is reserved: `slug-reserved`) and the unique index the address (`slug-taken`).
+ * A patch that moves something writes the next version and appends `organization.updated.v1` in
+ * the same transaction; one that moves nothing answers the same version and appends nothing.
  */
 export class UpdateOrganization {
   // #region Properties
@@ -64,7 +64,7 @@ export class UpdateOrganization {
    * @param {UpdateOrganizationInput} input - The patch, its actor and its organization.
    * @returns {Promise<OrganizationView>} The organization after the change.
    * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden`, `version-mismatch`,
-   * `invalid-field` or `slug-taken`.
+   * `invalid-field`, `slug-reserved` or `slug-taken`.
    */
   public async execute(input: UpdateOrganizationInput): Promise<OrganizationView> {
     try {

@@ -12,6 +12,7 @@ import { InvalidDescriptionError } from '../../../domain/errors/organizations/in
 import { InvalidOrganizationNameError } from '../../../domain/errors/organizations/invalid-organization-name.error.js';
 import { InvalidWebsiteError } from '../../../domain/errors/organizations/invalid-website.error.js';
 import { SlugInvalidError } from '../../../domain/errors/organizations/slug-invalid.error.js';
+import { SlugReservedError } from '../../../domain/errors/organizations/slug-reserved.error.js';
 import { SlugTakenError } from '../../../domain/errors/organizations/slug-taken.error.js';
 import { OrganizationRefusal } from '../../models/refusals/organization-refusal.model.js';
 import type { Refusal } from '../../models/refusals/refusal.model.js';
@@ -47,6 +48,9 @@ function refusalOf(error: unknown): Refusal | null {
   }
   if (error instanceof SlugInvalidError) {
     return { reason: 'slug-invalid', slug: error.slug };
+  }
+  if (error instanceof SlugReservedError) {
+    return { reason: 'slug-reserved', slug: error.slug };
   }
   if (error instanceof SlugTakenError) {
     return { reason: 'slug-taken', slug: error.slug };

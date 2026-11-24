@@ -93,6 +93,24 @@ describe('UpdateOrganization, GetCurrentOrganization and ListMyOrganizations', (
     ).rejects.toMatchObject({ refusal: { reason: 'invalid-field', field: 'website' } });
   });
 
+  it('refuses a reserved address and leaves the organization as it was', async () => {
+    await expect(
+      update.execute({
+        actorUserId: CAMILLE.id,
+        organizationId: scenario.organizationId,
+        change: { slug: 'account', website: 'https://ateliernord.fr' },
+        expectedVersion: null,
+      }),
+    ).rejects.toMatchObject({ refusal: { reason: 'slug-reserved', slug: 'account' } });
+
+    const read: OrganizationView = await new GetCurrentOrganization(scenario.store).execute({
+      actorUserId: CAMILLE.id,
+      organizationId: scenario.organizationId,
+    });
+    expect(read).toMatchObject({ slug: 'atelier-nord', website: null, version: 1 });
+    expect(scenario.store.tables.events).toEqual([]);
+  });
+
   it('reads the organization for every member, and lists the organizations of an account', async () => {
     await new CreateOrganization(scenario.store, scenario.clock).execute({
       actorUserId: INES.id,

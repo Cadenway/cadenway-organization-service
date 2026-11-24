@@ -14,6 +14,7 @@ export type Refusal =
   | { readonly reason: 'role-forbidden' }
   | { readonly reason: 'slug-taken'; readonly slug: string }
   | { readonly reason: 'slug-invalid'; readonly slug: string }
+  | { readonly reason: 'slug-reserved'; readonly slug: string }
   | { readonly reason: 'version-mismatch'; readonly version: number }
   | { readonly reason: 'member-not-found' }
   | { readonly reason: 'owner-protected' }

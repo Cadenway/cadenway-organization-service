@@ -118,6 +118,7 @@ export class Organization {
    * @returns {OrganizationDraft} The organization to store.
    * @throws {InvalidOrganizationNameError} When the name is blank or too long.
    * @throws {SlugInvalidError} When the given or derived address is not valid.
+   * @throws {SlugReservedError} When the given or derived address is reserved.
    */
   public static found(founding: OrganizationFounding, now: Date): OrganizationDraft {
     const name: string = Organization.checkedName(founding.name);
@@ -215,12 +216,15 @@ export class Organization {
    *
    * @description
    * Applies a JSON Merge Patch of the profile: a member left out is unchanged, `null` clears the
-   * description or the website. When something moves, the version goes up by one.
+   * description or the website. When something moves, the version goes up by one. The current
+   * address sent back is kept unchecked, so an organization whose address became reserved after
+   * it was chosen can still change its other members (`PATCH /v1/organization`).
    *
    * @param {OrganizationChange} change - The patch.
    * @returns {OrganizationUpdate} The organization after the change and the members that moved.
    * @throws {InvalidOrganizationNameError} When the new name is blank or too long.
    * @throws {SlugInvalidError} When the new address is not valid.
+   * @throws {SlugReservedError} When the new address is reserved.
    * @throws {InvalidDescriptionError} When the new description is too long.
    * @throws {InvalidWebsiteError} When the new website is not an http or https URL.
    */
@@ -233,7 +237,10 @@ export class Organization {
       defaultLanguage: OrganizationState['defaultLanguage'];
     } = {
       name: change.name === undefined ? this.state.name : Organization.checkedName(change.name),
-      slug: change.slug === undefined ? this.state.slug : Slug.parse(change.slug).value,
+      slug:
+        change.slug === undefined || change.slug === this.state.slug
+          ? this.state.slug
+          : Slug.parse(change.slug).value,
       description:
         change.description === undefined
           ? this.state.description

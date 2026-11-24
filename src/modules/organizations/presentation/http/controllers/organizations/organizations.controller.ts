@@ -131,7 +131,7 @@ export class OrganizationsController {
    * @description
    * `POST /internal/v1/organizations`: `201` with the organization and the invitation outcomes,
    * `Location` and `ETag`; `400`, `404 user.not-synchronized`, `409 organization.slug-taken`,
-   * `422 organization.slug-invalid`.
+   * `422 organization.slug-invalid` or `organization.slug-reserved`.
    *
    * @param {CreateOrganizationBody} body - The creation form.
    * @param {Response} response - The response, for its headers.
@@ -212,7 +212,8 @@ export class OrganizationsController {
    * @description
    * `PATCH /internal/v1/organization`: `200` with the organization after the change and its `ETag`;
    * `400`, `403 organization.role-forbidden`, `404 organization.not-found`,
-   * `409 organization.slug-taken`, `412 request.version-mismatch`.
+   * `409 organization.slug-taken`, `412 request.version-mismatch`,
+   * `422 organization.slug-reserved`.
    *
    * @param {UpdateOrganizationBody} body - The JSON Merge Patch.
    * @param {string | undefined} ifMatch - The `If-Match` header.
