@@ -154,6 +154,7 @@ members keep their access if the organization is over the reduced limit.
 | `PUT /internal/v1/organization/logo`                       | Required     | 204, `ETag`             | 400, 403, 404, 409 expired or superseded, 412 `request.version-mismatch`                                                                                  |
 | `DELETE /internal/v1/organization/logo`                    | Required     | 204, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`                                                                                                             |
 | `GET /internal/v1/members`                                 | Required     | 200                     | 400, 403 `organization.role-forbidden`, 404 `organization.not-found`                                                                                      |
+| `QUERY /internal/v1/members`                               | Required     | 200                     | 400, 403 `organization.role-forbidden`, 404 `organization.not-found`                                                                                      |
 | `POST /internal/v1/member-names/lookup`                    | Required     | 200                     | 400, 404 `organization.not-found`                                                                                                                         |
 | `GET /internal/v1/members/{memberId}`                      | Required     | 200, `ETag`             | 400, 403, 404 `member.not-found`                                                                                                                          |
 | `PATCH /internal/v1/members/{memberId}`                    | Required     | 200, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`, 422 `member.owner-protected`                                                                               |
@@ -421,7 +422,7 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - Tenant transaction of the organization of the token: reading and patching the organization,
   every member and invitation route. The membership of the actor, the change, its version check
   and its event commit together.
-- `GET /internal/v1/members` opens a tenant `REPEATABLE READ READ ONLY` transaction for the
+- `GET` and `QUERY /internal/v1/members` open a tenant `REPEATABLE READ READ ONLY` transaction for the
   permission check, the page, the filtered total and the counts by role.
 - `GET /internal/v1/search-membership` opens a tenant `REPEATABLE READ READ ONLY` transaction and
   reads the active membership of the delegated user in the token's organization.
