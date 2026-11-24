@@ -34,7 +34,7 @@ import { TenantTransactionRunner } from '@cadenway/nest-common/database';
 import { OutboxWriter } from '@cadenway/nest-messaging/outbox';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import type { Response } from 'supertest';
+import type { Response, Test } from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { DeclaredErrors } from './support/declared-errors.js';
@@ -168,14 +168,14 @@ describe('organizations, members and invitations', () => {
    * @returns The response.
    */
   async function call(
-    method: 'get' | 'post' | 'put' | 'patch' | 'delete',
+    method: 'get' | 'query' | 'post' | 'put' | 'patch' | 'delete',
     path: string,
     account: Account | null,
     organizationId: string | null,
     body?: object | string,
     headers: Readonly<Record<string, string>> = {},
   ): Promise<Response> {
-    let pending = request(app.getHttpServer())[method](path);
+    let pending = request(app.getHttpServer())[method](path) as Test;
     if (account !== null) {
       pending = pending.set('Authorization', await stack.bearer(account.id, organizationId));
     }
@@ -1137,6 +1137,98 @@ describe('organizations, members and invitations', () => {
   });
 
   describe('members', () => {
+    it('returns the same filtered pages through GET and QUERY', async () => {
+      const getFirst = await call(
+        'get',
+        '/internal/v1/members?role=owner,admin&limit=1',
+        camille,
+        atelierNordId,
+      );
+      const queryFirst = await call('query', '/internal/v1/members', camille, atelierNordId, {
+        role: ['owner', 'admin'],
+        limit: 1,
+      });
+      expect(queryFirst.status).toBe(200);
+      conforms(ListMembersInternalResponse, queryFirst);
+      expect(queryFirst.body).toEqual(getFirst.body);
+      const cursor = (getFirst.body as MemberPage).nextCursor ?? '';
+      const getSecond = await call(
+        'get',
+        `/internal/v1/members?role=owner,admin&limit=1&cursor=${encodeURIComponent(cursor)}`,
+        camille,
+        atelierNordId,
+      );
+      const querySecond = await call('query', '/internal/v1/members', camille, atelierNordId, {
+        role: ['owner', 'admin'],
+        limit: 1,
+        cursor,
+      });
+      expect(querySecond.status).toBe(200);
+      expect(querySecond.body).toEqual(getSecond.body);
+
+      const getSearch = await call(
+        'get',
+        '/internal/v1/members?search=INES',
+        camille,
+        atelierNordId,
+      );
+      const querySearch = await call('query', '/internal/v1/members', camille, atelierNordId, {
+        search: 'INES',
+      });
+      expect(querySearch.status).toBe(200);
+      expect(querySearch.body).toEqual(getSearch.body);
+    });
+
+    it('enforces member access, organization isolation and body validation for QUERY', async () => {
+      const guest = await call('query', '/internal/v1/members', nadia, atelierNordId, {});
+      const guestGet = await call('get', '/internal/v1/members', nadia, atelierNordId);
+      const outsider = await call('query', '/internal/v1/members', camille, lumenId, {});
+      const outsiderGet = await call('get', '/internal/v1/members', camille, lumenId);
+      const invalid = await call('query', '/internal/v1/members', camille, atelierNordId, {
+        role: ['invalid'],
+        limit: 0,
+      });
+      const missing = await call('query', '/internal/v1/members', camille, atelierNordId);
+      const emptyJson = await call(
+        'query',
+        '/internal/v1/members',
+        camille,
+        atelierNordId,
+        undefined,
+        { 'Content-Type': 'application/json', 'Content-Length': '0' },
+      );
+      const emptyObject = await call('query', '/internal/v1/members', camille, atelierNordId, {});
+      const wrongContentType = await call(
+        'query',
+        '/internal/v1/members',
+        camille,
+        atelierNordId,
+        '{}',
+        { 'Content-Type': 'text/plain' },
+      );
+      const form = await call(
+        'query',
+        '/internal/v1/members',
+        camille,
+        atelierNordId,
+        'search=INES',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+      );
+      expect(guest.status).toBe(guestGet.status);
+      expect(guest.status).toBe(403);
+      expect(outsider.status).toBe(outsiderGet.status);
+      expect(outsider.status).toBe(404);
+      expect(invalid.status).toBe(400);
+      expect(invalid.body).toMatchObject({ code: 'request.invalid' });
+      expect(missing.status).toBe(400);
+      expect(emptyJson.status).toBe(400);
+      expect(emptyJson.body).toMatchObject({ code: 'request.invalid' });
+      expect(emptyObject.status).toBe(200);
+      expect(wrongContentType.status).toBe(400);
+      expect(form.status).toBe(400);
+      expect(form.body).toMatchObject({ code: 'request.invalid' });
+    });
+
     it('lists the members by name with the counts of every role', async () => {
       const response = await call('get', '/internal/v1/members', camille, atelierNordId);
 

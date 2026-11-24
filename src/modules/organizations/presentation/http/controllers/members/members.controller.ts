@@ -1,5 +1,5 @@
 import type { Member, MemberPage } from '@cadenway/contracts/types/internal/organization-service';
-import { InternalAccess } from '@cadenway/nest-common';
+import { InternalAccess, ProblemException } from '@cadenway/nest-common';
 import {
   Body,
   Controller,
@@ -10,7 +10,10 @@ import {
   Param,
   Patch,
   Query,
+  QueryMethod,
+  Req,
 } from '@nestjs/common';
+import type { Request } from 'express';
 
 import type { PagePosition } from '../../../../application/models/pagination/page-position.model.js';
 import type { MemberView } from '../../../../application/projections/members/member-view.projection.js';
@@ -22,6 +25,7 @@ import { ListMembers } from '../../../../application/use-cases/queries/members/l
 import { ChangeMemberRoleBody } from '../../dto/input/members/change-member-role-body.dto.js';
 import { ListMembersQuery } from '../../dto/input/members/list-members-query.dto.js';
 import { MemberPath } from '../../dto/input/members/member-path.dto.js';
+import { QueryMembersBody } from '../../dto/input/members/query-members-body.dto.js';
 import { answerRefusals } from '../../errors/organizations/organization-refusal.problem.js';
 import { toActorUserId, toOrganizationId } from '../../mappers/context/request-context.mapper.js';
 import { toMemberResponse } from '../../mappers/members/member-response.mapper.js';
@@ -149,6 +153,29 @@ export class MembersController {
       total: output.total,
       counts: { ...output.counts },
     };
+  }
+
+  /** Lists members using the contract's JSON filters and the same tenant-scoped read as GET. */
+  @QueryMethod()
+  @HttpCode(200)
+  public async queryMembers(
+    @Body() body: QueryMembersBody,
+    @Req() request: Request,
+  ): Promise<MemberPage> {
+    const length = request.headers['content-length'];
+    if (
+      !request.is('application/json') ||
+      Number(length) === 0 ||
+      (length === undefined && !request.readableDidRead)
+    ) {
+      throw new ProblemException({ status: 400, code: 'request.invalid' });
+    }
+    return this.list({
+      search: body.search,
+      role: body.role,
+      cursor: body.cursor,
+      limit: body.limit,
+    });
   }
 
   /**
