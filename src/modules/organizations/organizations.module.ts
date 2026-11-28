@@ -40,6 +40,7 @@ import { searchOrganizationCursorProvider } from './composition/providers/use-ca
 import { BillingAuthorityController } from './presentation/http/controllers/billing/billing-authority.controller.js';
 import { AutomationRecipientController } from './presentation/http/controllers/automation/automation-recipient.controller.js';
 import { QuotaNotificationRecipientsController } from './presentation/http/controllers/billing/quota-notification-recipients.controller.js';
+import { InvitationBatchesController } from './presentation/http/controllers/invitations/invitation-batches.controller.js';
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { OrganizationLogoController } from './presentation/http/controllers/logo/organization-logo.controller.js';
@@ -72,6 +73,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     AccountDeletionReservationsController,
     MemberNamesController,
     InvitationsController,
+    InvitationBatchesController,
     ReceivedInvitationsController,
     SearchAuthorityController,
     AutomationRecipientController,

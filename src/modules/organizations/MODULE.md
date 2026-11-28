@@ -192,6 +192,7 @@ members keep their access if the organization is over the reduced limit.
 | `PATCH /internal/v1/members/{memberId}`                    | Required     | 200, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`, 422 `member.owner-protected`                                                                               |
 | `DELETE /internal/v1/members/{memberId}`                   | Required     | 204                     | 400, 403, 404, 422 `member.owner-protected`                                                                                                               |
 | `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`, 409 `idempotency.request-in-progress`, 422 `idempotency.key-reused`, 429 `invitation.daily-limit-reached`         |
+| `POST /internal/v1/invitation-batches`                     | Required     | 200                     | As above; 400 also without `Idempotency-Key`, which it requires                                                                                           |
 | `GET /internal/v1/invitations`                             | Required     | 200                     | 400, 403, 404                                                                                                                                             |
 | `GET /internal/v1/invitations/{invitationId}`              | Required     | 200                     | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
 | `DELETE /internal/v1/invitations/{invitationId}`           | Required     | 204                     | 400, 403, 404 `invitation.not-found`, 409 `invitation.answered`                                                                                           |
@@ -223,30 +224,33 @@ in the same deployment as this module or before, otherwise they reach the browse
 
 ### Rollout and rollback of idempotent batches
 
-A release before this one ignores `Idempotency-Key`: behind it, a retried keyed batch runs again,
-sends its emails again and charges the allowances again, and could invite again an address whose
-invitation was revoked meanwhile. Nothing in the service tells the gateway which behavior it gets,
-so the gateway owns the decision with a configuration switch, and the order is operational.
+A release before this one ignores `Idempotency-Key` on `POST /internal/v1/invitations`: behind it,
+a retried keyed batch would run again, send its emails again, charge the allowances again, and
+could invite again an address whose invitation was revoked meanwhile. So keyed batches have a route
+of their own (`@cadenway/contracts` 0.46.0), `POST /internal/v1/invitation-batches`, which requires
+the key and which only a release that replays serves:
 
-The contract this service asks of the gateway: **a request that carries `Idempotency-Key` is
-either forwarded with its key to a release that replays, or refused; the key is never stripped.**
-Whenever replay support is unavailable (the switch turned off after it had been on, or during a
-rollback of this service), the gateway answers such a request with a retryable
-`503 service.unavailable` problem and `Retry-After`, so the client retries the same key later
-instead of running the batch afresh. A request without the key keeps being forwarded as usual.
-The gateway change implements it; nothing in this service does. A distinct internal route for keyed
-batches is coming contract-first in `cadenway-api-contracts`, so that a replica of a previous
-release answers it `404` rather than running a keyed batch without its key.
+- the gateway sends `POST /v1/invitations` with `Idempotency-Key` to
+  `POST /internal/v1/invitation-batches`, and without the key to `POST /internal/v1/invitations`;
+- a `404` from the keyed route whose code is not `organization.not-found` means the replica that
+  answered has no replay support (a previous release has no such route): the gateway answers
+  `503 upstream.unavailable` (`details.service`: `organization-service`) with `Retry-After`, and
+  the client retries the same key later, never as a fresh batch;
+- both routes share one key namespace, the same replay records and the same in-progress claim,
+  scoped to the organization, the actor and the invitation of members, never to a route: a key
+  used on `POST /internal/v1/invitations` before the gateway moved replays, conflicts or waits on
+  the keyed route for its whole replay window, and the reverse. The former route keeps accepting
+  the optional key with the same behavior.
 
 1. Deploy this release (migration `0012` first, as every migration) in the environment.
-2. Only then turn the gateway's switch on: it forwards `Idempotency-Key` on
-   `POST /v1/invitations` and exposes `GET /v1/invitations/{invitationId}`.
-3. To roll this service back below this release, first turn the gateway's switch to refusing
-   keyed requests with the `503` above, wait until no forwarded keyed request is in flight, then
-   roll the service back. Keep `invitation_batch_replays`: the previous release never reads it.
-   Leave the switch refusing for as long as the previous release runs. Rolling forward again
-   restores the replays of the records still live, and the switch can forward keys again; no keyed
-   batch ran in between, since the gateway refused them all.
+2. Then the gateway may send keyed batches to the keyed route and expose
+   `GET /v1/invitations/{invitationId}`; a replica of the previous release still running during
+   the rollout answers the keyed route `404`, which becomes the retryable `503`.
+3. To roll this service back below this release, roll it back: the previous release answers the
+   keyed route `404` by construction, so keyed requests get the retryable `503` while it runs,
+   and requests without the key keep working. Keep `invitation_batch_replays`: the previous
+   release never reads it. Rolling forward again restores the replays of the records still live;
+   no keyed batch ran in between.
 4. Once no replica of this release runs (a replica that starts registers the schedule again),
    clean up what the previous release leaves behind, since it has no purge worker:
    - remove the persisted schedule of `organization.purge-invitation-batch-replays`, which would
@@ -277,8 +281,9 @@ release answers it `404` rather than running a keyed batch without its key.
    new job. Rolling forward again needs neither undone: the new replicas register the schedule at
    start-up.
 
-The gateway must not forward the key, nor call `getInvitation`, in an environment where this
-release is not running: the previous release answers that route `404`.
+A previous release also answers `getInvitation` `404` (`invitation.not-found` is not its code
+there, the route does not exist): the gateway exposes `GET /v1/invitations/{invitationId}` once
+this release runs in the environment.
 
 ## Events emitted
 
@@ -605,7 +610,7 @@ Any failure rolls back the business rows and the outbox rows together
 
 ## Decisions
 
-- Idempotent invitation batches (`@cadenway/contracts` 0.45.0) use a table of this module rather
+- Idempotent invitation batches (`@cadenway/contracts` 0.45.0 and 0.46.0) use a table of this module rather
   than the kit's `@Idempotent()` interceptor and `idempotency_keys`: the interceptor scopes a key to
   the organization only and replays before the handler runs, while the contract scopes it to the
   acting user too and requires the current authorization before any replay. The in-progress marker
@@ -628,13 +633,15 @@ Any failure rolls back the business rows and the outbox rows together
   `statement_timestamp()`, which PostgreSQL can use as an index range bound
   (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
-  replayed body still lists. The service exposes no version or capability signal (its only
-  unauthenticated routes are `/health/live` and `/health/ready`, from the kit), so the gateway
-  cannot detect support for the key; the rollout order is operational and the gateway gates the
-  forwarding behind its own configuration switch. When the switch does not forward, the gateway
-  refuses keyed requests with a retryable `503 service.unavailable` rather than stripping the key:
-  a stripped retry would run the batch afresh (re-inviting an address revoked meanwhile, sending
-  and charging again), while a refused one keeps its key for a later replay.
+  replayed body still lists.
+- Replay support is signalled by a route, not by a capability flag or a gateway switch: a keyed
+  batch goes to `POST /internal/v1/invitation-batches`, which a release without replays does not
+  serve, so a rolling deploy or a rollback can never run a keyed retry as a fresh batch (which
+  would re-invite an address revoked meanwhile, send and charge again); the gateway turns that
+  `404` into a retryable `503 upstream.unavailable`. The replay key holds no route: the advisory
+  claim and the primary key of `invitation_batch_replays` are the organization, the actor, the
+  digest of the key (and, for the claim, of the batch), so records written through the former
+  route before the gateway moved keep replaying with no data migration.
 - Reserved addresses (B19 of the webapp rebuild): a new code `organization.slug-reserved` rather
   than a reason on `organization.slug-invalid`, so that a client that only knows the latter never
   shows its length message for a reserved address. An address that becomes reserved after it was

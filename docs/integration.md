@@ -56,16 +56,14 @@ These skills fix the engineering standards this service follows. They are target
 
 The `cadenway-api-contracts` repository owns HTTP and event specifications. Consumers use published `@cadenway/contracts` packages and `@cadenway/nest-messaging`; do not redefine payloads or connect to another service's database. Change contracts first, then the producing service, followed by gateways and listeners, and finally the webapp. Planned event names on this page must be checked against the actual published specification before use.
 
-Idempotent invitation batches (`Idempotency-Key` on `inviteMembers`, `@cadenway/contracts` 0.45.0)
-need one more ordering rule, since a release of this service before it ignores the key and a
-keyed retry would run again: deploy this service first; the gateway forwards keys only after,
-behind its own configuration switch. The gateway never strips the key: whenever replay support is
-unavailable (the switch turned off after it had been on, or during a rollback of this service), it
-refuses a request that carries `Idempotency-Key` with a retryable `503 service.unavailable` and
-`Retry-After`, while requests without the key keep working. To roll this service back below that
-release, set the gateway's switch to refusing keyed requests first. The service exposes no version
-or capability signal the gateway could check. See "Rollout and rollback of idempotent batches" in
-`src/modules/organizations/MODULE.md`.
+Idempotent invitation batches (`@cadenway/contracts` 0.46.0) need no ordering switch: the gateway
+sends a batch with `Idempotency-Key` to `POST /internal/v1/invitation-batches`, which requires the
+key and which only a release with replay support serves, and a batch without it to
+`POST /internal/v1/invitations`. A `404` from the keyed route that is not `organization.not-found`
+means the replica has no replay support: the gateway answers `503 upstream.unavailable` with
+`Retry-After`, so a rolling deploy or a rollback never runs a keyed retry as a fresh batch. Both
+routes share one key namespace and the same replay records. See "Rollout and rollback of
+idempotent batches" in `src/modules/organizations/MODULE.md`.
 
 ## References
 

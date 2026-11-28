@@ -72,6 +72,9 @@ describe('idempotent invitation batches and the invitation state', () => {
   /** Every client error a route answered, checked against the contract at the end. */
   const errors: SeenError[] = [];
 
+  /** The outcome of the first keyed batch, which the later replays answer. */
+  let first: InvitationBatchResult;
+
   /**
    * Sends a request as the gateway would, for a user and the organization of their session.
    *
@@ -285,7 +288,6 @@ describe('idempotent invitation batches and the invitation state', () => {
 
   describe('Idempotency-Key of inviteMembers', () => {
     const key = 'members-page-batch-1';
-    let first: InvitationBatchResult;
 
     it('replays an equivalent batch without sending, emitting or charging the allowances again', async () => {
       const created: Response = await invite(ines, atelierNordId, key, [
@@ -783,6 +785,105 @@ describe('idempotent invitation batches and the invitation state', () => {
       ]);
       expect(malformed.status).toBe(400);
       expect(malformed.body).toMatchObject({ code: 'request.invalid' });
+    });
+  });
+
+  describe('keyed route POST /internal/v1/invitation-batches', () => {
+    const BATCHES = '/internal/v1/invitation-batches';
+
+    /**
+     * Invites addresses through the keyed route as `member`.
+     *
+     * @param key - The `Idempotency-Key`, or `undefined` to send none.
+     * @param emails - The addresses.
+     * @returns The response.
+     */
+    function inviteKeyed(key: string | undefined, emails: readonly string[]): Promise<Response> {
+      return call('post', BATCHES, ines, atelierNordId, {
+        body: { emails, role: 'member' },
+        ...(key === undefined ? {} : { key }),
+      });
+    }
+
+    it('requires the Idempotency-Key, and writes nothing without it', async () => {
+      const before: Record<string, number> = await effects(atelierNordId);
+
+      const missing: Response = await inviteKeyed(undefined, ['zoe@ateliernord.fr']);
+      const empty: Response = await call('post', BATCHES, ines, atelierNordId, {
+        body: { emails: ['zoe@ateliernord.fr'], role: 'member' },
+        key: '',
+      });
+
+      expect(missing.status).toBe(400);
+      expect(missing.body).toMatchObject({
+        code: 'request.invalid',
+        details: { issues: [{ in: 'header', path: 'Idempotency-Key' }] },
+      });
+      expect(empty.status).toBe(400);
+      expect(await effects(atelierNordId)).toEqual(before);
+    });
+
+    it('replays on the keyed route a batch keyed on the former route, and the reverse', async () => {
+      const before: Record<string, number> = await effects(atelierNordId);
+      const formerKey = 'members-page-batch-1';
+      const fromFormer: Response = await inviteKeyed(formerKey, [
+        'paul.lefevre@ateliernord.fr',
+        'sarah.morel@ateliernord.fr',
+      ]);
+      const reusedOnKeyed: Response = await inviteKeyed(formerKey, ['sarah.morel@ateliernord.fr']);
+
+      const keyedKey = 'members-page-batch-keyed';
+      const created: Response = await inviteKeyed(keyedKey, ['yves@ateliernord.fr']);
+      const fromKeyed: Response = await invite(ines, atelierNordId, keyedKey, [
+        'Yves@AtelierNord.fr',
+      ]);
+      const reusedOnFormer: Response = await invite(ines, atelierNordId, keyedKey, [
+        'zack@ateliernord.fr',
+      ]);
+
+      expect(fromFormer.status).toBe(200);
+      expect(fromFormer.body).toEqual(first);
+      expect(InviteMembersInternalResponse.parse(fromFormer.body)).toEqual(fromFormer.body);
+      expect(reusedOnKeyed.status).toBe(422);
+      expect(reusedOnKeyed.body).toMatchObject({ code: 'idempotency.key-reused' });
+      expect(created.status).toBe(200);
+      expect(fromKeyed.status).toBe(200);
+      expect(fromKeyed.body).toEqual(created.body);
+      expect(reusedOnFormer.status).toBe(422);
+      expect(await effects(atelierNordId)).toEqual({
+        invitations: (before.invitations ?? 0) + 1,
+        emails: (before.emails ?? 0) + 1,
+        events: (before.events ?? 0) + 1,
+        replays: (before.replays ?? 0) + 1,
+      });
+    });
+
+    it('applies concurrent equivalent requests split across both routes once', async () => {
+      const split = 'members-page-batch-split';
+      const emails: readonly string[] = ['abel@ateliernord.fr', 'bea@ateliernord.fr'];
+      const before: Record<string, number> = await effects(atelierNordId);
+
+      const responses: Response[] = await Promise.all([
+        inviteKeyed(split, emails),
+        invite(ines, atelierNordId, split, emails),
+        inviteKeyed(split, emails),
+        invite(ines, atelierNordId, split, emails),
+      ]);
+
+      const succeeded: Response[] = responses.filter((response) => response.status === 200);
+      expect(succeeded.length).toBeGreaterThanOrEqual(1);
+      for (const response of responses) {
+        expect([200, 409]).toContain(response.status);
+        if (response.status === 200) {
+          expect(response.body).toEqual(succeeded[0]?.body);
+        }
+      }
+      expect(await effects(atelierNordId)).toEqual({
+        invitations: (before.invitations ?? 0) + 2,
+        emails: (before.emails ?? 0) + 2,
+        events: (before.events ?? 0) + 2,
+        replays: (before.replays ?? 0) + 1,
+      });
     });
   });
 
