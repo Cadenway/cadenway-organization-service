@@ -115,9 +115,12 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   once and **destroys the connection on the client side**: the purge's system transactions run on
   a connection of the pool it can discard (`DiscardableSystemTransactions`, the same row-level
   security settings as the kit's system runner, which gives no handle on its connection), and
-  releasing it with an error makes `pg` destroy its socket, so the pending statement, a stalled
-  commit included, rejects at once, even on a connection stuck at the socket level that would
-  never answer; the pool never reuses it. The server rolls the transaction back once it notices the
+  the discard releases it to the pool with an error, once, so the pool never reuses it, and
+  destroys its socket itself, since `pg` does so on release only while a statement is its active
+  query: after an `ErrorResponse` it has none until `ReadyForQuery`, the rollback only waits in
+  its queue, and a graceful close never completes while the peer keeps the socket open. So the
+  pending statement, a stalled commit or a queued rollback included, rejects at once, even on a
+  connection stuck at the socket level that would never answer. The server rolls the transaction back once it notices the
   disconnection, and the two timeouts still bound, on its side, the locks it may hold until then. A
   call that had no time left before its delete started answers `null`, the normal end of a tick; a
   deadline or an abort that comes while a delete is in flight or committing fails the call, and

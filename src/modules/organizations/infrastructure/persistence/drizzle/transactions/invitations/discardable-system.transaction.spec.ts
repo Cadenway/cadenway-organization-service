@@ -12,19 +12,27 @@ interface Recorded {
 
   /** What each release was given. */
   readonly releases: unknown[];
+
+  /** How many times the transport was destroyed. */
+  destroys: number;
   // #endregion
 }
 
 /**
  * A pool with one connection whose statements answer at once, except `hang`, which waits until the
- * connection is released with an error and then rejects, as pg does when it destroys a socket with
- * a statement in flight.
+ * transport is destroyed and then rejects, as pg fails its statements once the socket closes.
+ * Releasing with an error only records it: with no active query, pg starts a graceful close that a
+ * peer keeping the socket open never completes.
  *
  * @param hang - The text of the statement that hangs, if any.
+ * @param fail - The text of a statement the server refuses at once, if any.
  * @returns The pool and what its connection recorded.
  */
-function poolWith(hang?: string): { readonly pool: Pool; readonly recorded: Recorded } {
-  const recorded: Recorded = { statements: [], releases: [] };
+function poolWith(
+  hang?: string,
+  fail?: string,
+): { readonly pool: Pool; readonly recorded: Recorded } {
+  const recorded: Recorded = { statements: [], releases: [], destroys: 0 };
   const destroyed: { reject?: (error: Error) => void } = {};
   const connection = {
     on: vi.fn(),
@@ -32,6 +40,9 @@ function poolWith(hang?: string): { readonly pool: Pool; readonly recorded: Reco
     query: vi.fn((text: string | { readonly text: string }) => {
       const statement: string = typeof text === 'string' ? text : text.text;
       recorded.statements.push(statement);
+      if (fail !== undefined && statement.startsWith(fail)) {
+        return Promise.reject(new Error('refused by the server'));
+      }
       if (hang !== undefined && statement.startsWith(hang)) {
         return new Promise((_resolve, reject) => {
           destroyed.reject = reject;
@@ -46,10 +57,15 @@ function poolWith(hang?: string): { readonly pool: Pool; readonly recorded: Reco
     }),
     release: vi.fn((error?: Error | boolean) => {
       recorded.releases.push(error);
-      if (error instanceof Error) {
-        destroyed.reject?.(new Error('Connection terminated'));
-      }
     }),
+    connection: {
+      stream: {
+        destroy: vi.fn(() => {
+          recorded.destroys += 1;
+          destroyed.reject?.(new Error('Connection terminated'));
+        }),
+      },
+    },
   };
   const pool = {
     connect: vi.fn(() => Promise.resolve(connection as unknown as PoolClient)),
@@ -110,6 +126,7 @@ describe('DiscardableSystemTransactions', () => {
     await expect(pending).rejects.toThrow('Failed query');
     expect(recorded.releases).toHaveLength(1);
     expect(recorded.releases[0]).toBeInstanceOf(Error);
+    expect(recorded.destroys).toBe(1);
     expect(recorded.statements).not.toContain('rollback');
   });
 
@@ -131,6 +148,7 @@ describe('DiscardableSystemTransactions', () => {
     await expect(pending).rejects.toThrow('Connection terminated');
     expect(recorded.releases).toHaveLength(1);
     expect(recorded.releases[0]).toBeInstanceOf(Error);
+    expect(recorded.destroys).toBe(1);
   });
 
   it('gives a connection back unused when discarded during the checkout', async () => {
@@ -155,5 +173,29 @@ describe('DiscardableSystemTransactions', () => {
     discard.abort();
 
     expect(recorded.releases).toEqual([false]);
+    expect(recorded.destroys).toBe(0);
+  });
+
+  it('closes the transport of a rollback queued behind a refused statement once discarded', async () => {
+    // The server refused the delete, then never sent `ReadyForQuery`: pg has no active query and
+    // keeps the rollback in its queue, so only destroying the transport settles it.
+    const { pool, recorded } = poolWith('rollback', 'delete');
+    const transactions = new DiscardableSystemTransactions(pool);
+    const discard = new AbortController();
+
+    const pending: Promise<unknown> = transactions.run(
+      ({ db }) => db.execute(sql`delete from invitation_batch_replays`),
+      {},
+      discard.signal,
+    );
+    await vi.waitFor(() => {
+      expect(recorded.statements.at(-1)).toBe('rollback');
+    });
+    discard.abort();
+
+    await expect(pending).rejects.toThrow('Failed query');
+    expect(recorded.releases).toHaveLength(1);
+    expect(recorded.releases[0]).toBeInstanceOf(Error);
+    expect(recorded.destroys).toBe(1);
   });
 });

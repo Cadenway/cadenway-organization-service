@@ -1312,7 +1312,13 @@ describe('idempotent invitation batches and the invitation state', () => {
 
     /**
      * A TCP proxy to PostgreSQL that can stop forwarding in both directions while keeping its
-     * sockets open, as a network path that stalls without closing.
+     * sockets open toward the client, as a network path that stalls without closing: once stalled,
+     * it ignores the client's half-close and the server's end of the session.
+     *
+     * - `now` stalls at once;
+     * - `after-error` forwards the server's messages one by one and stalls right after the first
+     *   `ErrorResponse`, withholding the `ReadyForQuery` that follows it;
+     * - `off` forwards everything, on new connections too.
      *
      * @param host - The host of PostgreSQL.
      * @param port - The port of PostgreSQL.
@@ -1323,35 +1329,67 @@ describe('idempotent invitation batches and the invitation state', () => {
       port: number,
     ): Promise<{
       readonly port: number;
-      readonly stall: (stalled: boolean) => void;
+      readonly stall: (mode: 'now' | 'after-error' | 'off') => void;
       readonly close: () => Promise<void>;
     }> {
-      const state = { stalled: false };
+      const state: { stalled: boolean; afterError: boolean } = {
+        stalled: false,
+        afterError: false,
+      };
       const sockets = new Set<net.Socket>();
-      const server: net.Server = net.createServer((client: net.Socket) => {
+      const server: net.Server = net.createServer({ allowHalfOpen: true }, (client: net.Socket) => {
         const upstream: net.Socket = net.connect(port, host);
         sockets.add(client);
         sockets.add(upstream);
-        const close = (): void => {
-          client.destroy();
-          upstream.destroy();
-        };
+        let unread: Buffer = Buffer.alloc(0);
         client.on('data', (chunk: Buffer) => {
           if (!state.stalled) upstream.write(chunk);
         });
         upstream.on('data', (chunk: Buffer) => {
-          if (!state.stalled) client.write(chunk);
+          if (state.stalled) return;
+          if (!state.afterError) {
+            client.write(chunk);
+            return;
+          }
+          // A backend message is its type byte, then its length, which counts itself.
+          unread = Buffer.concat([unread, chunk]);
+          while (unread.length >= 5 && unread.length >= 1 + unread.readUInt32BE(1)) {
+            const end: number = 1 + unread.readUInt32BE(1);
+            const message: Buffer = unread.subarray(0, end);
+            unread = unread.subarray(end);
+            client.write(message);
+            if (message[0] === 0x45) {
+              state.stalled = true;
+              return;
+            }
+          }
         });
-        for (const socket of [client, upstream]) {
-          socket.on('close', close);
-          socket.on('error', close);
+        // The client's close ends both sides; the server's only while the path is not stalled.
+        const closeBoth = (): void => {
+          client.destroy();
+          upstream.destroy();
+        };
+        client.on('close', closeBoth);
+        client.on('error', closeBoth);
+        client.on('end', () => {
+          if (!state.stalled) closeBoth();
+        });
+        for (const event of ['close', 'error'] as const) {
+          upstream.on(event, () => {
+            if (state.stalled) {
+              upstream.destroy();
+            } else {
+              closeBoth();
+            }
+          });
         }
       });
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       return {
         port: (server.address() as net.AddressInfo).port,
-        stall: (stalled: boolean): void => {
-          state.stalled = stalled;
+        stall: (mode: 'now' | 'after-error' | 'off'): void => {
+          state.stalled = mode === 'now';
+          state.afterError = mode === 'after-error';
         },
         close: (): Promise<void> => {
           for (const socket of sockets) socket.destroy();
@@ -1390,7 +1428,7 @@ describe('idempotent invitation batches and the invitation state', () => {
         // and never answered, and the socket stays open.
         await pool.query('select 1');
         const store: ExpiredInvitationBatchReplays = purgeStore(pool);
-        proxy.stall(true);
+        proxy.stall('now');
         const started: number = performance.now();
 
         await expect(
@@ -1406,12 +1444,67 @@ describe('idempotent invitation batches and the invitation state', () => {
         expect(performance.now() - started).toBeLessThan(2_000);
         expect(pool.totalCount).toBe(0);
 
-        proxy.stall(false);
+        proxy.stall('off');
         await tick(store);
         expect(await swept(lumenId)).toBe(0);
       } finally {
-        await pool.end();
+        // The proxy closes first: a connection it still holds open would otherwise hang the end
+        // of the pool instead of failing an assertion.
         await proxy.close();
+        await pool.end();
+      }
+    });
+
+    it('closes a connection whose rollback waits behind an error never followed by ReadyForQuery, so a later tick deletes', async () => {
+      await expired(lumenId, 4, 'stuck-rollback-');
+      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
+      const proxy = await stallingProxy(target.hostname, Number(target.port));
+      target.host = `127.0.0.1:${String(proxy.port)}`;
+      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
+      pool.on('error', () => undefined);
+      // The delete of the purge fails at once with an `ErrorResponse`.
+      await stack.migrator.query(
+        `create function refuse_invitation_batch_replay_delete() returns trigger language plpgsql as
+         $$ begin raise exception 'refused by the test'; end $$`,
+      );
+      await stack.migrator.query(
+        `create trigger refuse_invitation_batch_replay_delete before delete on invitation_batch_replays
+         for each row execute function refuse_invitation_batch_replay_delete()`,
+      );
+      const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+      try {
+        try {
+          await pool.query('select 1');
+          // The error reaches pg, which has then no active query and queues the rollback; the
+          // `ReadyForQuery` it waits for never comes, and the socket stays open.
+          proxy.stall('after-error');
+          const started: number = performance.now();
+
+          await expect(
+            store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+          ).rejects.toThrow('while a delete was in flight');
+          await vi.waitFor(
+            () => {
+              expect(store.stalled).toBe(false);
+            },
+            { timeout: 2_000, interval: 10 },
+          );
+          expect(pool.totalCount).toBe(0);
+        } finally {
+          await stack.migrator.query(
+            'drop trigger refuse_invitation_batch_replay_delete on invitation_batch_replays',
+          );
+          await stack.migrator.query('drop function refuse_invitation_batch_replay_delete()');
+        }
+
+        // The next tick deletes on a fresh connection, the stuck one being gone from the pool.
+        proxy.stall('off');
+        await tick(store);
+        expect(pool.totalCount).toBe(1);
+        expect(await swept(lumenId)).toBe(0);
+      } finally {
+        await proxy.close();
+        await pool.end();
       }
     });
 

@@ -24,8 +24,9 @@ const BEGIN_STATEMENTS: Readonly<
  * Runs a system transaction, as the kit's `SystemTransactionRunner` does (the same row-level
  * security settings: no organization, system access on), on a pooled connection that its caller
  * can discard. When the `discard` signal aborts before the transaction ends, the connection is
- * released to the pool with an error, which destroys its socket on the client side: a statement
- * in flight, a stalled commit included, rejects at once with the connection terminated, the pool
+ * released to the pool with an error, once, and its socket is destroyed on the client side,
+ * whatever pg was doing: a statement in flight, a stalled commit or a rollback queued behind an
+ * error whose `ReadyForQuery` never came, rejects at once with the connection terminated, the pool
  * never reuses the connection and frees its slot, and the server rolls the transaction back when
  * it notices the disconnection (or at its own timeouts). Nothing is retried, nothing joins an
  * ambient transaction: it is meant for a bounded maintenance call that gives up at its deadline,
@@ -81,9 +82,13 @@ export class DiscardableSystemTransactions {
     const destroy = (): void => {
       state.discarded = true;
       connection.removeListener('error', onConnectionError);
-      // An error destroys the connection: pg ends a client with a statement in flight by
-      // destroying its socket, so that statement rejects at once.
+      // Evicts the client, once: the pool never reuses it and frees its slot.
       connection.release(new Error('The system transaction was discarded.'));
+      // pg destroys the socket on eviction only while a statement is its active query. After an
+      // `ErrorResponse` it has none until `ReadyForQuery`, the rollback only waits in its queue,
+      // and eviction starts a graceful close that a peer keeping the socket open never completes.
+      // Destroying the transport always closes it, and pg then fails every queued statement.
+      connection.connection.stream.destroy();
     };
     connection.on('error', onConnectionError);
     discard.addEventListener('abort', destroy, { once: true });
@@ -98,7 +103,7 @@ export class DiscardableSystemTransactions {
         SYSTEM_ACCESS_SETTING,
         'on',
       ]);
-      const result: TResult = await work({ db: drizzle(connection) });
+      const result: TResult = await work({ db: drizzle({ client: connection }) });
       const committed = await connection.query('commit');
       if (committed.command === 'ROLLBACK') {
         throw new Error('The system transaction was rolled back at commit.');
