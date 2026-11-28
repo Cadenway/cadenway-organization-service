@@ -75,13 +75,36 @@ const CLAIM_WAIT: string = '2s';
  * @returns {SQL} The statement.
  */
 export function inlinePurgeOf(organizationId: string): SQL {
-  return sql`delete from ${invitationBatchReplays}
-    where (organization_id, actor_user_id, key_digest) in (
+  return boundedPurgeOf(
+    sql`organization_id = ${organizationId}::uuid and expires_at <= ${PURGE_CUTOFF}`,
+    INLINE_PURGE_LIMIT,
+  );
+}
+
+/**
+ * Function boundedPurgeOf
+ *
+ * @description
+ * A delete of at most `limit` replay records matching `condition`, oldest first, skipping the rows
+ * another transaction holds. The candidates are selected, limited and locked once, in a
+ * materialized CTE, then deleted by primary key: a `LIMIT` inside an `IN (subquery)` can be
+ * evaluated again by a semi-join, which would not bound the rows.
+ *
+ * @param {SQL} condition - Which records may go.
+ * @param {number} limit - The most rows the statement deletes.
+ * @returns {SQL} The statement.
+ */
+export function boundedPurgeOf(condition: SQL, limit: number): SQL {
+  return sql`with candidates as materialized (
       select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
-      where organization_id = ${organizationId}::uuid and expires_at <= ${PURGE_CUTOFF}
+      where ${condition}
       order by expires_at
-      limit ${INLINE_PURGE_LIMIT}
-      for update skip locked)`;
+      limit ${limit}
+      for update skip locked)
+    delete from ${invitationBatchReplays} as replay using candidates
+    where replay.organization_id = candidates.organization_id
+      and replay.actor_user_id = candidates.actor_user_id
+      and replay.key_digest = candidates.key_digest`;
 }
 
 /**

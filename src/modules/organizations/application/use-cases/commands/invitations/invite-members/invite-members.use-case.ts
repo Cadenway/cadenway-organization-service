@@ -253,8 +253,8 @@ export class InviteMembers {
    * Method replay
    *
    * @description
-   * Answers the live record of the key, if any: its outcome for an equivalent batch once the actor
-   * still manages the organization under a share lock, `idempotency-key-reused` for another batch.
+   * Answers the live record of the key, if any, once the actor still manages the organization
+   * under a share lock: its outcome for an equivalent batch, `idempotency-key-reused` for another.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest }}
@@ -278,9 +278,8 @@ export class InviteMembers {
     if (stored === null) {
       return null;
     }
-    if (!stored.sameRequest) {
-      throw new InvitationBatchKeyReusedError();
-    }
+    // Authorization first, as for a fresh batch: a member who lost the role answers 403, never
+    // what the key holds, whether the batch matches it or not.
     const actor: Member = await requireActorMembership(
       store,
       key.organizationId,
@@ -288,6 +287,9 @@ export class InviteMembers {
       'share',
     );
     assertManagesOrganization(actor.role);
+    if (!stored.sameRequest) {
+      throw new InvitationBatchKeyReusedError();
+    }
     return { invitations: stored.invitations };
   }
 

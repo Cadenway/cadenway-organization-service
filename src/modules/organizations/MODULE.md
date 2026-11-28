@@ -87,7 +87,9 @@ the insert of the record on the database clock (`clock_timestamp()`), which the 
 the purges compare with `statement_timestamp()`, fixed for their statement, so they range-scan the
 expiry indexes. **`outcome` holds the invited addresses**, the body the contract replays, until the
 record is purged: 24 hours, plus the delay of the purge. A record is written once, in the
-transaction of its batch, and never changed. Two purges delete expired records, both bounded:
+transaction of its batch, and never changed. Two purges delete expired records, both bounded: each
+delete selects, limits and locks its candidates once in a materialized CTE, then deletes them by
+primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by a semi-join.
 
 - a keyed batch deletes its own key's expired record and at most 10 other expired records of its
   organization (`invitation_batch_replays_organization_expiry_index`, `skip locked`), so it never
@@ -96,7 +98,10 @@ transaction of its batch, and never changed. Two purges delete expired records, 
   tenants' traffic: bounded deletes of at most 500 expired records of any organization
   (`invitation_batch_replays_expiry_index`, oldest first, `skip locked`), each in its own system
   transaction, one after the other until one deletes fewer than 500 or 5 seconds have passed (under
-  the 8 s shutdown timeout of the job runtime). A keyed batch stores a record even when it sends
+  the 8 s shutdown timeout of the job runtime). Each transaction sets the time left to the tick as
+  its `statement_timeout`, keeping the last 500 ms for the read of the backlog, which is skipped
+  when no time remains; a delete cut short rolls back and fails the tick, which its queue retries.
+  A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
   next tick continues. A failed tick is retried by its queue, which the migrator provisions with
@@ -229,7 +234,9 @@ Whenever replay support is unavailable (the switch turned off after it had been 
 rollback of this service), the gateway answers such a request with a retryable
 `503 service.unavailable` problem and `Retry-After`, so the client retries the same key later
 instead of running the batch afresh. A request without the key keeps being forwarded as usual.
-The gateway change implements it; nothing in this service does.
+The gateway change implements it; nothing in this service does. A distinct internal route for keyed
+batches is coming contract-first in `cadenway-api-contracts`, so that a replica of a previous
+release answers it `404` rather than running a keyed batch without its key.
 
 1. Deploy this release (migration `0012` first, as every migration) in the environment.
 2. Only then turn the gateway's switch on: it forwards `Idempotency-Key` on
@@ -548,9 +555,10 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - `GET /internal/v1/invitations/{invitationId}` opens a tenant `REPEATABLE READ READ ONLY`
   transaction for the actor's membership and the invitation.
 - A keyed invitation batch runs in the same tenant transaction. After the role and organization
-  checks, it reads the committed live record of the key first, without any lock: a replay checks
-  the actor's role again under a share lock on the membership and answers the stored body, taking
-  neither allowance lock, and another batch answers `422`. Without a record, it takes a
+  checks, it reads the committed live record of the key first, without any lock. With a record, it
+  checks the actor's role again under a share lock on the membership, then answers the stored body
+  to an equivalent batch, taking neither allowance lock, and `422` to another: a member who lost the
+  role answers `403` either way. Without a record, it takes a
   transaction-level advisory lock on the scoped key and the fingerprint of the batch, waiting at
   most 2 s for an equivalent batch that holds it (the wait runs in a savepoint under its own
   `lock_timeout`, so a timeout leaves the transaction usable), and reads the record again in either

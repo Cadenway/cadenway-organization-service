@@ -645,6 +645,11 @@ describe('idempotent invitation batches and the invitation state', () => {
         ]);
         expect(demoted.status).toBe(403);
         expect(demoted.body).toMatchObject({ code: 'organization.role-forbidden' });
+        const otherBody: Response = await invite(ines, atelierNordId, key, [
+          'sarah.morel@ateliernord.fr',
+        ]);
+        expect(otherBody.status).toBe(403);
+        expect(otherBody.body).toMatchObject({ code: 'organization.role-forbidden' });
       } finally {
         await setRole(ines, 'admin');
       }
@@ -837,7 +842,7 @@ describe('idempotent invitation batches and the invitation state', () => {
 
       const deleted: number = await new ExpiredInvitationBatchReplays(
         app.get(SystemTransactionRunner),
-      ).purge(3);
+      ).purge(3, 5_000);
       expect(deleted).toBe(3);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(9);
 
@@ -878,6 +883,27 @@ describe('idempotent invitation batches and the invitation state', () => {
           atelierNordId,
         ),
       ).toBe(live);
+    });
+
+    it('never deletes more rows than the limit of a purge, however many have expired', async () => {
+      await expired(atelierNordId, 40, 'cap-a-');
+      await expired(lumenId, 1_200, 'cap-l-');
+      const system: SystemTransactionRunner = app.get(SystemTransactionRunner);
+
+      const inline: number = await system.run(
+        async ({ db }) => (await db.execute(inlinePurgeOf(atelierNordId))).rowCount ?? 0,
+      );
+      expect(inline).toBe(10);
+      expect(await swept(atelierNordId)).toBe(30);
+
+      const purge = new ExpiredInvitationBatchReplays(system);
+      const batches: number[] = [];
+      for (let round = 0; round < 3; round += 1) {
+        batches.push(await purge.purge(500, 5_000));
+      }
+
+      expect(batches).toEqual([500, 500, 230]);
+      expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(0);
     });
 
     it('finds the expired records of both purges by an index range on their expiry', async () => {

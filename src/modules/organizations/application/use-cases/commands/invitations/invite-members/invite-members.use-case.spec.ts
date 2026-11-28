@@ -286,6 +286,9 @@ describe('InviteMembers with an Idempotency-Key', () => {
     await expect(invite.execute(keyed(['marc.roux@ateliernord.fr']))).rejects.toMatchObject({
       refusal: { reason: 'role-forbidden' },
     });
+    await expect(invite.execute(keyed(['lucie@exemple.fr']))).rejects.toMatchObject({
+      refusal: { reason: 'role-forbidden' },
+    });
     await expect(
       invite.execute(keyed(['marc.roux@ateliernord.fr'], { organizationId: 'elsewhere' })),
     ).rejects.toMatchObject({ refusal: { reason: 'organization-not-found' } });

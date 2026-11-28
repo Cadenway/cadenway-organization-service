@@ -20,11 +20,13 @@ function setup(deletions: readonly number[], elapsedPerPurgeMs: number = 0) {
   let clock = 0;
   const remaining = [...deletions];
   const expired = {
-    purge: vi.fn<(limit: number) => Promise<number>>(() => {
+    purge: vi.fn<(limit: number, timeoutMs: number) => Promise<number>>(() => {
       clock += elapsedPerPurgeMs;
       return Promise.resolve(remaining.shift() ?? 0);
     }),
-    oldestExpiredAgeSeconds: vi.fn<() => Promise<number | null>>().mockResolvedValue(840),
+    oldestExpiredAgeSeconds: vi
+      .fn<(timeoutMs: number) => Promise<number | null>>()
+      .mockResolvedValue(840),
   };
   const handler = new PurgeInvitationBatchReplaysHandler(
     workers,
@@ -60,21 +62,55 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     await handler.handle(system);
 
     expect(INVITATION_BATCH_REPLAY_PURGE_LIMIT).toBe(500);
-    expect(expired.purge.mock.calls).toEqual([[500], [500], [500]]);
+    expect(expired.purge.mock.calls).toEqual([
+      [500, 4_500],
+      [500, 4_500],
+      [500, 4_500],
+    ]);
     expect(expired.oldestExpiredAgeSeconds).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('stops on its time budget and reports the age of the oldest expired record left', async () => {
+  it('gives each delete the time left, stops on its budget and reads the backlog in the rest', async () => {
     const { handler, expired } = setup(
       Array.from({ length: 100 }, () => 500),
-      INVITATION_BATCH_REPLAY_PURGE_BUDGET_MS / 4,
+      1_000,
     );
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
     await handler.handle(system);
 
-    expect(expired.purge).toHaveBeenCalledTimes(4);
+    expect(INVITATION_BATCH_REPLAY_PURGE_BUDGET_MS).toBe(5_000);
+    expect(expired.purge.mock.calls).toEqual([
+      [500, 4_500],
+      [500, 3_500],
+      [500, 2_500],
+      [500, 1_500],
+      [500, 500],
+    ]);
+    expect(expired.oldestExpiredAgeSeconds).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      { deleted: 2_500, oldestExpiredAgeSeconds: null },
+      expect.any(String),
+    );
+  });
+
+  it('reads the backlog within what remains of the budget when the deletes leave time', async () => {
+    const { handler, expired } = setup(
+      Array.from({ length: 100 }, () => 500),
+      1_200,
+    );
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await handler.handle(system);
+
+    expect(expired.purge.mock.calls).toEqual([
+      [500, 4_500],
+      [500, 3_300],
+      [500, 2_100],
+      [500, 900],
+    ]);
+    expect(expired.oldestExpiredAgeSeconds).toHaveBeenCalledExactlyOnceWith(200);
     expect(warn).toHaveBeenCalledWith(
       { deleted: 2_000, oldestExpiredAgeSeconds: 840 },
       expect.any(String),
