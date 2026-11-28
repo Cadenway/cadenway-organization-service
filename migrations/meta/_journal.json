@@ -85,6 +85,13 @@
       "when": 1795425072698,
       "tag": "0011_enforce_membership_deletion_reservations",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1795855749361,
+      "tag": "0012_invitation_batch_replays",
+      "breakpoints": true
     }
   ]
 }

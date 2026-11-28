@@ -1,6 +1,7 @@
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import type { InvitationDraft } from '../../../../../domain/value-objects/invitations/invitation-draft.value-object.js';
+import type { ActorInvitationRead } from '../../../../models/invitations/actor-invitation-read.model.js';
 import type { Page } from '../../../../models/pagination/page.model.js';
 import type { PagePosition } from '../../../../models/pagination/page-position.model.js';
 import type { InvitationView } from '../../../../projections/invitations/invitation-view.projection.js';
@@ -52,6 +53,27 @@ export interface InvitationRepository {
    * @returns {Promise<Invitation | null>} The invitation, or `null`.
    */
   findForUpdate(organizationId: string, invitationId: string): Promise<Invitation | null>;
+
+  /**
+   * Method readAsActor
+   *
+   * @description
+   * Reads, in one statement, the role of the actor's active membership in an organization and the
+   * invitation of that organization with this id, in any state, with the name of its sender as the
+   * lists show it and the instant of the statement: one snapshot and one instant, so an answer
+   * committed before the read is never shown as an expiry.
+   *
+   * @param {string} organizationId - The organization.
+   * @param {string} actorUserId - The actor.
+   * @param {string} invitationId - Id of the invitation.
+   * @returns {Promise<ActorInvitationRead | null>} The role and the invitation, or `null` when the
+   * actor is not an active member.
+   */
+  readAsActor(
+    organizationId: string,
+    actorUserId: string,
+    invitationId: string,
+  ): Promise<ActorInvitationRead | null>;
 
   /**
    * Method find

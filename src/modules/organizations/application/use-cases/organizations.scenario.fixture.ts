@@ -76,6 +76,7 @@ export async function atelierNord(): Promise<AtelierNord> {
     store.withAccount(person.id, person.name, person.email);
   }
   const clock: FixedClock = new FixedClock('2026-11-08T09:00:00Z');
+  store.databaseClock = clock;
   const created: CreateOrganizationOutput = await new CreateOrganization(store, clock).execute({
     actorUserId: CAMILLE.id,
     name: 'Atelier Nord',

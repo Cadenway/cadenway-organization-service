@@ -56,6 +56,15 @@ These skills fix the engineering standards this service follows. They are target
 
 The `cadenway-api-contracts` repository owns HTTP and event specifications. Consumers use published `@cadenway/contracts` packages and `@cadenway/nest-messaging`; do not redefine payloads or connect to another service's database. Change contracts first, then the producing service, followed by gateways and listeners, and finally the webapp. Planned event names on this page must be checked against the actual published specification before use.
 
+Idempotent invitation batches (`@cadenway/contracts` 0.46.0) need no ordering switch: the gateway
+sends a batch with `Idempotency-Key` to `POST /internal/v1/invitation-batches`, which requires the
+key and which only a release with replay support serves, and a batch without it to
+`POST /internal/v1/invitations`. A `404` from the keyed route that is not `organization.not-found`
+means the replica has no replay support: the gateway answers `503 upstream.unavailable` with
+`Retry-After`, so a rolling deploy or a rollback never runs a keyed retry as a fresh batch. Both
+routes share one key namespace and the same replay records. See "Rollout and rollback of
+idempotent batches" in `src/modules/organizations/MODULE.md`.
+
 ## References
 
 [Interactive mockup](https://claude.ai/artifact/KYRM7AnsYLiBLBLKy8i4HE), [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et), and [repositories and packages](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N). Use [AGENTS.md](../AGENTS.md) as the local source for ownership and hard limits.

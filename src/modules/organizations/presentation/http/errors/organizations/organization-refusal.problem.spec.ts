@@ -40,6 +40,13 @@ describe('answerRefusals', () => {
       [{ reason: 'invitation-not-found' }, 404, 'invitation.not-found', undefined],
       [{ reason: 'invitation-email-mismatch' }, 403, 'invitation.email-mismatch', undefined],
       [{ reason: 'invitation-revoked' }, 409, 'invitation.revoked', undefined],
+      [{ reason: 'idempotency-key-reused' }, 422, 'idempotency.key-reused', undefined],
+      [
+        { reason: 'idempotency-request-in-progress' },
+        409,
+        'idempotency.request-in-progress',
+        undefined,
+      ],
       [
         { reason: 'invitation-answered', status: 'refused' },
         409,

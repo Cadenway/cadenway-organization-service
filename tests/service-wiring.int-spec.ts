@@ -67,6 +67,7 @@ const platformTables = [
 /** The tables of the organizations module, as its schemas name them. */
 const businessTables = [
   'directory_users',
+  'invitation_batch_replays',
   'invitation_emails',
   'invitation_sender_emails',
   'invitations',
@@ -85,7 +86,7 @@ const allTables = [...platformTables, ...businessTables].sort();
  * the logo reference and upload reservations, the billing membership index and the seat
  * entitlement projection, the sender budget ledger, and the account deletion reservation and guard.
  */
-const migrationCount = 12;
+const migrationCount = 13;
 
 /**
  * Runs `docker compose` on the throwaway project.
@@ -403,6 +404,7 @@ describe('organization-service wiring', () => {
       { relname: 'directory_users', relrowsecurity: false, relforcerowsecurity: false },
       { relname: 'event_versions', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'idempotency_keys', relrowsecurity: true, relforcerowsecurity: true },
+      { relname: 'invitation_batch_replays', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitation_emails', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitation_sender_emails', relrowsecurity: true, relforcerowsecurity: true },
       { relname: 'invitations', relrowsecurity: true, relforcerowsecurity: true },
@@ -424,6 +426,10 @@ describe('organization-service wiring', () => {
     expect(policies.rows).toEqual([
       { tablename: 'event_versions', policyname: 'event_versions_organization_isolation' },
       { tablename: 'idempotency_keys', policyname: 'idempotency_keys_organization_isolation' },
+      {
+        tablename: 'invitation_batch_replays',
+        policyname: 'invitation_batch_replays_organization_isolation',
+      },
       { tablename: 'invitation_emails', policyname: 'invitation_emails_organization_isolation' },
       {
         tablename: 'invitation_sender_emails',

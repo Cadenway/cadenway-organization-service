@@ -6,11 +6,15 @@ import {
   assertInvitationBatchAvailable,
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
+import { InvitationBatchKeyReusedError } from '../../../../../domain/errors/invitations/invitation-batch-key-reused.error.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
+import { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationEmailUsage } from '../../../../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
+import type { InvitationBatchReplayKey } from '../../../../models/invitations/invitation-batch-replay-key.model.js';
 import type { InvitationMail } from '../../../../models/invitations/invitation-mail.model.js';
+import type { StoredInvitationBatch } from '../../../../models/invitations/stored-invitation-batch.model.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
@@ -20,6 +24,29 @@ import { senderNameOf } from '../../../../services/invitations/sender-name.servi
 import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
 import type { InviteMembersInput } from './invite-members.input.js';
 import type { InviteMembersOutput } from './invite-members.output.js';
+
+/**
+ * Interface KeyedBatch
+ *
+ * @description
+ * A batch sent with an `Idempotency-Key`: its scoped key, its canonical form, its distinct
+ * addresses and the instant of the sending.
+ */
+interface KeyedBatch {
+  // #region Properties
+  /** The key, scoped to the organization and the actor. */
+  readonly key: InvitationBatchReplayKey;
+
+  /** The canonical batch, whose fingerprint the key holds. */
+  readonly request: InvitationBatchRequest;
+
+  /** The distinct addresses, in order. */
+  readonly addresses: readonly EmailAddress[];
+
+  /** When the batch is sent. */
+  readonly now: Date;
+  // #endregion
+}
 
 /**
  * Interface PlannedAddress
@@ -71,6 +98,18 @@ interface PlannedAddress {
  * need more invitation emails than remain of the 100 of the last 24 hours: nothing is written,
  * sent or emitted (decision 1 of the P2b security follow-ups). A batch that invites nobody is never
  * refused.
+ *
+ * With an `Idempotency-Key` (scoped to the organization, the actor and this operation), the key is
+ * settled first, in a short transaction of its own, once the authorization and the organization
+ * are checked as for a fresh batch: a live record replays for an equivalent batch (the actor's role
+ * read again in the snapshot of the record, without any lock), without writing, sending or
+ * emitting; a live reservation answers `idempotency-request-in-progress` to the same batch; either
+ * answers `idempotency-key-reused` to another batch. A free key is reserved under a lease and the
+ * reservation commits, so the first batch that reserves a key is the only one that can run with
+ * it. The batch then runs as without a key and turns the reservation into its record last, in the
+ * same transaction: the invitations, their ledger entries, their `invitation.issued.v1` and the
+ * record commit together, and a refusal (a 429 included) or a failure records nothing and deletes
+ * the reservation.
  */
 export class InviteMembers {
   // #region Properties
@@ -123,73 +162,312 @@ export class InviteMembers {
    *
    * @param {InviteMembersInput} input - The actor, the organization, the addresses and the role.
    * @returns {Promise<InviteMembersOutput>} The outcome of each distinct address.
-   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden` or
-   * `invitation-daily-limit-reached`.
+   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden`,
+   * `invitation-daily-limit-reached`, `idempotency-key-reused` or
+   * `idempotency-request-in-progress`.
    */
   public async execute(input: InviteMembersInput): Promise<InviteMembersOutput> {
     const now: Date = this.clock.now();
     try {
       const addresses: EmailAddress[] = distinctAddresses(input.emails);
-      return await this.unitOfWork.runInRequestOrganization(
-        async (store: OrganizationsStore): Promise<InviteMembersOutput> => {
-          const actor: Member = await requireActorMembership(
-            store,
-            input.organizationId,
-            input.actorUserId,
-          );
-          assertManagesOrganization(actor.role);
-          const organization: Organization | null = await store.organizations.find(
-            input.organizationId,
-          );
-          if (organization === null) {
-            throw new OrganizationRefusal({ reason: 'organization-not-found' });
-          }
-          const windowStart = invitationEmailWindowStart(now);
-          const senderUsage = await store.invitationEmails.lockSenderUsage(
-            input.actorUserId,
-            windowStart,
-          );
-          const usage: InvitationEmailUsage = await store.invitationEmails.lockUsage(
-            input.organizationId,
-            windowStart,
-          );
-          const currentActor = await requireActorMembership(
-            store,
-            input.organizationId,
-            input.actorUserId,
-            'share',
-          );
-          assertManagesOrganization(currentActor.role);
-          const planned: PlannedAddress[] = [];
-          for (const address of addresses) {
-            planned.push(await InviteMembers.plan(store, input.organizationId, address));
-          }
-          assertInvitationBatchAvailable(
-            senderUsage,
-            usage,
-            planned.filter((entry: PlannedAddress) => entry.decided === null).length,
-            now,
-          );
-          const mail: InvitationMail = {
-            inviterUserId: input.actorUserId,
-            inviterName: await senderNameOf(store, input.actorUserId),
-            organizationName: organization.snapshot.name,
-            memberCount: await store.members.countSeats(input.organizationId),
-            language: organization.snapshot.defaultLanguage,
-          };
-          const invitations: InvitationOutcome[] = [];
-          for (const entry of planned) {
-            invitations.push(
-              entry.decided ??
-                (await InviteMembers.invite(store, input, mail, { address: entry.address, now })),
-            );
-          }
-          return { invitations };
+      if (input.idempotencyKey === undefined) {
+        return await this.unitOfWork.runInRequestOrganization(
+          async (store: OrganizationsStore): Promise<InviteMembersOutput> =>
+            InviteMembers.issue(store, input, {
+              organization: await InviteMembers.authorize(store, input),
+              addresses,
+              now,
+            }),
+        );
+      }
+      return await this.keyed(input, {
+        key: {
+          organizationId: input.organizationId,
+          actorUserId: input.actorUserId,
+          key: input.idempotencyKey,
         },
-      );
+        request: InvitationBatchRequest.of(addresses, input.role),
+        addresses,
+        now,
+      });
     } catch (error) {
       throw toOrganizationRefusal(error);
     }
+  }
+
+  /**
+   * Method keyed
+   *
+   * @description
+   * Runs a keyed batch in two transactions. The first, short, settles the key: it replays a live
+   * record or refuses a live reservation, or reserves the key under a lease and commits. The second
+   * runs the batch and turns the reservation into its record, together with the invitations. A
+   * batch that fails or is refused (a 429 included) deletes its reservation afterwards, best
+   * effort, so the key runs again at once; the lease frees it otherwise.
+   *
+   * @param {InviteMembersInput} input - The batch.
+   * @param {KeyedBatch} batch - The scoped key, the canonical batch, the distinct addresses and the
+   * instant.
+   * @returns {Promise<InviteMembersOutput>} The outcome, replayed or fresh.
+   * @throws {OrganizationRefusal} `idempotency-request-in-progress`, `role-forbidden`,
+   * `organization-not-found` or `invitation-daily-limit-reached`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
+   */
+  private async keyed(input: InviteMembersInput, batch: KeyedBatch): Promise<InviteMembersOutput> {
+    const { key, request, addresses, now } = batch;
+    const settled: InviteMembersOutput | string = await this.unitOfWork.runInRequestOrganization(
+      (store: OrganizationsStore): Promise<InviteMembersOutput | string> =>
+        InviteMembers.reserve(store, input, batch),
+    );
+    if (typeof settled !== 'string') {
+      return settled;
+    }
+    const leaseId: string = settled;
+    try {
+      return await this.unitOfWork.runInRequestOrganization(
+        async (store: OrganizationsStore): Promise<InviteMembersOutput> => {
+          // Hold the reservation for the whole batch: past its lease, nobody may take it over.
+          if (!(await store.invitationBatchReplays.renew(key, leaseId))) {
+            throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+          }
+          const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
+            organization: await InviteMembers.authorize(store, input),
+            addresses,
+            now,
+          });
+          if (
+            !(await store.invitationBatchReplays.complete(key, leaseId, {
+              request,
+              invitations: output.invitations,
+            }))
+          ) {
+            // The lease ran out and another request took the key over: this batch rolls back.
+            throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+          }
+          return output;
+        },
+      );
+    } catch (error) {
+      await this.release(key, leaseId);
+      throw error;
+    }
+  }
+
+  /**
+   * Method release
+   *
+   * @description
+   * Deletes the reservation of a batch that did not commit, in a transaction of its own; a failure
+   * is left to the lease, which frees the key once it runs out.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease of the batch.
+   * @returns {Promise<void>} Resolves once deleted, or once given up.
+   */
+  private async release(key: InvitationBatchReplayKey, leaseId: string): Promise<void> {
+    try {
+      await this.unitOfWork.runInRequestOrganization((store: OrganizationsStore): Promise<void> =>
+        store.invitationBatchReplays.release(key, leaseId),
+      );
+    } catch {
+      // The lease of `INVITATION_BATCH_LEASE_MS` frees the key.
+    }
+  }
+
+  /**
+   * Method authorize
+   *
+   * @description
+   * Checks that the actor is an owner or an admin of the organization of the request, and loads it.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {InviteMembersInput} input - The batch.
+   * @returns {Promise<Organization>} The organization.
+   * @throws {OrganizationRefusal} `organization-not-found` or `role-forbidden`.
+   */
+  private static async authorize(
+    store: OrganizationsStore,
+    input: InviteMembersInput,
+  ): Promise<Organization> {
+    const actor: Member = await requireActorMembership(
+      store,
+      input.organizationId,
+      input.actorUserId,
+    );
+    assertManagesOrganization(actor.role);
+    const organization: Organization | null = await store.organizations.find(input.organizationId);
+    if (organization === null) {
+      throw new OrganizationRefusal({ reason: 'organization-not-found' });
+    }
+    return organization;
+  }
+
+  /**
+   * Method reserve
+   *
+   * @description
+   * The first transaction of a keyed batch: once the actor and the organization are found, settles
+   * the key from its live reservation or record, or reserves it. When the key is not free for the
+   * reservation (another request reserves it at that moment, or a transaction holds its expired
+   * row), the request is settled from a live row if one is committed by then, and otherwise answers
+   * the retryable `idempotency-request-in-progress`, whatever the body: an expired reservation's
+   * fingerprint never decides a terminal `idempotency-key-reused`. Nothing waits on a batch.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {InviteMembersInput} input - The batch.
+   * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @returns {Promise<InviteMembersOutput | string>} The replayed outcome, or the id of the lease.
+   */
+  private static async reserve(
+    store: OrganizationsStore,
+    input: InviteMembersInput,
+    batch: KeyedBatch,
+  ): Promise<InviteMembersOutput | string> {
+    await InviteMembers.authorize(store, input);
+    const settled: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
+    if (settled !== null) {
+      return settled;
+    }
+    const leaseId: string | null = await store.invitationBatchReplays.reserve(
+      batch.key,
+      batch.request,
+    );
+    if (leaseId !== null) {
+      return leaseId;
+    }
+    const meanwhile: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
+    if (meanwhile !== null) {
+      return meanwhile;
+    }
+    // The key is held without a live row: another request reserves it, a batch runs past its lease,
+    // a takeover or a purge holds its expired row. Who holds it, and with which batch, is unknown,
+    // so the answer is the retryable one whatever the body, never a terminal 422.
+    throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+  }
+
+  /**
+   * Method settle
+   *
+   * @description
+   * Answers the live reservation or record of the key, if any, once the actor still manages the
+   * organization in the snapshot of the row (a replay creates nothing, so it never waits on a role
+   * change in progress): a record replays its outcome to an equivalent batch; a reservation
+   * answers `idempotency-request-in-progress` to the same batch, which is still running; any other
+   * batch answers `idempotency-key-reused`.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` when the key is
+   * free.
+   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden` or
+   * `idempotency-request-in-progress`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
+   */
+  private static async settle(
+    store: OrganizationsStore,
+    batch: KeyedBatch,
+  ): Promise<InviteMembersOutput | null> {
+    const stored: StoredInvitationBatch | null = await store.invitationBatchReplays.findLive(
+      batch.key,
+      batch.request,
+    );
+    return stored === null ? null : InviteMembers.answer(stored);
+  }
+
+  /**
+   * Method answer
+   *
+   * @description
+   * What a row of the key answers once the actor still manages the organization in the snapshot of
+   * the row: a record its outcome to an equivalent batch, a reservation
+   * `idempotency-request-in-progress` to the same batch, either `idempotency-key-reused` to another.
+   *
+   * @param {StoredInvitationBatch} stored - The row of the key.
+   * @returns {InviteMembersOutput} The stored outcome of an equivalent batch.
+   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden` or
+   * `idempotency-request-in-progress`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
+   */
+  private static answer(stored: StoredInvitationBatch): InviteMembersOutput {
+    if (stored.actorRole === null) {
+      throw new OrganizationRefusal({ reason: 'organization-not-found' });
+    }
+    assertManagesOrganization(stored.actorRole);
+    if (!stored.sameRequest) {
+      throw new InvitationBatchKeyReusedError();
+    }
+    if (stored.state === 'reserved') {
+      throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+    }
+    return { invitations: stored.invitations };
+  }
+
+  /**
+   * Method issue
+   *
+   * @description
+   * Runs the batch once the actor and the organization are found: locks the allowances of the
+   * sender and of the organization, checks the actor's role again under a share lock, decides each
+   * address, refuses a batch that needs more emails than remain, then stores the new invitations
+   * with their ledger entries and events.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {InviteMembersInput} input - The batch.
+   * @param {{ readonly organization: Organization; readonly addresses: readonly EmailAddress[];
+   * readonly now: Date }} batch - The organization, the distinct addresses and the instant.
+   * @returns {Promise<InviteMembersOutput>} The outcome of each distinct address.
+   */
+  private static async issue(
+    store: OrganizationsStore,
+    input: InviteMembersInput,
+    batch: {
+      readonly organization: Organization;
+      readonly addresses: readonly EmailAddress[];
+      readonly now: Date;
+    },
+  ): Promise<InviteMembersOutput> {
+    const { organization, addresses, now } = batch;
+    const windowStart = invitationEmailWindowStart(now);
+    const senderUsage = await store.invitationEmails.lockSenderUsage(
+      input.actorUserId,
+      windowStart,
+    );
+    const usage: InvitationEmailUsage = await store.invitationEmails.lockUsage(
+      input.organizationId,
+      windowStart,
+    );
+    const currentActor = await requireActorMembership(
+      store,
+      input.organizationId,
+      input.actorUserId,
+      'share',
+    );
+    assertManagesOrganization(currentActor.role);
+    const planned: PlannedAddress[] = [];
+    for (const address of addresses) {
+      planned.push(await InviteMembers.plan(store, input.organizationId, address));
+    }
+    assertInvitationBatchAvailable(
+      senderUsage,
+      usage,
+      planned.filter((entry: PlannedAddress) => entry.decided === null).length,
+      now,
+    );
+    const mail: InvitationMail = {
+      inviterUserId: input.actorUserId,
+      inviterName: await senderNameOf(store, input.actorUserId),
+      organizationName: organization.snapshot.name,
+      memberCount: await store.members.countSeats(input.organizationId),
+      language: organization.snapshot.defaultLanguage,
+    };
+    const invitations: InvitationOutcome[] = [];
+    for (const entry of planned) {
+      invitations.push(
+        entry.decided ??
+          (await InviteMembers.invite(store, input, mail, { address: entry.address, now })),
+      );
+    }
+    return { invitations };
   }
 
   /**

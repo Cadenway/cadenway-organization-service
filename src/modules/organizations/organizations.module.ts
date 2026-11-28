@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 
 import { subscriptionChangedHandlerProvider } from './composition/providers/adapters/billing/subscription-changed-handler.provider.js';
+import { purgeInvitationBatchReplaysHandlerProvider } from './composition/providers/adapters/invitations/purge-invitation-batch-replays-handler.provider.js';
 import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { verifiedEmailAuthorityProvider } from './composition/providers/adapters/invitations/verified-email-authority.provider.js';
@@ -15,6 +16,7 @@ import { projectTwoStepVerificationChangeProvider } from './composition/provider
 import { projectUserSignUpProvider } from './composition/providers/use-cases/directory/project-user-sign-up.provider.js';
 import { acceptInvitationProvider } from './composition/providers/use-cases/invitations/accept-invitation.provider.js';
 import { inviteMembersProvider } from './composition/providers/use-cases/invitations/invite-members.provider.js';
+import { getInvitationProvider } from './composition/providers/use-cases/invitations/get-invitation.provider.js';
 import { listInvitationsProvider } from './composition/providers/use-cases/invitations/list-invitations.provider.js';
 import { listReceivedInvitationsProvider } from './composition/providers/use-cases/invitations/list-received-invitations.provider.js';
 import { refuseInvitationProvider } from './composition/providers/use-cases/invitations/refuse-invitation.provider.js';
@@ -38,6 +40,7 @@ import { searchOrganizationCursorProvider } from './composition/providers/use-ca
 import { BillingAuthorityController } from './presentation/http/controllers/billing/billing-authority.controller.js';
 import { AutomationRecipientController } from './presentation/http/controllers/automation/automation-recipient.controller.js';
 import { QuotaNotificationRecipientsController } from './presentation/http/controllers/billing/quota-notification-recipients.controller.js';
+import { InvitationBatchesController } from './presentation/http/controllers/invitations/invitation-batches.controller.js';
 import { InvitationsController } from './presentation/http/controllers/invitations/invitations.controller.js';
 import { ReceivedInvitationsController } from './presentation/http/controllers/invitations/received-invitations.controller.js';
 import { OrganizationLogoController } from './presentation/http/controllers/logo/organization-logo.controller.js';
@@ -70,6 +73,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     AccountDeletionReservationsController,
     MemberNamesController,
     InvitationsController,
+    InvitationBatchesController,
     ReceivedInvitationsController,
     SearchAuthorityController,
     AutomationRecipientController,
@@ -84,6 +88,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     applySeatEntitlementProvider,
     checkAutomationRecipientProvider,
     expireOrganizationLogoUploadsHandlerProvider,
+    purgeInvitationBatchReplaysHandlerProvider,
     createOrganizationProvider,
     updateOrganizationProvider,
     getCurrentOrganizationProvider,
@@ -97,6 +102,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     changeMemberRoleProvider,
     removeMemberProvider,
     inviteMembersProvider,
+    getInvitationProvider,
     listInvitationsProvider,
     resendInvitationProvider,
     revokeInvitationProvider,

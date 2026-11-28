@@ -30,5 +30,7 @@ export type Refusal =
       readonly remaining: number;
       readonly nextAvailableAt: Date;
     }
+  | { readonly reason: 'idempotency-key-reused' }
+  | { readonly reason: 'idempotency-request-in-progress' }
   | { readonly reason: 'user-not-found' }
   | { readonly reason: 'user-not-synchronized' };
