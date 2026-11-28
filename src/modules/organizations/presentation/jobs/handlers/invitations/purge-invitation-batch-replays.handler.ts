@@ -105,15 +105,20 @@ export interface ExpiredInvitationBatchReplayPurge {
  * budget, and the backlog is read only with time left. A tick that stops on its budget, before
  * another delete, ends normally: it logs, at `warn`, how many rows it deleted and how old the
  * oldest expired row still is (`null` when there was no time to read it), then leaves the rest to
- * the next tick. A delete the deadline or the abort cut short once started (in its checkout, its
- * setup, its delete, its commit or its rollback) is not confirmed: it made no progress, except one
- * cut short in its commit, which may have committed without its answer coming back. The tick logs,
- * at `error`, the phase, what cut it short, `committed: 'unknown'` for a commit, the rows of the
- * deletes it confirmed before and the backlog, then fails with the store's
- * `InvitationBatchReplayPurgeCutShortError`, so the queue retries it with its backoff, as any
- * other failed tick: a delete of expired rows is safe to run again. The backlog is read best
- * effort: a read that fails logs `null` and never replaces the outcome of the tick. The store destroys the connection of a call it gives up on, so that call
- * settles at once and the retry runs. As a fallback, a tick that still finds a call of an earlier
+ * the next tick. A delete cut short once started, by the deadline, the abort or a connection lost
+ * after its commit was sent (in its checkout, its setup, its delete, its commit or its rollback),
+ * is not confirmed: it made no progress, except one cut short in its commit, which may have
+ * committed without its answer coming back. The tick logs, at `warn`, the phase, what cut it
+ * short, `committed: 'unknown'` for a commit, the rows of the deletes it confirmed before and the
+ * backlog, then fails with the store's `InvitationBatchReplayPurgeCutShortError`, so the queue
+ * retries it with its backoff, as any other failed tick: a delete of expired rows is safe to run
+ * again. The `warn` keeps the fields; the only `error` event is the one `@cadenway/nest-jobs`
+ * writes when the last attempt fails and the job moves to its dead-letter queue (each earlier
+ * attempt gets a `warn` of its own), whose text, the name and message of the error, names the
+ * phase and the trigger: the job runtime never logs the properties of an error. The backlog is
+ * read best effort: a read that fails logs `null` and never replaces the outcome of the tick. The
+ * store destroys the connection of a call it gives up on, so that call settles at once and the
+ * retry runs. As a fallback, a tick that still finds a call of an earlier
  * tick running (one waiting for a pooled connection) skips at once, logging it at `warn`, so the
  * purge never holds more than one connection.
  */
@@ -211,10 +216,10 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
    * Method cutShortReported
    *
    * @description
-   * Passes the outcome of a delete through, logging, at `error`, a delete cut short once started,
+   * Passes the outcome of a delete through, logging, at `warn`, a delete cut short once started,
    * with its phase, what cut it short, whether it committed when that is unknown (a commit whose
    * answer never came), the rows of the deletes the tick confirmed before and its backlog, before
-   * the same error fails the tick.
+   * the same error fails the tick; the job runtime writes the error-level event of a last attempt.
    *
    * @param {Promise<number | null>} purge - The delete.
    * @param {{ readonly deleted: number; readonly deadline: number; readonly signal: AbortSignal }}
@@ -231,7 +236,7 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
       return await purge;
     } catch (error: unknown) {
       if (error instanceof InvitationBatchReplayPurgeCutShortError) {
-        this.logger.error(
+        this.logger.warn(
           {
             phase: error.phase,
             trigger: error.trigger,
