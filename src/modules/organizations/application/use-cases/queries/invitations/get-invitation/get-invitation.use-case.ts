@@ -1,14 +1,13 @@
-import type { Member } from '../../../../../domain/aggregates/member/member.aggregate.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import type { InvitationLifecycle } from '../../../../../domain/value-objects/invitations/invitation-lifecycle.value-object.js';
 import type { InvitationState } from '../../../../../domain/value-objects/invitations/invitation-state.value-object.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
+import type { ActorInvitationRead } from '../../../../models/invitations/actor-invitation-read.model.js';
 import type { InvitationWithInviter } from '../../../../models/invitations/invitation-with-inviter.model.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { InvitationStateView } from '../../../../projections/invitations/invitation-state-view.projection.js';
-import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
 import type { GetInvitationInput } from './get-invitation.input.js';
 
 /**
@@ -20,9 +19,10 @@ import type { GetInvitationInput } from './get-invitation.input.js';
  * invitation from an accepted or refused one. The owner and the admins read it, as they see the
  * pending list (`role-forbidden` otherwise); an actor outside the organization answers
  * `organization-not-found`, and an invitation of another organization `invitation-not-found`
- * (decision 9 of P2b). One read-only tenant transaction at `REPEATABLE READ`: the actor's role and
- * the invitation come from the same snapshot, so a demotion or an answer that commits between the
- * two reads can never mix a former role with a later state, or the reverse.
+ * (decision 9 of P2b). One read-only tenant transaction at `READ COMMITTED`, and one statement
+ * (`readAsActor`) for the actor's role, the invitation and the instant that tells `pending` from
+ * `expired`: one snapshot and one instant, so an answer committed before the read is never shown
+ * as an expiry, and a demotion committed meanwhile never mixes with a later state.
  */
 export class GetInvitation {
   // #region Properties
@@ -70,16 +70,16 @@ export class GetInvitation {
     try {
       return await this.unitOfWork.runInRequestOrganization(
         async (store: OrganizationsStore): Promise<InvitationStateView> => {
-          const actor: Member = await requireActorMembership(
-            store,
+          const read: ActorInvitationRead | null = await store.invitations.readAsActor(
             input.organizationId,
             input.actorUserId,
-          );
-          assertManagesOrganization(actor.role);
-          const found: InvitationWithInviter | null = await store.invitations.findWithInviter(
-            input.organizationId,
             input.invitationId,
           );
+          if (read === null) {
+            throw new OrganizationRefusal({ reason: 'organization-not-found' });
+          }
+          assertManagesOrganization(read.actorRole);
+          const found: InvitationWithInviter | null = read.invitation;
           if (found === null) {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
@@ -98,7 +98,7 @@ export class GetInvitation {
             version: state.version,
           };
         },
-        { readOnly: true, isolationLevel: 'repeatable read' },
+        { readOnly: true },
       );
     } catch (error) {
       throw toOrganizationRefusal(error);

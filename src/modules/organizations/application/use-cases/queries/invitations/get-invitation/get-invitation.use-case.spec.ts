@@ -119,14 +119,12 @@ describe('GetInvitation', () => {
     expect(waited.status).toBe('expired');
   });
 
-  it('reads the role of the actor and the invitation in one read-only snapshot', async () => {
+  it('reads the role of the actor and the invitation in one read-only transaction', async () => {
     const before: number = scenario.store.requestOptions.length;
 
     await read.execute({ ...owner, invitationId });
 
-    expect(scenario.store.requestOptions.slice(before)).toEqual([
-      { readOnly: true, isolationLevel: 'repeatable read' },
-    ]);
+    expect(scenario.store.requestOptions.slice(before)).toEqual([{ readOnly: true }]);
   });
 
   it('lets the owner and the admins read it, and no other member', async () => {

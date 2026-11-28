@@ -491,6 +491,62 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(await effects(lyonId)).toMatchObject({ invitations: 2, emails: 100, replays: 1 });
     });
 
+    it('commits a batch that outlives its lease, which neither a purge nor another request takes', async () => {
+      const slow = 'members-page-batch-slow';
+      // Every lease this batch takes or renews has already run out, as for a batch slower than
+      // the 30 seconds of its lease.
+      await stack.migrator.query(
+        `create function expire_invitation_batch_lease() returns trigger language plpgsql as
+         $$ begin
+           if new.state = 'reserved' then
+             new.expires_at := clock_timestamp() - interval '1 second';
+           end if;
+           return new;
+         end $$`,
+      );
+      await stack.migrator.query(
+        `create trigger expire_invitation_batch_lease before insert or update on invitation_batch_replays
+         for each row execute function expire_invitation_batch_lease()`,
+      );
+      let original: Response;
+      let competitor: Response;
+      let purged: number | null;
+      try {
+        const lock = await holdSenderLock();
+        const pending: Promise<Response> = invite(ines, atelierNordId, slow, [
+          'sven@ateliernord.fr',
+        ]);
+        try {
+          await lock.waiting(1);
+          purged = await new ExpiredInvitationBatchReplays(app.get(SystemTransactionRunner)).purge(
+            500,
+            { deadline: Date.now() + 5_000, signal: new AbortController().signal },
+          );
+          competitor = await invite(ines, atelierNordId, slow, ['tess@ateliernord.fr']);
+        } finally {
+          await lock.release();
+        }
+        original = await pending;
+      } finally {
+        await stack.migrator.query(
+          'drop trigger expire_invitation_batch_lease on invitation_batch_replays',
+        );
+        await stack.migrator.query('drop function expire_invitation_batch_lease()');
+      }
+
+      expect(purged).toBe(0);
+      expect(competitor.status).toBe(409);
+      expect(competitor.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      expect(original.status).toBe(200);
+      expect((original.body as InvitationBatchResult).invitations[0]).toMatchObject({
+        email: 'sven@ateliernord.fr',
+        outcome: 'invited',
+      });
+      const replayed: Response = await invite(ines, atelierNordId, slow, ['sven@ateliernord.fr']);
+      expect(replayed.status).toBe(200);
+      expect(replayed.body).toEqual(original.body);
+    });
+
     it('starts the 24 hours of a replay on the database clock when the record is written', async () => {
       const key = 'members-page-batch-delayed';
       const lock = await holdSenderLock();
@@ -1252,6 +1308,39 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(revalidated.headers['cache-control']).toBe('private, no-store');
       expect(revalidated.headers.etag).toBeUndefined();
       expect(revalidated.body).toMatchObject({ id: invitationId, status: 'expired', version: 1 });
+    });
+
+    it('reads an invitation accepted just before its expiry as accepted, never expired', async () => {
+      const invitationId: string = await invited('ulla@ateliernord.fr');
+      const ulla: Account = { id: newId(), name: 'Ulla Berg', email: 'ulla@ateliernord.fr' };
+      await stack.system(
+        `insert into directory_users (user_id, name, email, email_verified, email_version)
+         values ($1, $2, $3, true, 1)`,
+        [ulla.id, ulla.name, ulla.email],
+      );
+      stack.verifiedEmails.set(ulla.id, 1, ulla.email);
+      await stack.system(
+        `update invitations set sent_at = now() - interval '7 days',
+         expires_at = clock_timestamp() + interval '1500 milliseconds' where id = $1`,
+        [invitationId],
+      );
+
+      const accepted: Response = await call(
+        'post',
+        `/internal/v1/users/${ulla.id}/invitations/${invitationId}/accept`,
+        ulla,
+        null,
+        { body: {} },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
+      const state: InvitationState = await read(invitationId);
+
+      expect(accepted.status).toBe(200);
+      expect(state).toMatchObject({ status: 'accepted', revokedAt: null });
+      expect(state.answeredAt).toEqual(expect.any(String));
+      expect(new Date(state.answeredAt ?? '').getTime()).toBeLessThan(
+        new Date(state.expiresAt).getTime(),
+      );
     });
 
     it('tells an accepted, a refused and a revoked invitation apart', async () => {

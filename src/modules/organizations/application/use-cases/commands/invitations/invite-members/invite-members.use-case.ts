@@ -226,6 +226,10 @@ export class InviteMembers {
     try {
       return await this.unitOfWork.runInRequestOrganization(
         async (store: OrganizationsStore): Promise<InviteMembersOutput> => {
+          // Hold the reservation for the whole batch: past its lease, nobody may take it over.
+          if (!(await store.invitationBatchReplays.renew(key, leaseId))) {
+            throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+          }
           const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
             organization: await InviteMembers.authorize(store, input),
             addresses,

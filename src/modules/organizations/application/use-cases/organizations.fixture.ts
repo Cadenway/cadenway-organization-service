@@ -26,7 +26,7 @@ import { searchKeyOf } from '../../domain/value-objects/search/search-key.value-
 import type { InvitationBatchReplayKey } from '../models/invitations/invitation-batch-replay-key.model.js';
 import type { InvitationBatchReplay } from '../models/invitations/invitation-batch-replay.model.js';
 import type { InvitationMail } from '../models/invitations/invitation-mail.model.js';
-import type { InvitationWithInviter } from '../models/invitations/invitation-with-inviter.model.js';
+import type { ActorInvitationRead } from '../models/invitations/actor-invitation-read.model.js';
 import type { StoredInvitationBatch } from '../models/invitations/stored-invitation-batch.model.js';
 import type { MemberFilters } from '../models/members/member-filters.model.js';
 import type { Page } from '../models/pagination/page.model.js';
@@ -544,19 +544,32 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
             state?.organizationId === organizationId ? Invitation.restore(state) : null,
           );
         },
-        findWithInviter: (
+        readAsActor: (
           organizationId: string,
+          actorUserId: string,
           invitationId: string,
-        ): Promise<InvitationWithInviter | null> => {
+        ): Promise<ActorInvitationRead | null> => {
+          const actor: MemberState | undefined = activeMembers(organizationId).find(
+            (member: MemberState) => member.userId === actorUserId.toLowerCase(),
+          );
           const state: InvitationState | undefined = tables.invitations.get(invitationId);
           return Promise.resolve(
-            state?.organizationId === organizationId
-              ? {
-                  invitation: Invitation.restore(state),
-                  invitedBy: { userId: state.invitedByUserId, name: nameOf(state.invitedByUserId) },
-                  readAt: this.databaseNow(),
-                }
-              : null,
+            actor === undefined
+              ? null
+              : {
+                  actorRole: actor.role,
+                  invitation:
+                    state?.organizationId === organizationId
+                      ? {
+                          invitation: Invitation.restore(state),
+                          invitedBy: {
+                            userId: state.invitedByUserId,
+                            name: nameOf(state.invitedByUserId),
+                          },
+                          readAt: this.databaseNow(),
+                        }
+                      : null,
+                },
           );
         },
         find: (invitationId: string): Promise<Invitation | null> => {
@@ -690,6 +703,20 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           tables.replays.set(claim, reservation);
           this.tables.replays.set(claim, reservation);
           return Promise.resolve(reservation.leaseId);
+        },
+        renew: (key: InvitationBatchReplayKey, leaseId: string): Promise<boolean> => {
+          const claim: string = replayKeyOf(key);
+          const current: StoredReplay | undefined = tables.replays.get(claim);
+          if (current?.state !== 'reserved' || current.leaseId !== leaseId) {
+            return Promise.resolve(false);
+          }
+          const renewed: StoredReplay = {
+            ...current,
+            expiresAt: new Date(this.databaseNow().getTime() + INVITATION_BATCH_LEASE_MS),
+          };
+          tables.replays.set(claim, renewed);
+          this.tables.replays.set(claim, renewed);
+          return Promise.resolve(true);
         },
         complete: (
           key: InvitationBatchReplayKey,

@@ -164,10 +164,14 @@ describe('ExpiredInvitationBatchReplays', () => {
     expect(statements[0]).toContain('idle_in_transaction_session_timeout');
   });
 
-  it('answers by its deadline when the commit stalls, without waiting for it', async () => {
-    vi.useFakeTimers();
+  /**
+   * A runner whose commit waits until the test lets it go.
+   *
+   * @returns The repository, the statements and the commit.
+   */
+  function stalledCommit() {
     const commit = { finish: (): void => undefined };
-    const execute = vi.fn(() => Promise.resolve({ rowCount: 42, rows: [] }));
+    const execute = vi.fn(() => Promise.resolve({ rowCount: 42, rows: [{ age: 7 }] }));
     const system = {
       run: async <TResult>(
         work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
@@ -179,15 +183,37 @@ describe('ExpiredInvitationBatchReplays', () => {
         return result;
       },
     } as unknown as SystemTransactionRunner;
-    const replays = new ExpiredInvitationBatchReplays(system);
+    return { replays: new ExpiredInvitationBatchReplays(system), execute, commit };
+  }
+
+  it('fails the purge by its deadline when a delete is in flight or committing, without waiting', async () => {
+    vi.useFakeTimers();
+    const { replays, execute, commit } = stalledCommit();
     const started: number = Date.now();
 
     const purge: Promise<number | null> = replays.purge(500, { deadline: started + 300, signal });
+    const failed = expect(purge).rejects.toThrow('while a delete was in flight');
     await vi.advanceTimersByTimeAsync(300);
 
-    await expect(purge).resolves.toBeNull();
+    await failed;
     expect(Date.now() - started).toBeLessThanOrEqual(310);
     expect(execute).toHaveBeenCalledTimes(2);
+    commit.finish();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('answers null by its deadline when a backlog read is cut short, a read failing nothing', async () => {
+    vi.useFakeTimers();
+    const { replays, commit } = stalledCommit();
+    const started: number = Date.now();
+
+    const read: Promise<number | null> = replays.oldestExpiredAgeSeconds({
+      deadline: started + 300,
+      signal,
+    });
+    await vi.advanceTimersByTimeAsync(300);
+
+    await expect(read).resolves.toBeNull();
     commit.finish();
     await vi.advanceTimersByTimeAsync(0);
   });

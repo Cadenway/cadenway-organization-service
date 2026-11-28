@@ -114,7 +114,7 @@ export class ExpiredInvitationBatchReplays {
    * once the transaction began.
    */
   public purge(limit: number, window: PurgeWindow): Promise<number | null> {
-    return this.within(window, {}, async (db: TransactionDatabase): Promise<number> => {
+    return this.within(window, {}, 'fail', async (db: TransactionDatabase): Promise<number> => {
       const result = await db.execute(expiredPurgeOf(limit));
       return result.rowCount ?? 0;
     });
@@ -135,6 +135,7 @@ export class ExpiredInvitationBatchReplays {
     return this.within(
       window,
       { readOnly: true },
+      'skip',
       async (db: TransactionDatabase): Promise<number | null> => {
         const result = await db.execute<{ age: number | null }>(
           sql`select floor(extract(epoch from ${PURGE_CUTOFF} - min(expires_at)))::int as age
@@ -151,7 +152,10 @@ export class ExpiredInvitationBatchReplays {
    * @description
    * Runs `work` in a system transaction bounded by `window`, from the wait for a pooled connection
    * to the commit. The whole transaction races the deadline and the abort signal: if either comes
-   * first, the call answers `null` at once and never waits for the transaction. Left behind, the
+   * first, the call never waits for the transaction. It answers `null` when no statement of `work`
+   * had started (no time left, the normal end of a tick), and, under `cutShort: 'fail'`, rejects
+   * when one was in flight or committing, since the server may have cancelled it: the job then
+   * fails and its queue's bounded retry applies, instead of a tick acknowledged as done. Left behind, the
    * transaction runs no statement of its own past that point (it checks before each one), and the
    * server ends it within the time that was left when it began: its first statement sets both
    * `statement_timeout` and `idle_in_transaction_session_timeout` to that time, so a statement that
@@ -162,21 +166,27 @@ export class ExpiredInvitationBatchReplays {
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
    * @param {TransactionOptions} options - How the transaction is opened.
+   * @param {'fail' | 'skip'} cutShort - What a deadline or an abort that comes while `work` runs
+   * does: `fail` rejects the call (a delete the server may have cancelled must fail its job, so its
+   * queue retries it), `skip` answers `null` (a read).
    * @param {(db: TransactionDatabase) => Promise<TResult>} work - The statements of the call.
    * @returns {Promise<TResult | null>} What `work` resolved with, or `null` without time left.
    */
   private within<TResult>(
     window: PurgeWindow,
     options: TransactionOptions,
+    cutShort: 'fail' | 'skip',
     work: (db: TransactionDatabase) => Promise<TResult>,
   ): Promise<TResult | null> {
     if (this.isOver(window)) {
       return Promise.resolve(null);
     }
     return new Promise<TResult | null>((resolve, reject) => {
-      const race: { abandoned: boolean; timer?: ReturnType<typeof setTimeout> } = {
-        abandoned: false,
-      };
+      const race: {
+        abandoned: boolean;
+        inFlight: boolean;
+        timer?: ReturnType<typeof setTimeout>;
+      } = { abandoned: false, inFlight: false };
       const listeners: { abandon: () => void } = { abandon: (): void => undefined };
       const stopRace = (): void => {
         clearTimeout(race.timer);
@@ -186,7 +196,11 @@ export class ExpiredInvitationBatchReplays {
         if (!race.abandoned) {
           race.abandoned = true;
           stopRace();
-          resolve(null);
+          if (race.inFlight && cutShort === 'fail') {
+            reject(new Error('The deadline of the purge came while a delete was in flight.'));
+          } else {
+            resolve(null);
+          }
         }
       };
       const abandon = listeners.abandon;
@@ -207,6 +221,7 @@ export class ExpiredInvitationBatchReplays {
           if (stopped()) {
             return null;
           }
+          race.inFlight = true;
           return work(db);
         }, options)
         .then(

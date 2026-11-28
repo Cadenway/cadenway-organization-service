@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { and, eq, gt, isNull, lte, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
 import type { InvitationBatchReplayKey } from '../../../../../application/models/invitations/invitation-batch-replay-key.model.js';
@@ -60,14 +60,19 @@ export const PURGE_CUTOFF: SQL<Date> = sql<Date>`statement_timestamp()`;
  * @description
  * The bounded delete a keyed batch runs: at most `INLINE_PURGE_LIMIT` expired records of its
  * organization, oldest first, by `invitation_batch_replays_organization_expiry_index`, skipping the
- * rows another transaction is deleting.
+ * rows another transaction holds, and never the row of the batch's own key.
  *
  * @param {string} organizationId - The organization of the batch.
+ * @param {InvitationBatchReplayKey | undefined} spared - The key of the batch, whose row stays.
  * @returns {SQL} The statement.
  */
-export function inlinePurgeOf(organizationId: string): SQL {
+export function inlinePurgeOf(organizationId: string, spared?: InvitationBatchReplayKey): SQL {
+  const own: SQL =
+    spared === undefined
+      ? sql`true`
+      : sql`(actor_user_id, key_digest) <> (${spared.actorUserId}::uuid, ${digestOf(spared.key)})`;
   return boundedPurgeOf(
-    sql`organization_id = ${organizationId}::uuid and expires_at <= ${PURGE_CUTOFF}`,
+    sql`organization_id = ${organizationId}::uuid and expires_at <= ${PURGE_CUTOFF} and ${own}`,
     INLINE_PURGE_LIMIT,
   );
 }
@@ -241,11 +246,16 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    * Method reserve
    *
    * @description
-   * Inserts the reservation of the key, or takes over its row when that row's time ran out.
+   * Takes over the row of the key if its time ran out and no transaction holds it (a batch in
+   * flight holds its reservation from the start of its transaction, `renew`, so `for update skip
+   * locked` never takes a live holder's key, nor waits for it); otherwise inserts the reservation
+   * when the key has no row at all. A plain read decides between the two, since an insert against a
+   * row that a batch is updating would wait for that batch; the insert itself waits only for
+   * another request's short reservation of the same key, then finds its row.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is live.
+   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is live or held.
    */
   public async reserve(
     key: InvitationBatchReplayKey,
@@ -259,7 +269,37 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
       expiresAt: sql`${REPLAY_CLOCK} + ${LEASE_WINDOW}`,
       createdAt: sql`now()`,
     };
-    const rows: { readonly leaseId: string | null }[] = await this.db
+    const taken = await this.db.execute<{ lease_id: string }>(
+      sql`with expired as materialized (
+          select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
+          where organization_id = ${key.organizationId}::uuid
+            and actor_user_id = ${key.actorUserId}::uuid
+            and key_digest = ${digestOf(key.key)}
+            and expires_at <= ${REPLAY_CLOCK}
+          for update skip locked)
+        update ${invitationBatchReplays} as replay
+        set request_digest = ${lease.requestDigest}, state = 'reserved', lease_id = uuidv7(),
+            outcome = null, expires_at = ${REPLAY_CLOCK} + ${LEASE_WINDOW}, created_at = now()
+        from expired
+        where replay.organization_id = expired.organization_id
+          and replay.actor_user_id = expired.actor_user_id
+          and replay.key_digest = expired.key_digest
+        returning replay.lease_id`,
+    );
+    if (taken.rows[0]?.lease_id !== undefined) {
+      return taken.rows[0].lease_id;
+    }
+    // A row of the key that is live, or held by the transaction of its batch, keeps the key; an
+    // insert against it would wait for that transaction, so a plain read decides first.
+    const existing: { readonly keyDigest: string }[] = await this.db
+      .select({ keyDigest: invitationBatchReplays.keyDigest })
+      .from(invitationBatchReplays)
+      .where(keyOf(key))
+      .limit(1);
+    if (existing.length > 0) {
+      return null;
+    }
+    const inserted: { readonly leaseId: string | null }[] = await this.db
       .insert(invitationBatchReplays)
       .values({
         organizationId: key.organizationId,
@@ -267,26 +307,45 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
         keyDigest: digestOf(key.key),
         ...lease,
       })
-      .onConflictDoUpdate({
-        target: [
-          invitationBatchReplays.organizationId,
-          invitationBatchReplays.actorUserId,
-          invitationBatchReplays.keyDigest,
-        ],
-        set: lease,
-        setWhere: lte(invitationBatchReplays.expiresAt, REPLAY_CLOCK),
-      })
+      .onConflictDoNothing()
       .returning({ leaseId: invitationBatchReplays.leaseId });
-    return rows[0]?.leaseId ?? null;
+    return inserted[0]?.leaseId ?? null;
+  }
+
+  /**
+   * Method renew
+   *
+   * @description
+   * Renews the lease of `leaseId` from now and locks its row until the end of the transaction of
+   * the batch: neither a takeover nor a purge, both `skip locked`, can touch it while the batch
+   * runs, however long it takes.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch holds.
+   * @returns {Promise<boolean>} `false` when the lease is no longer the batch's.
+   */
+  public async renew(key: InvitationBatchReplayKey, leaseId: string): Promise<boolean> {
+    const rows: { readonly keyDigest: string }[] = await this.db
+      .update(invitationBatchReplays)
+      .set({ expiresAt: sql`${REPLAY_CLOCK} + ${LEASE_WINDOW}` })
+      .where(
+        and(
+          keyOf(key),
+          eq(invitationBatchReplays.state, 'reserved'),
+          eq(invitationBatchReplays.leaseId, leaseId),
+        ),
+      )
+      .returning({ keyDigest: invitationBatchReplays.keyDigest });
+    return rows.length === 1;
   }
 
   /**
    * Method complete
    *
    * @description
-   * Deletes at most `INLINE_PURGE_LIMIT` expired rows of the organization, then turns the
-   * reservation of `leaseId` into the record, replayed for 24 hours from the database's
-   * `clock_timestamp()` at this last statement of the batch.
+   * Turns the reservation of `leaseId` into the record, replayed for 24 hours from the database's
+   * `clock_timestamp()`, then deletes at most `INLINE_PURGE_LIMIT` other expired rows of the
+   * organization, never the row of the key itself.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {string} leaseId - The lease the batch holds.
@@ -298,7 +357,6 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
     leaseId: string,
     replay: InvitationBatchReplay,
   ): Promise<boolean> {
-    await this.db.execute(inlinePurgeOf(key.organizationId));
     const rows: { readonly keyDigest: string }[] = await this.db
       .update(invitationBatchReplays)
       .set({
@@ -316,7 +374,11 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
         ),
       )
       .returning({ keyDigest: invitationBatchReplays.keyDigest });
-    return rows.length === 1;
+    if (rows.length !== 1) {
+      return false;
+    }
+    await this.db.execute(inlinePurgeOf(key.organizationId, key));
+    return true;
   }
 
   /**

@@ -1,8 +1,8 @@
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { and, desc, eq, gt, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
-import type { InvitationWithInviter } from '../../../../../application/models/invitations/invitation-with-inviter.model.js';
+import type { ActorInvitationRead } from '../../../../../application/models/invitations/actor-invitation-read.model.js';
 import type { Page } from '../../../../../application/models/pagination/page.model.js';
 import type { PagePosition } from '../../../../../application/models/pagination/page-position.model.js';
 import type { InvitationRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-repository.port.js';
@@ -13,6 +13,7 @@ import type { EmailAddress } from '../../../../../domain/value-objects/email/ema
 import type { InvitationDraft } from '../../../../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationState } from '../../../../../domain/value-objects/invitations/invitation-state.value-object.js';
 import type { AssignableRole } from '../../../../../domain/value-objects/members/assignable-role.value-object.js';
+import type { Role } from '../../../../../domain/value-objects/members/role.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../../../../domain/value-objects/directory/former-member-name.value-object.js';
 import { toInvitation } from '../../mappers/invitations/invitation.mapper.js';
 import type { InvitationRow } from '../../mappers/invitations/invitation.mapper.js';
@@ -20,6 +21,7 @@ import { toSeatCount } from '../../mappers/members/seat-count.mapper.js';
 import { toPage } from '../../mappers/pagination/page.mapper.js';
 import { directoryUsers } from '../../schemas/directory/directory-user.schema.js';
 import { invitations } from '../../schemas/invitations/invitation.schema.js';
+import { members } from '../../schemas/members/member.schema.js';
 import { organizations } from '../../schemas/organizations/organization.schema.js';
 
 /**
@@ -338,42 +340,68 @@ export class DrizzleInvitationRepository implements InvitationRepository {
   }
 
   /**
-   * Method findWithInviter
+   * Method readAsActor
    *
    * @description
-   * Loads an invitation of an organization in any state, with the name of its sender and the
-   * instant of the read on the database clock (`statement_timestamp()`, in milliseconds).
+   * One statement from the actor's active membership, joined with the invitation of the
+   * organization and its sender, with the instant of the statement on the database clock
+   * (`statement_timestamp()`, in milliseconds): one snapshot, one instant.
    *
    * @param {string} organizationId - The organization.
+   * @param {string} actorUserId - The actor.
    * @param {string} invitationId - Id of the invitation.
-   * @returns {Promise<InvitationWithInviter | null>} The invitation, or `null`.
+   * @returns {Promise<ActorInvitationRead | null>} The role and the invitation, or `null` when the
+   * actor is not an active member.
    */
-  public async findWithInviter(
+  public async readAsActor(
     organizationId: string,
+    actorUserId: string,
     invitationId: string,
-  ): Promise<InvitationWithInviter | null> {
+  ): Promise<ActorInvitationRead | null> {
     const rows: {
-      readonly invitation: InvitationRow;
+      readonly actorRole: Role;
+      readonly invitation: InvitationRow | null;
       readonly inviterName: string;
       readonly readAtMs: number;
     }[] = await this.db
       .select({
+        actorRole: members.role,
         invitation: invitations,
         inviterName: INVITER_NAME,
         readAtMs: sql<number>`(extract(epoch from statement_timestamp()) * 1000)::float8`,
       })
-      .from(invitations)
+      .from(members)
+      .leftJoin(
+        invitations,
+        and(
+          eq(invitations.organizationId, members.organizationId),
+          eq(invitations.id, invitationId),
+        ),
+      )
       .leftJoin(directoryUsers, eq(directoryUsers.userId, invitations.invitedByUserId))
-      .where(and(eq(invitations.organizationId, organizationId), eq(invitations.id, invitationId)))
+      .where(
+        and(
+          eq(members.organizationId, organizationId),
+          eq(members.userId, actorUserId),
+          isNull(members.removedAt),
+        ),
+      )
       .limit(1);
     const row = rows[0];
-    return row === undefined
-      ? null
-      : {
-          invitation: toInvitation(row.invitation),
-          invitedBy: { userId: row.invitation.invitedByUserId, name: row.inviterName },
-          readAt: new Date(row.readAtMs),
-        };
+    if (row === undefined) {
+      return null;
+    }
+    return {
+      actorRole: row.actorRole,
+      invitation:
+        row.invitation === null
+          ? null
+          : {
+              invitation: toInvitation(row.invitation),
+              invitedBy: { userId: row.invitation.invitedByUserId, name: row.inviterName },
+              readAt: new Date(row.readAtMs),
+            },
+    };
   }
 
   /**

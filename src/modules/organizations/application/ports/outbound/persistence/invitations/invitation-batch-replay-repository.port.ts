@@ -48,6 +48,19 @@ export interface InvitationBatchReplayRepository {
   reserve(key: InvitationBatchReplayKey, request: InvitationBatchRequest): Promise<string | null>;
 
   /**
+   * Method renew
+   *
+   * @description
+   * Renews the lease of `leaseId` and holds its reservation for the rest of the transaction of the
+   * batch, so that neither a takeover nor a purge can take it while the batch runs, however long.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch holds.
+   * @returns {Promise<boolean>} `false` when the lease is no longer the batch's.
+   */
+  renew(key: InvitationBatchReplayKey, leaseId: string): Promise<boolean>;
+
+  /**
    * Method complete
    *
    * @description

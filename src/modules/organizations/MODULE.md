@@ -114,8 +114,10 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   the server cancels a statement past its timeout and terminates a session left idle in its
   transaction (a stalled commit included), so the pool discards that connection instead of
   reusing it. The kit's runner gives no handle on the connection, so these two timeouts are the
-  bound: the time left when the transaction began, past its first statement. A delete cut short
-  rolls back and fails the tick, which its queue retries.
+  bound: the time left when the transaction began, past its first statement. A call that had no
+  time left before its delete started answers `null`, the normal end of a tick; a deadline or an
+  abort that comes while a delete is in flight or committing fails the call, and with it the tick,
+  since the server may cancel that delete: the queue's bounded retry then applies.
   A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
@@ -519,9 +521,10 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `accepted`, `refused` or `revoked` as stored. `answeredAt` is set for an acceptance or a refusal,
   `revokedAt` for a revocation, from `answered_at`, which holds the instant that closed it; a
   revocation keeps the row with its status, so the three are stored, never inferred. The actor's
-  role and the invitation are read from one snapshot, and `pending` is told from `expired` at the
-  `statement_timestamp()` of the read, never at the arrival of a request that may have waited for
-  its connection. Every answer, refusals included, is `Cache-Control: private, no-store`, set by
+  role, the invitation and the instant that tells `pending` from `expired` (its
+  `statement_timestamp()`) come from one statement at `READ COMMITTED`: an acceptance committed
+  before the read is read as accepted, never as an expiry measured after it, and a request that
+  waited for its connection is judged at the read. Every answer, refusals included, is `Cache-Control: private, no-store`, set by
   `installOrganizationAuthorityCachePolicy` before the guards and the validation; a `200` carries
   no `ETag` and is never conditional: an invitation becomes `expired` without
   a new `version`, so a tag derived from the version could validate a stale copy. The handler
@@ -581,26 +584,32 @@ The Search readers open their snapshots directly with the kit's transaction runn
   when it sends mail. It needs no tenant budget lock because its new organization is private to
   the transaction. A request waiting on the lock longer
   than the `lock_timeout` of the application role (5 s) fails with a 500.
-- `GET /internal/v1/invitations/{invitationId}` opens a tenant `REPEATABLE READ READ ONLY`
-  transaction for the actor's membership and the invitation.
+- `GET /internal/v1/invitations/{invitationId}` opens a tenant `READ ONLY` transaction at
+  `READ COMMITTED` and reads the actor's active membership, the invitation, its sender and the
+  instant in one statement, from the membership: no row for the actor answers
+  `organization-not-found`, a row without an invitation `invitation-not-found`.
 - A keyed invitation batch runs in up to three tenant transactions. The first, short, settles the
   key once the role and the organization are checked: it reads the live row of the key with the
   actor's active membership, in one statement and without any lock, and checks the actor's role
   from that snapshot. A record answers its stored body to an equivalent batch, taking neither
   allowance lock; a reservation answers `409` to the same batch, still running; either answers
-  `422` to another batch, and a member who lost the role answers `403`. A free key (no row, or a
-  row whose time ran out) is reserved by one `insert … on conflict do update … where expires_at <=
-clock_timestamp()`, which takes over an expired row atomically; the primary key decides between
-  two requests that reserve one key at once (the second waits only for the first's reservation to
-  commit, then settles as above), so the first batch that reserves a key is the only one that runs.
-  The reservation commits. The second transaction runs the batch as without a key and turns the
-  reservation into its record by its `lease_id` last: the invitations, their ledger entries, their
-  `invitation.issued.v1` outbox rows and the record commit together, and any failure rolls them all
-  back. A batch that does not commit, a refusal such as a `429` included, then deletes its
-  reservation in a third transaction, best effort, so the key runs again at once; the 30-second
-  lease frees it otherwise (a crash). A batch whose lease ran out and was taken over finds no
-  reservation to turn into its record, answers `409` and rolls back. No step waits on a lock held by
-  a batch in flight.
+  `422` to another batch, and a member who lost the role answers `403`. A free key is reserved:
+  a row whose time ran out and that no transaction holds is taken over atomically
+  (`for update skip locked`); a key without any row gets an `insert … on conflict do nothing`, the
+  primary key deciding between two requests that reserve one key at once (the second waits only
+  for the first's short reservation to commit, then settles as above); a row that is live, or held
+  by its batch's transaction, keeps the key (`409`). The first batch that reserves a key is the
+  only one that runs. The reservation commits. The second transaction first renews the lease and
+  locks the reservation for its whole duration, so that past its lease neither a takeover nor a
+  purge (both `skip locked`) can take it, then runs the batch as without a key and turns the
+  reservation into its record by its `lease_id`, then deletes at most 10 other expired rows of the
+  organization, never its own: the invitations, their ledger entries, their `invitation.issued.v1`
+  outbox rows and the record commit together, and any failure rolls them all back. A batch that does
+  not commit, a refusal such as a `429` included, then deletes its reservation in a third
+  transaction, best effort, so the key runs again at once; the 30-second lease frees it otherwise
+  (a crash: the server ends a dead holder's transaction within its `idle_in_transaction_session_timeout`,
+  and its reservation is then free once the lease runs out). No step waits on a lock held by a
+  batch in flight.
 - The purge job runs in system transactions, a bounded exception: each one `delete` of at most 500
   expired replay records, chosen by expiry and skipping the rows a batch is deleting.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
@@ -644,9 +653,10 @@ Any failure rolls back the business rows and the outbox rows together
   under one key took different locks and the later one could commit first, leaving the earlier one a
   `422`. A reservation is decided on the key alone, at once and before any effect, so the first
   batch that reserves a key is the only one that runs, and every other one learns at once: `409`
-  for the same batch, `422` for another. The lease (30 s, beyond the `statement_timeout` of 10 s
-  and the `idle_in_transaction_session_timeout` of 30 s that bound a batch's transaction) covers a
-  crash; a failed batch deletes its reservation itself, so the key runs again at once. Nothing
+  for the same batch, `422` for another. The lease (30 s) covers a crash between the reservation
+  and the batch; the batch renews it and locks its reservation from the first statement of its
+  transaction, so a batch slower than its lease still commits, while a dead one's lock goes with its
+  connection; a failed batch deletes its reservation itself, so the key runs again at once. Nothing
   waits on a batch in flight: a bounded wait (tried in an earlier revision) let the retries of one
   slow batch each hold one of the five pooled connections, starving the readiness probe and other
   tenants, so a retry that lands while the batch it repeats is still running answers the retryable
