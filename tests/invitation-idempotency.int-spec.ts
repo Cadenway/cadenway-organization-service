@@ -222,21 +222,26 @@ describe('idempotent invitation batches and the invitation state', () => {
   }
 
   /**
-   * The advisory lock name the service takes for a scoped key and a `member` batch.
+   * Writes the reservation a `member` batch of Inès in Atelier Nord holds while it runs, as a
+   * request in flight (or one that crashed) leaves it.
    *
-   * @param organizationId - The organization.
-   * @param account - The actor.
    * @param key - The key.
    * @param emails - The addresses of the batch.
-   * @returns The lock name.
+   * @param leaseSeconds - How long the lease still holds; negative for a lease that ran out.
    */
-  function lockName(
-    organizationId: string,
-    account: Account,
+  async function reservedBy(
     key: string,
     emails: readonly string[],
-  ): string {
-    return `invitation-batch:${organizationId}:${account.id}:${digestOf(key)}:${digestOf(canonicalOf(emails))}`;
+    leaseSeconds = 30,
+  ): Promise<void> {
+    await stack.system(
+      `insert into invitation_batch_replays
+         (organization_id, actor_user_id, key_digest, request_digest, state, lease_id, outcome,
+          expires_at)
+       values ($1, $2, $3, $4, 'reserved', uuidv7(), null,
+               clock_timestamp() + make_interval(secs => $5))`,
+      [atelierNordId, ines.id, digestOf(key), digestOf(canonicalOf(emails)), leaseSeconds],
+    );
   }
 
   beforeAll(async () => {
@@ -329,56 +334,34 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(await effects(atelierNordId)).toEqual(before);
     });
 
-    it('answers request-in-progress while another transaction holds the key, and frees it when that one dies', async () => {
-      const holder: pg.PoolClient = await stack.migrator.connect();
-      holder.on('error', () => undefined);
+    it('answers 409 to the batch in flight and 422 to another under its reservation, until its lease runs out', async () => {
       const busy = 'members-page-batch-busy';
-      try {
-        await holder.query('begin');
-        const [backend] = (
-          await holder.query<{ pid: number }>(
-            'select pg_backend_pid() as pid, pg_advisory_xact_lock(hashtextextended($1, 0))',
-            [lockName(atelierNordId, ines, busy, ['nina@ateliernord.fr'])],
-          )
-        ).rows;
+      await reservedBy(busy, ['nina@ateliernord.fr']);
+      const before: Record<string, number> = await effects(atelierNordId);
 
-        const running: Response = await invite(ines, atelierNordId, busy, ['Nina@AtelierNord.fr']);
-        expect(running.status).toBe(409);
-        expect(running.body).toMatchObject({ code: 'idempotency.request-in-progress' });
-        expect(await effects(atelierNordId)).toMatchObject({ invitations: 2, replays: 1 });
+      const running: Response = await invite(ines, atelierNordId, busy, ['Nina@AtelierNord.fr']);
+      const other: Response = await invite(ines, atelierNordId, busy, ['olga@ateliernord.fr']);
 
-        // The transaction is never committed nor rolled back: its backend ends, as the
-        // connection of a crashed process would, and PostgreSQL releases its locks.
-        await stack.migrator.query('select pg_terminate_backend($1, 5000)', [backend?.pid]);
-      } finally {
-        holder.release(true);
-      }
+      expect(running.status).toBe(409);
+      expect(running.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      expect(other.status).toBe(422);
+      expect(other.body).toMatchObject({ code: 'idempotency.key-reused' });
+      expect(await effects(atelierNordId)).toEqual(before);
 
-      const freed: Response = await invite(ines, atelierNordId, busy, ['nina@ateliernord.fr']);
+      // The holder crashed: nothing deletes its reservation, but its lease runs out.
+      await stack.system(
+        `update invitation_batch_replays set expires_at = clock_timestamp() - interval '1 second'
+         where organization_id = $1 and actor_user_id = $2 and key_digest = $3`,
+        [atelierNordId, ines.id, digestOf(busy)],
+      );
+      const freed: Response = await invite(ines, atelierNordId, busy, ['olga@ateliernord.fr']);
       expect(freed.status).toBe(200);
-      expect((freed.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
-    });
-
-    it('lets another batch under a key run while an equivalent one is in flight, then refuses the latter', async () => {
-      const holder: pg.PoolClient = await stack.migrator.connect();
-      const shared = 'members-page-batch-shared';
-      try {
-        await holder.query('begin');
-        await holder.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
-          lockName(atelierNordId, ines, shared, ['pia@ateliernord.fr']),
-        ]);
-
-        const other: Response = await invite(ines, atelierNordId, shared, ['olga@ateliernord.fr']);
-        expect(other.status).toBe(200);
-        expect((other.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
-        await holder.query('rollback');
-      } finally {
-        holder.release();
-      }
-
-      const late: Response = await invite(ines, atelierNordId, shared, ['pia@ateliernord.fr']);
-      expect(late.status).toBe(422);
-      expect(late.body).toMatchObject({ code: 'idempotency.key-reused' });
+      expect((freed.body as InvitationBatchResult).invitations[0]).toMatchObject({
+        email: 'olga@ateliernord.fr',
+        outcome: 'invited',
+      });
+      const replayed: Response = await invite(ines, atelierNordId, busy, ['olga@ateliernord.fr']);
+      expect(replayed.body).toEqual(freed.body);
     });
 
     it('replays a committed batch to concurrent retries, never answering 409', async () => {
@@ -495,7 +478,7 @@ describe('idempotent invitation batches and the invitation state', () => {
         invite(ines, lyonId, key, ['oscar@ateliernord.fr']),
       ];
       try {
-        await lock.waiting(2);
+        await lock.waiting(1);
       } finally {
         await lock.release();
       }
@@ -540,59 +523,42 @@ describe('idempotent invitation batches and the invitation state', () => {
       const outcome: InvitationBatchResult = {
         invitations: [{ email: 'ruth@ateliernord.fr', outcome: 'invited', invitationId: newId() }],
       };
-      // The original batch, in flight: its claim is held and its record written, not committed.
-      const original: pg.PoolClient = await stack.migrator.connect();
-      let retries: Response[];
-      let probes: { readonly status: number; readonly durationMs: number }[];
-      let retriesMs: number;
-      try {
-        await original.query('begin');
-        await original.query(`select set_config('app.system_access', 'on', true)`);
-        await original.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
-          lockName(atelierNordId, ines, racing, emails),
-        ]);
-        await original.query(
-          `insert into invitation_batch_replays
-             (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
-           values ($1, $2, $3, $4, $5, clock_timestamp() + interval '24 hours')`,
-          [
-            atelierNordId,
-            ines.id,
-            digestOf(racing),
-            digestOf(canonicalOf(emails)),
-            JSON.stringify(outcome.invitations),
-          ],
-        );
-        /**
-         * Times a request.
-         *
-         * @param pending - The request.
-         * @returns Its status and how long it took.
-         */
-        const timed = async (
-          pending: PromiseLike<Response>,
-        ): Promise<{ readonly status: number; readonly durationMs: number }> => {
-          const started: number = Date.now();
-          const response: Response = await pending;
-          return { status: response.status, durationMs: Date.now() - started };
-        };
-        // More retries than the five connections of the pool, with a readiness probe and a read of
-        // another tenant at the same time.
+      // The original batch, in flight: the key is reserved under its lease, nothing committed.
+      await reservedBy(racing, emails);
+      /**
+       * Times a request.
+       *
+       * @param pending - The request.
+       * @returns Its status and how long it took.
+       */
+      const timed = async (
+        pending: PromiseLike<Response>,
+      ): Promise<{ readonly status: number; readonly durationMs: number }> => {
         const started: number = Date.now();
-        const pendingRetries: Promise<Response>[] = Array.from({ length: 12 }, () =>
-          invite(ines, atelierNordId, racing, emails),
-        );
-        const pendingProbes = [
-          timed(request(app.getHttpServer()).get('/health/ready')),
-          timed(call('get', '/internal/v1/organization', ines, lumenId)),
-        ];
-        retries = await Promise.all(pendingRetries);
-        retriesMs = Date.now() - started;
-        probes = await Promise.all(pendingProbes);
-      } finally {
-        await original.query('commit');
-        original.release();
-      }
+        const response: Response = await pending;
+        return { status: response.status, durationMs: Date.now() - started };
+      };
+      // More retries than the five connections of the pool, with a readiness probe and a read of
+      // another tenant at the same time.
+      const started: number = Date.now();
+      const pendingRetries: Promise<Response>[] = Array.from({ length: 12 }, () =>
+        invite(ines, atelierNordId, racing, emails),
+      );
+      const pendingProbes = [
+        timed(request(app.getHttpServer()).get('/health/ready')),
+        timed(call('get', '/internal/v1/organization', ines, lumenId)),
+      ];
+      const retries: Response[] = await Promise.all(pendingRetries);
+      const retriesMs: number = Date.now() - started;
+      const probes = await Promise.all(pendingProbes);
+      // The original batch commits its record.
+      await stack.system(
+        `update invitation_batch_replays
+         set state = 'committed', lease_id = null, outcome = $4,
+             expires_at = clock_timestamp() + interval '24 hours'
+         where organization_id = $1 and actor_user_id = $2 and key_digest = $3`,
+        [atelierNordId, ines.id, digestOf(racing), JSON.stringify(outcome.invitations)],
+      );
       const replayed: Response = await invite(ines, atelierNordId, racing, emails);
 
       expect(retries.map((response) => response.status)).toEqual(Array(12).fill(409));
@@ -624,6 +590,8 @@ describe('idempotent invitation batches and the invitation state', () => {
         'actor_user_id',
         'key_digest',
         'request_digest',
+        'state',
+        'lease_id',
         'outcome',
         'expires_at',
         'created_at',
@@ -757,8 +725,8 @@ describe('idempotent invitation batches and the invitation state', () => {
          $$ begin raise exception 'simulated failure after the invitations'; end $$`,
       );
       await stack.migrator.query(
-        `create trigger fail_invitation_batch_replay before insert on invitation_batch_replays
-         for each row execute function fail_invitation_batch_replay()`,
+        `create trigger fail_invitation_batch_replay before update on invitation_batch_replays
+         for each row when (new.state = 'committed') execute function fail_invitation_batch_replay()`,
       );
       const before: Record<string, number> = await effects(atelierNordId);
       const sent: number = await senderEmails(ines);
@@ -973,8 +941,8 @@ describe('idempotent invitation batches and the invitation state', () => {
     async function expired(organizationId: string, count: number, prefix: string): Promise<void> {
       await stack.system(
         `insert into invitation_batch_replays
-           (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
-         select $1, $2, encode(sha256(convert_to($3 || g, 'UTF8')), 'hex'), repeat('a', 64),
+           (organization_id, actor_user_id, key_digest, request_digest, state, outcome, expires_at)
+         select $1, $2, encode(sha256(convert_to($3 || g, 'UTF8')), 'hex'), repeat('a', 64), 'committed',
                 '[]'::jsonb, now() - make_interval(hours => 1, mins => g)
          from generate_series(1, $4::int) as g`,
         [organizationId, sweeper, prefix, count],
@@ -1147,8 +1115,9 @@ describe('idempotent invitation batches and the invitation state', () => {
       });
       await stack.system(
         `insert into invitation_batch_replays
-           (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
-         values ($1, $2, repeat('b', 64), repeat('a', 64), '[]'::jsonb, now() - interval '1 minute')`,
+           (organization_id, actor_user_id, key_digest, request_digest, state, outcome, expires_at)
+         values ($1, $2, repeat('b', 64), repeat('a', 64), 'committed', '[]'::jsonb,
+                 now() - interval '1 minute')`,
         [lumenId, newId()],
       );
       const live: number = await count(
@@ -1367,6 +1336,10 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(outsider.status).toBe(404);
       expect(outsider.body).toMatchObject({ code: 'organization.not-found' });
       expect(malformed.status).toBe(400);
+      // The policy runs before the guards and the validation: refusals are never cacheable either.
+      for (const refused of [elsewhere, unknown, member, outsider, malformed]) {
+        expect(refused.headers['cache-control']).toBe('private, no-store');
+      }
     });
   });
 

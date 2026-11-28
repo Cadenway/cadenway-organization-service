@@ -129,6 +129,69 @@ describe('ExpiredInvitationBatchReplays', () => {
     expect(pool.released).toBe(1);
   });
 
+  it('answers by its deadline when the setting stalls, and runs nothing after it', async () => {
+    vi.useFakeTimers();
+    const stalled = { finish: (): void => undefined };
+    const dialect: PgDialect = new PgDialect();
+    const statements: string[] = [];
+    const execute = vi.fn((statement: SQL) => {
+      const text: string = dialect.sqlToQuery(statement).sql;
+      statements.push(text);
+      return text.includes('statement_timeout')
+        ? new Promise((resolve) => {
+            stalled.finish = (): void => {
+              resolve({ rowCount: 0, rows: [] });
+            };
+          })
+        : Promise.resolve({ rowCount: 42, rows: [] });
+    });
+    const system = {
+      run: <TResult>(
+        work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
+      ): Promise<TResult> => work({ db: { execute } }),
+    } as unknown as SystemTransactionRunner;
+    const replays = new ExpiredInvitationBatchReplays(system);
+    const started: number = Date.now();
+
+    const purge: Promise<number | null> = replays.purge(500, { deadline: started + 300, signal });
+    await vi.advanceTimersByTimeAsync(300);
+    await expect(purge).resolves.toBeNull();
+    expect(Date.now() - started).toBeLessThanOrEqual(310);
+
+    stalled.finish();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain('idle_in_transaction_session_timeout');
+  });
+
+  it('answers by its deadline when the commit stalls, without waiting for it', async () => {
+    vi.useFakeTimers();
+    const commit = { finish: (): void => undefined };
+    const execute = vi.fn(() => Promise.resolve({ rowCount: 42, rows: [] }));
+    const system = {
+      run: async <TResult>(
+        work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
+      ): Promise<TResult> => {
+        const result: TResult = await work({ db: { execute } });
+        await new Promise<void>((resolve) => {
+          commit.finish = resolve;
+        });
+        return result;
+      },
+    } as unknown as SystemTransactionRunner;
+    const replays = new ExpiredInvitationBatchReplays(system);
+    const started: number = Date.now();
+
+    const purge: Promise<number | null> = replays.purge(500, { deadline: started + 300, signal });
+    await vi.advanceTimersByTimeAsync(300);
+
+    await expect(purge).resolves.toBeNull();
+    expect(Date.now() - started).toBeLessThanOrEqual(310);
+    expect(execute).toHaveBeenCalledTimes(2);
+    commit.finish();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
   it('answers at once when the job is aborted during the checkout, for the backlog read too', async () => {
     const { replays, execute, pool } = saturatedPool();
     const job = new AbortController();

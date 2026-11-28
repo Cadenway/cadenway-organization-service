@@ -26,6 +26,29 @@ import type { InviteMembersInput } from './invite-members.input.js';
 import type { InviteMembersOutput } from './invite-members.output.js';
 
 /**
+ * Interface KeyedBatch
+ *
+ * @description
+ * A batch sent with an `Idempotency-Key`: its scoped key, its canonical form, its distinct
+ * addresses and the instant of the sending.
+ */
+interface KeyedBatch {
+  // #region Properties
+  /** The key, scoped to the organization and the actor. */
+  readonly key: InvitationBatchReplayKey;
+
+  /** The canonical batch, whose fingerprint the key holds. */
+  readonly request: InvitationBatchRequest;
+
+  /** The distinct addresses, in order. */
+  readonly addresses: readonly EmailAddress[];
+
+  /** When the batch is sent. */
+  readonly now: Date;
+  // #endregion
+}
+
+/**
  * Interface PlannedAddress
  *
  * @description
@@ -76,15 +99,17 @@ interface PlannedAddress {
  * sent or emitted (decision 1 of the P2b security follow-ups). A batch that invites nobody is never
  * refused.
  *
- * With an `Idempotency-Key` (scoped to the organization, the actor and this operation), the
- * authorization and the organization are checked first, as for a fresh batch. A committed record
- * still live is then replayed for an equivalent batch once the actor's role is checked again in the
- * snapshot of the record, without any lock, writing, sending or emitting; another batch is
- * refused (`idempotency-key-reused`). Without a record, the key and the batch are claimed for the
- * transaction without waiting (`idempotency-request-in-progress` while an equivalent batch runs
- * with the key), and the batch runs as without a key and records its outcome last, in the same
- * transaction: the invitations, their ledger entries, their `invitation.issued.v1` and the record
- * commit together, and a refusal (a 429 included) or a failure records nothing.
+ * With an `Idempotency-Key` (scoped to the organization, the actor and this operation), the key is
+ * settled first, in a short transaction of its own, once the authorization and the organization
+ * are checked as for a fresh batch: a live record replays for an equivalent batch (the actor's role
+ * read again in the snapshot of the record, without any lock), without writing, sending or
+ * emitting; a live reservation answers `idempotency-request-in-progress` to the same batch; either
+ * answers `idempotency-key-reused` to another batch. A free key is reserved under a lease and the
+ * reservation commits, so the first batch that reserves a key is the only one that can run with
+ * it. The batch then runs as without a key and turns the reservation into its record last, in the
+ * same transaction: the invitations, their ledger entries, their `invitation.issued.v1` and the
+ * record commit together, and a refusal (a 429 included) or a failure records nothing and deletes
+ * the reservation.
  */
 export class InviteMembers {
   // #region Properties
@@ -145,34 +170,26 @@ export class InviteMembers {
     const now: Date = this.clock.now();
     try {
       const addresses: EmailAddress[] = distinctAddresses(input.emails);
-      const request: InvitationBatchRequest = InvitationBatchRequest.of(addresses, input.role);
-      const key: InvitationBatchReplayKey | null =
-        input.idempotencyKey === undefined
-          ? null
-          : {
-              organizationId: input.organizationId,
-              actorUserId: input.actorUserId,
-              key: input.idempotencyKey,
-            };
-      return await this.unitOfWork.runInRequestOrganization(
-        async (store: OrganizationsStore): Promise<InviteMembersOutput> => {
-          const actor: Member = await requireActorMembership(
-            store,
-            input.organizationId,
-            input.actorUserId,
-          );
-          assertManagesOrganization(actor.role);
-          const organization: Organization | null = await store.organizations.find(
-            input.organizationId,
-          );
-          if (organization === null) {
-            throw new OrganizationRefusal({ reason: 'organization-not-found' });
-          }
-          return key === null
-            ? InviteMembers.issue(store, input, { organization, addresses, now })
-            : InviteMembers.keyed(store, input, { key, request, organization, addresses, now });
+      if (input.idempotencyKey === undefined) {
+        return await this.unitOfWork.runInRequestOrganization(
+          async (store: OrganizationsStore): Promise<InviteMembersOutput> =>
+            InviteMembers.issue(store, input, {
+              organization: await InviteMembers.authorize(store, input),
+              addresses,
+              now,
+            }),
+        );
+      }
+      return await this.keyed(input, {
+        key: {
+          organizationId: input.organizationId,
+          actorUserId: input.actorUserId,
+          key: input.idempotencyKey,
         },
-      );
+        request: InvitationBatchRequest.of(addresses, input.role),
+        addresses,
+        now,
+      });
     } catch (error) {
       throw toOrganizationRefusal(error);
     }
@@ -182,112 +199,181 @@ export class InviteMembers {
    * Method keyed
    *
    * @description
-   * Runs a keyed batch. A committed live record is resolved first, without any lock, so retries of
-   * a committed batch all replay (or answer `idempotency-key-reused`) and never contend. Otherwise
-   * the key and the batch are claimed without waiting; the record is read again in either case (a
-   * batch with the same key may have committed in between), so a refused claim answers
-   * `idempotency-request-in-progress` only while the key still has no record. Then the batch runs and records its outcome last. A record that another transaction
-   * committed first for the key can only be of another batch, since an equivalent one holds the same
-   * claim: that answers `idempotency-key-reused` and rolls back.
+   * Runs a keyed batch in two transactions. The first, short, settles the key: it replays a live
+   * record or refuses a live reservation, or reserves the key under a lease and commits. The second
+   * runs the batch and turns the reservation into its record, together with the invitations. A
+   * batch that fails or is refused (a 429 included) deletes its reservation afterwards, best
+   * effort, so the key runs again at once; the lease frees it otherwise.
    *
-   * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
-   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest;
-   * readonly organization: Organization; readonly addresses: readonly EmailAddress[];
-   * readonly now: Date }} batch - The scoped key, the canonical batch, the organization, the
-   * distinct addresses and the instant.
+   * @param {KeyedBatch} batch - The scoped key, the canonical batch, the distinct addresses and the
+   * instant.
    * @returns {Promise<InviteMembersOutput>} The outcome, replayed or fresh.
    * @throws {OrganizationRefusal} `idempotency-request-in-progress`, `role-forbidden`,
    * `organization-not-found` or `invitation-daily-limit-reached`.
-   * @throws {InvitationBatchKeyReusedError} For a batch that is not equivalent to the recorded one.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
    */
-  private static async keyed(
-    store: OrganizationsStore,
-    input: InviteMembersInput,
-    batch: {
-      readonly key: InvitationBatchReplayKey;
-      readonly request: InvitationBatchRequest;
-      readonly organization: Organization;
-      readonly addresses: readonly EmailAddress[];
-      readonly now: Date;
-    },
-  ): Promise<InviteMembersOutput> {
-    const { key, request, organization, addresses, now } = batch;
-    const committed: InviteMembersOutput | null = await InviteMembers.replay(store, batch);
-    if (committed !== null) {
-      return committed;
+  private async keyed(input: InviteMembersInput, batch: KeyedBatch): Promise<InviteMembersOutput> {
+    const { key, request, addresses, now } = batch;
+    const settled: InviteMembersOutput | string = await this.unitOfWork.runInRequestOrganization(
+      (store: OrganizationsStore): Promise<InviteMembersOutput | string> =>
+        InviteMembers.reserve(store, input, batch),
+    );
+    if (typeof settled !== 'string') {
+      return settled;
     }
-    if (!(await store.invitationBatchReplays.tryClaim(key, request))) {
-      // The batch holding the claim may be a retry replaying a batch committed since the first
-      // read: only a key still without a record is in progress.
-      const settled: InviteMembersOutput | null = await InviteMembers.replay(store, batch);
-      if (settled !== null) {
-        return settled;
-      }
-      throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+    const leaseId: string = settled;
+    try {
+      return await this.unitOfWork.runInRequestOrganization(
+        async (store: OrganizationsStore): Promise<InviteMembersOutput> => {
+          const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
+            organization: await InviteMembers.authorize(store, input),
+            addresses,
+            now,
+          });
+          if (
+            !(await store.invitationBatchReplays.complete(key, leaseId, {
+              request,
+              invitations: output.invitations,
+            }))
+          ) {
+            // The lease ran out and another request took the key over: this batch rolls back.
+            throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+          }
+          return output;
+        },
+      );
+    } catch (error) {
+      await this.release(key, leaseId);
+      throw error;
     }
-    const meanwhile: InviteMembersOutput | null = await InviteMembers.replay(store, batch);
-    if (meanwhile !== null) {
-      return meanwhile;
-    }
-    const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
-      organization,
-      addresses,
-      now,
-      // Another batch of the key may have committed while this one waited on the allowance
-      // locks: it answers `idempotency-key-reused` before the allowance is evaluated, never 429.
-      afterLocks: (): Promise<InviteMembersOutput | null> => InviteMembers.replay(store, batch),
-    });
-    const recorded: boolean = await store.invitationBatchReplays.record(key, {
-      request,
-      invitations: output.invitations,
-    });
-    if (!recorded) {
-      throw new InvitationBatchKeyReusedError();
-    }
-    return output;
   }
 
   /**
-   * Method replay
+   * Method release
    *
    * @description
-   * Answers the live record of the key, if any, once the actor still manages the organization in
-   * the snapshot of the record: its outcome for an equivalent batch, `idempotency-key-reused` for
-   * another.
+   * Deletes the reservation of a batch that did not commit, in a transaction of its own; a failure
+   * is left to the lease, which frees the key once it runs out.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease of the batch.
+   * @returns {Promise<void>} Resolves once deleted, or once given up.
+   */
+  private async release(key: InvitationBatchReplayKey, leaseId: string): Promise<void> {
+    try {
+      await this.unitOfWork.runInRequestOrganization((store: OrganizationsStore): Promise<void> =>
+        store.invitationBatchReplays.release(key, leaseId),
+      );
+    } catch {
+      // The lease of `INVITATION_BATCH_LEASE_MS` frees the key.
+    }
+  }
+
+  /**
+   * Method authorize
+   *
+   * @description
+   * Checks that the actor is an owner or an admin of the organization of the request, and loads it.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
-   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest }}
-   * batch - The scoped key and the canonical batch.
-   * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` without a record.
+   * @param {InviteMembersInput} input - The batch.
+   * @returns {Promise<Organization>} The organization.
    * @throws {OrganizationRefusal} `organization-not-found` or `role-forbidden`.
-   * @throws {InvitationBatchKeyReusedError} For a batch that is not equivalent.
    */
-  private static async replay(
+  private static async authorize(
     store: OrganizationsStore,
-    batch: {
-      readonly key: InvitationBatchReplayKey;
-      readonly request: InvitationBatchRequest;
-    },
+    input: InviteMembersInput,
+  ): Promise<Organization> {
+    const actor: Member = await requireActorMembership(
+      store,
+      input.organizationId,
+      input.actorUserId,
+    );
+    assertManagesOrganization(actor.role);
+    const organization: Organization | null = await store.organizations.find(input.organizationId);
+    if (organization === null) {
+      throw new OrganizationRefusal({ reason: 'organization-not-found' });
+    }
+    return organization;
+  }
+
+  /**
+   * Method reserve
+   *
+   * @description
+   * The first transaction of a keyed batch: once the actor and the organization are found, settles
+   * the key from its live reservation or record, or reserves it. A reservation that another
+   * request takes between the read and the insert is settled from what that request wrote.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {InviteMembersInput} input - The batch.
+   * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @returns {Promise<InviteMembersOutput | string>} The replayed outcome, or the id of the lease.
+   */
+  private static async reserve(
+    store: OrganizationsStore,
+    input: InviteMembersInput,
+    batch: KeyedBatch,
+  ): Promise<InviteMembersOutput | string> {
+    await InviteMembers.authorize(store, input);
+    const settled: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
+    if (settled !== null) {
+      return settled;
+    }
+    const leaseId: string | null = await store.invitationBatchReplays.reserve(
+      batch.key,
+      batch.request,
+    );
+    if (leaseId !== null) {
+      return leaseId;
+    }
+    const meanwhile: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
+    if (meanwhile !== null) {
+      return meanwhile;
+    }
+    // The row that refused the reservation is gone already: the client may try again.
+    throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+  }
+
+  /**
+   * Method settle
+   *
+   * @description
+   * Answers the live reservation or record of the key, if any, once the actor still manages the
+   * organization in the snapshot of the row (a replay creates nothing, so it never waits on a role
+   * change in progress): a record replays its outcome to an equivalent batch; a reservation
+   * answers `idempotency-request-in-progress` to the same batch, which is still running; any other
+   * batch answers `idempotency-key-reused`.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` when the key is
+   * free.
+   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden` or
+   * `idempotency-request-in-progress`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
+   */
+  private static async settle(
+    store: OrganizationsStore,
+    batch: KeyedBatch,
   ): Promise<InviteMembersOutput | null> {
-    const { key, request } = batch;
     const stored: StoredInvitationBatch | null = await store.invitationBatchReplays.findLive(
-      key,
-      request,
+      batch.key,
+      batch.request,
     );
     if (stored === null) {
       return null;
     }
-    // Authorization first, as for a fresh batch: a member who lost the role answers 403, never
-    // what the key holds, whether the batch matches it or not. The role comes from the snapshot of
-    // the record itself, without a lock: a replay creates nothing, so it may not wait on a role
-    // change in progress (`MODULE.md`, Decisions).
     if (stored.actorRole === null) {
       throw new OrganizationRefusal({ reason: 'organization-not-found' });
     }
     assertManagesOrganization(stored.actorRole);
     if (!stored.sameRequest) {
       throw new InvitationBatchKeyReusedError();
+    }
+    if (stored.state === 'reserved') {
+      throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
     }
     return { invitations: stored.invitations };
   }
@@ -297,17 +383,14 @@ export class InviteMembers {
    *
    * @description
    * Runs the batch once the actor and the organization are found: locks the allowances of the
-   * sender and of the organization, checks the actor's role again under a share lock, gives
-   * `afterLocks` the last word before anything is decided (a keyed batch reads its replay record
-   * again there), decides each address, refuses a batch that needs more emails than remain, then
-   * stores the new invitations with their ledger entries and events.
+   * sender and of the organization, checks the actor's role again under a share lock, decides each
+   * address, refuses a batch that needs more emails than remain, then stores the new invitations
+   * with their ledger entries and events.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
    * @param {{ readonly organization: Organization; readonly addresses: readonly EmailAddress[];
-   * readonly now: Date; readonly afterLocks?: () => Promise<InviteMembersOutput | null> }} batch -
-   * The organization, the distinct addresses, the instant and the check run under the locks, whose
-   * outcome, when not `null`, is answered instead.
+   * readonly now: Date }} batch - The organization, the distinct addresses and the instant.
    * @returns {Promise<InviteMembersOutput>} The outcome of each distinct address.
    */
   private static async issue(
@@ -317,10 +400,9 @@ export class InviteMembers {
       readonly organization: Organization;
       readonly addresses: readonly EmailAddress[];
       readonly now: Date;
-      readonly afterLocks?: () => Promise<InviteMembersOutput | null>;
     },
   ): Promise<InviteMembersOutput> {
-    const { organization, addresses, now, afterLocks } = batch;
+    const { organization, addresses, now } = batch;
     const windowStart = invitationEmailWindowStart(now);
     const senderUsage = await store.invitationEmails.lockSenderUsage(
       input.actorUserId,
@@ -337,11 +419,6 @@ export class InviteMembers {
       'share',
     );
     assertManagesOrganization(currentActor.role);
-    const settled: InviteMembersOutput | null =
-      afterLocks === undefined ? null : await afterLocks();
-    if (settled !== null) {
-      return settled;
-    }
     const planned: PlannedAddress[] = [];
     for (const address of addresses) {
       planned.push(await InviteMembers.plan(store, input.organizationId, address));

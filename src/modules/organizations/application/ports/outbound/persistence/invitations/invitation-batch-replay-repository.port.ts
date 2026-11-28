@@ -7,12 +7,11 @@ import type { StoredInvitationBatch } from '../../../../models/invitations/store
  * Interface InvitationBatchReplayRepository
  *
  * @description
- * The replay records of the invitation batches sent with an `Idempotency-Key`, bound to the tenant
- * transaction of the batch: the record commits with the invitations and their outbox rows, or not
- * at all. A record keeps a fingerprint of its batch, never its addresses, and the `200` body to
- * replay, which lists them, until it expires. Its replay window (`INVITATION_BATCH_REPLAY_MS`)
- * starts when the record is written and is read and purged on the same clock, the store's own, so
- * the time a batch waited on its locks never shortens it.
+ * The keys of the invitation batches sent with an `Idempotency-Key`: first a reservation, taken
+ * and committed in a short transaction of its own before the batch runs, then, in the transaction
+ * of the batch, the record of its `200` outcome, replayed for 24 hours. A record keeps a fingerprint
+ * of its batch, never its addresses, and the body to replay, which lists them, until it expires.
+ * Every instant is read on the clock of the store, at the moment of the statement.
  */
 export interface InvitationBatchReplayRepository {
   // #region Methods
@@ -20,14 +19,13 @@ export interface InvitationBatchReplayRepository {
    * Method findLive
    *
    * @description
-   * The committed record of a key still replayed at the instant of the read, compared with the
-   * batch of the request, with the actor's current role, or `null`. One statement, one snapshot,
-   * no row lock: a membership locked by a role change or a removal in progress never makes the
-   * read wait.
+   * The live reservation or record of a key, compared with the batch of the request, with the
+   * actor's current role, or `null`. One statement, one snapshot, no row lock: a membership locked
+   * by a role change or a removal in progress never makes the read wait.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<StoredInvitationBatch | null>} The record.
+   * @returns {Promise<StoredInvitationBatch | null>} The reservation or record.
    */
   findLive(
     key: InvitationBatchReplayKey,
@@ -35,35 +33,51 @@ export interface InvitationBatchReplayRepository {
   ): Promise<StoredInvitationBatch | null>;
 
   /**
-   * Method tryClaim
+   * Method reserve
    *
    * @description
-   * Marks the key and the batch as in progress for the rest of the transaction, without waiting, so
-   * no request holds a pooled connection while another batch runs. Only an equivalent batch under
-   * the same key contends; another batch under it does not. The marker lives exactly as long as the
-   * transaction: it goes with its commit or rollback, and with its connection when the process
-   * stops, so a crashed request never holds the key.
+   * Reserves the key for the batch, with a lease of `INVITATION_BATCH_LEASE_MS`, unless a live
+   * reservation or record of the key exists; a row whose time ran out (a crashed holder's lease, an
+   * expired record) is taken over. One atomic statement, decided by the primary key: of two
+   * requests that reserve one key, the second answers once the first's transaction ends.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<boolean>} `false` when another transaction runs the same batch with the key.
+   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is live.
    */
-  tryClaim(key: InvitationBatchReplayKey, request: InvitationBatchRequest): Promise<boolean>;
+  reserve(key: InvitationBatchReplayKey, request: InvitationBatchRequest): Promise<string | null>;
 
   /**
-   * Method record
+   * Method complete
    *
    * @description
-   * Drops the expired record of the key and a few other expired records of the organization (a
-   * bounded number, so the batch never holds its locks for a long delete), then stores the record
-   * of the key, replayed for `INVITATION_BATCH_REPLAY_MS` from the instant it is written. The unique
-   * key of the table decides between two transactions that both reached this point with the same
-   * key: the second stores nothing.
+   * Turns the reservation of `leaseId` into the record of the batch, replayed for
+   * `INVITATION_BATCH_REPLAY_MS` from now, in the transaction of the batch; first deletes a bounded
+   * number of expired rows of the organization.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch holds.
    * @param {InvitationBatchReplay} replay - The batch and its outcome.
-   * @returns {Promise<boolean>} `false` when a record of the key already exists.
+   * @returns {Promise<boolean>} `false` when the lease is no longer the batch's (it ran out and was
+   * taken over).
    */
-  record(key: InvitationBatchReplayKey, replay: InvitationBatchReplay): Promise<boolean>;
+  complete(
+    key: InvitationBatchReplayKey,
+    leaseId: string,
+    replay: InvitationBatchReplay,
+  ): Promise<boolean>;
+
+  /**
+   * Method release
+   *
+   * @description
+   * Deletes the reservation of `leaseId`, so the key can run again at once; nothing when the lease
+   * is no longer there.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch held.
+   * @returns {Promise<void>} Resolves once deleted.
+   */
+  release(key: InvitationBatchReplayKey, leaseId: string): Promise<void>;
   // #endregion
 }

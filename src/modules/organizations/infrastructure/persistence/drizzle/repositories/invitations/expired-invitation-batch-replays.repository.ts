@@ -149,14 +149,16 @@ export class ExpiredInvitationBatchReplays {
    * Method within
    *
    * @description
-   * Runs `work` in a system transaction bounded by `window`, the wait for a pooled connection
-   * included. The checkout races the deadline and the abort signal: if either comes first, the call
-   * answers `null` at once, and the transaction, whenever it gets its connection, runs no statement
-   * of its own and ends, which gives the connection back to the pool. Once the transaction holds its
-   * connection in time, the race is over: `statement_timeout` is set to the time left, then the
-   * deadline and the abort are checked once more, right before `work`, which does not run if either
-   * came during that round trip. The time `work` may take is thus the time left before the setting,
-   * which overruns the deadline by the latency of one `set_config` at most.
+   * Runs `work` in a system transaction bounded by `window`, from the wait for a pooled connection
+   * to the commit. The whole transaction races the deadline and the abort signal: if either comes
+   * first, the call answers `null` at once and never waits for the transaction. Left behind, the
+   * transaction runs no statement of its own past that point (it checks before each one), and the
+   * server ends it within the time that was left when it began: its first statement sets both
+   * `statement_timeout` and `idle_in_transaction_session_timeout` to that time, so a statement that
+   * runs too long is cancelled and a transaction left idle, a stalled commit's included, has its
+   * session terminated, which the pool discards instead of reusing. The kit's runner does not give
+   * the connection to its caller, so it cannot be destroyed from here; these two timeouts are the
+   * bound: at most the time left at the start of the transaction past its first statement.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
    * @param {TransactionOptions} options - How the transaction is opened.
@@ -168,42 +170,41 @@ export class ExpiredInvitationBatchReplays {
     options: TransactionOptions,
     work: (db: TransactionDatabase) => Promise<TResult>,
   ): Promise<TResult | null> {
-    const left: number = window.deadline - this.now();
-    if (left <= 0 || window.signal.aborted) {
+    if (this.isOver(window)) {
       return Promise.resolve(null);
     }
     return new Promise<TResult | null>((resolve, reject) => {
-      let state: 'checking-out' | 'running' | 'abandoned' = 'checking-out';
-      const race: { timer?: ReturnType<typeof setTimeout> } = {};
+      const race: { abandoned: boolean; timer?: ReturnType<typeof setTimeout> } = {
+        abandoned: false,
+      };
       const listeners: { abandon: () => void } = { abandon: (): void => undefined };
       const stopRace = (): void => {
         clearTimeout(race.timer);
         window.signal.removeEventListener('abort', listeners.abandon);
       };
       listeners.abandon = (): void => {
-        if (state === 'checking-out') {
-          state = 'abandoned';
+        if (!race.abandoned) {
+          race.abandoned = true;
           stopRace();
           resolve(null);
         }
       };
       const abandon = listeners.abandon;
-      race.timer = setTimeout(abandon, left);
+      race.timer = setTimeout(abandon, Math.max(0, window.deadline - this.now()));
       window.signal.addEventListener('abort', abandon, { once: true });
+      const stopped = (): boolean => race.abandoned || this.isOver(window);
       this.system
         .run(async ({ db }): Promise<TResult | null> => {
-          const remaining: number = window.deadline - this.now();
-          if (state === 'abandoned' || remaining <= 0 || window.signal.aborted) {
-            abandon();
+          if (stopped()) {
             return null;
           }
-          state = 'running';
-          stopRace();
+          const timeout: string = timeoutOf(window.deadline - this.now());
           await db.execute(
-            sql`select set_config('statement_timeout', ${timeoutOf(remaining)}, true)`,
+            sql`select set_config('statement_timeout', ${timeout}, true),
+                       set_config('idle_in_transaction_session_timeout', ${timeout}, true)`,
           );
-          // The setting took a round trip: the deadline or the abort may have come meanwhile.
-          if (this.isOver(window)) {
+          // The settings took a round trip: the deadline or the abort may have come meanwhile.
+          if (stopped()) {
             return null;
           }
           return work(db);
@@ -211,12 +212,14 @@ export class ExpiredInvitationBatchReplays {
         .then(
           (value: TResult | null): void => {
             stopRace();
-            resolve(value);
+            if (!race.abandoned) {
+              resolve(value);
+            }
           },
           (error: unknown): void => {
             stopRace();
             // A transaction the call gave up on can only fail on its own; nobody waits for it.
-            if (state !== 'abandoned') {
+            if (!race.abandoned) {
               reject(error instanceof Error ? error : new Error(String(error)));
             }
           },

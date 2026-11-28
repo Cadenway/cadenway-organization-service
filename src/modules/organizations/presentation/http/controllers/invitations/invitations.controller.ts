@@ -196,11 +196,13 @@ export class InvitationsController {
    * @description
    * `GET /internal/v1/invitations/{invitationId}`: `200` with the invitation in any state; `400`,
    * `403 organization.role-forbidden`, `404 invitation.not-found` or `organization.not-found`.
-   * Uncacheable, without `ETag` and never conditional (`private, no-store`): its `status` moves
-   * from `pending` to `expired` with time, without a new `version`, so no tag derived from the
-   * version can validate a copy. The handler writes the body itself with `end`, which neither the
-   * kit's `EtagInterceptor` (it sees no returned body) nor the `ETag` and freshness check of
-   * Express `send` reach; a refusal still goes through the problem filter of the kit.
+   * Uncacheable, without `ETag` and never conditional: its `status` moves from `pending` to
+   * `expired` with time, without a new `version`, so no tag derived from the version can validate
+   * a copy. `Cache-Control: private, no-store` comes from `installOrganizationAuthorityCachePolicy`,
+   * before the guards and the validation, so refusals carry it too. The handler writes the body
+   * itself with `end`, which neither the kit's `EtagInterceptor` (it sees no returned body) nor the
+   * `ETag` and freshness check of Express `send` reach; a refusal still goes through the problem
+   * filter of the kit.
    *
    * @param {GetInvitationPath} path - The id of the invitation.
    * @param {Response} response - The response the handler writes.
@@ -218,7 +220,6 @@ export class InvitationsController {
     const body: InvitationState = toInvitationStateResponse(view);
     response
       .status(200)
-      .setHeader('Cache-Control', 'private, no-store')
       .setHeader('Content-Type', 'application/json; charset=utf-8')
       .end(JSON.stringify(body));
   }

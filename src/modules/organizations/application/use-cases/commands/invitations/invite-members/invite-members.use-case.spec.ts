@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { atelierNord, CAMILLE, HUGO, INES } from '../../../organizations.scenario.fixture.js';
 import type { AtelierNord } from '../../../organizations.scenario.fixture.js';
@@ -243,6 +243,28 @@ describe('InviteMembers with an Idempotency-Key', () => {
     }
   }
 
+  /**
+   * A reservation of the key left by a batch that crashed after reserving it, its lease still live.
+   *
+   * @param emails - The addresses of that batch.
+   * @returns The scoped key of the row and the reservation.
+   */
+  async function reservationLeftBy(emails: readonly string[]): Promise<readonly [string, unknown]> {
+    scenario.store.failReplayRecords = true;
+    const crashed: InviteMembers = new InviteMembers(scenario.store, scenario.clock);
+    // The release of a crashed process never runs: keep the row the reservation wrote.
+    const release = vi
+      .spyOn(crashed as unknown as { release: () => Promise<void> }, 'release')
+      .mockResolvedValue();
+    await expect(crashed.execute(keyed(emails))).rejects.toThrow();
+    scenario.store.failReplayRecords = false;
+    expect(release).toHaveBeenCalledOnce();
+    const [row] = [...scenario.store.tables.replays];
+    if (row === undefined) throw new Error('No reservation was left.');
+    expect(row[1]).toMatchObject({ state: 'reserved' });
+    return row;
+  }
+
   it('replays an equivalent batch without sending, emitting or charging the allowances again', async () => {
     const first: InviteMembersOutput = await invite.execute(
       keyed(['marc.roux@ateliernord.fr', 'lucie@exemple.fr']),
@@ -356,23 +378,52 @@ describe('InviteMembers with an Idempotency-Key', () => {
     expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
   });
 
-  it('replays a batch that committed while its claim was refused, and answers 409 only without a record', async () => {
-    const first: InviteMembersOutput = await invite.execute(keyed(['marc.roux@ateliernord.fr']));
-    const [key, record] = [...scenario.store.tables.replays][0] ?? [];
-    if (key === undefined || record === undefined) throw new Error('No replay was recorded.');
-    scenario.store.tables.replays.delete(key);
-    scenario.store.refuseNextClaim = (): void => {
-      scenario.store.tables.replays.set(key, record);
-    };
+  it('lets the first batch that reserves a key run, and refuses any other batch under it', async () => {
+    const [first, second] = await Promise.allSettled([
+      invite.execute(keyed(['marc.roux@ateliernord.fr'])),
+      invite.execute(keyed(['lucie@exemple.fr'])),
+    ]);
 
-    await expect(invite.execute(keyed(['marc.roux@ateliernord.fr']))).resolves.toEqual(first);
+    expect(first).toMatchObject({ status: 'fulfilled' });
+    expect(second).toMatchObject({
+      status: 'rejected',
+      reason: { refusal: { reason: 'idempotency-key-reused' } },
+    });
+    expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
+    expect(scenario.store.eventsNamed('invitation.issued.v1')[0]?.payload).toMatchObject({
+      email: 'marc.roux@ateliernord.fr',
+    });
+  });
 
-    scenario.store.tables.replays.delete(key);
-    scenario.store.refuseNextClaim = (): void => undefined;
+  it('takes over the reservation of a crashed batch once its lease runs out', async () => {
+    const [claim, reservation] = await reservationLeftBy(['marc.roux@ateliernord.fr']);
+
     await expect(invite.execute(keyed(['marc.roux@ateliernord.fr']))).rejects.toMatchObject({
       refusal: { reason: 'idempotency-request-in-progress' },
     });
-    expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
+    await expect(invite.execute(keyed(['lucie@exemple.fr']))).rejects.toMatchObject({
+      refusal: { reason: 'idempotency-key-reused' },
+    });
+    expect(scenario.store.tables.replays.get(claim)).toEqual(reservation);
+
+    scenario.clock.advance(31_000);
+    const taken: InviteMembersOutput = await invite.execute(keyed(['lucie@exemple.fr']));
+    expect(taken.invitations[0]).toMatchObject({ email: 'lucie@exemple.fr', outcome: 'invited' });
+    expect(scenario.store.tables.replays.get(claim)).toMatchObject({ state: 'committed' });
+  });
+
+  it('deletes the reservation of a refused batch, so the key runs again at once', async () => {
+    const owner = { actorUserId: CAMILLE.id, organizationId: scenario.organizationId };
+    await invite.execute({ ...owner, emails: newcomers('first', 50), role: 'member' });
+    await invite.execute({ ...owner, emails: newcomers('second', 47), role: 'member' });
+
+    await expect(invite.execute(keyed(['lucie@exemple.fr']))).rejects.toMatchObject({
+      refusal: { reason: 'invitation-daily-limit-reached' },
+    });
+    expect(scenario.store.tables.replays.size).toBe(0);
+    await expect(invite.execute(keyed(['hugo.martin@exemple.fr']))).rejects.toMatchObject({
+      refusal: { reason: 'invitation-daily-limit-reached' },
+    });
   });
 
   it('commits nothing when the replay record fails, and lets the key run again', async () => {
@@ -384,6 +435,7 @@ describe('InviteMembers with an Idempotency-Key', () => {
     );
     expect(scenario.store.tables.invitations.size).toBe(invitations);
     expect(scenario.store.tables.events).toEqual([]);
+    expect(scenario.store.tables.replays.size).toBe(0);
 
     scenario.store.failReplayRecords = false;
     const retried: InviteMembersOutput = await invite.execute(keyed(['marc.roux@ateliernord.fr']));

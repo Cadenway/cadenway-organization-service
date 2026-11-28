@@ -1,5 +1,5 @@
 {
-  "id": "69e18ed6-8495-471d-bbb5-6c08e77d5e64",
+  "id": "0c1f9a3c-587d-449e-abad-afc06b4305f4",
   "prevId": "f773857d-fa48-47f9-9479-3af75a11c3a6",
   "version": "7",
   "dialect": "postgresql",
@@ -253,11 +253,23 @@
           "primaryKey": false,
           "notNull": true
         },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_id": {
+          "name": "lease_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "outcome": {
           "name": "outcome",
           "type": "jsonb",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "expires_at": {
           "name": "expires_at",
@@ -357,6 +369,10 @@
         "invitation_batch_replays_request_digest_check": {
           "name": "invitation_batch_replays_request_digest_check",
           "value": "\"invitation_batch_replays\".\"request_digest\" ~ '^[0-9a-f]{64}$'"
+        },
+        "invitation_batch_replays_state_check": {
+          "name": "invitation_batch_replays_state_check",
+          "value": "(\"invitation_batch_replays\".\"state\" = 'reserved' and \"invitation_batch_replays\".\"lease_id\" is not null and \"invitation_batch_replays\".\"outcome\" is null) or (\"invitation_batch_replays\".\"state\" = 'committed' and \"invitation_batch_replays\".\"lease_id\" is null and \"invitation_batch_replays\".\"outcome\" is not null)"
         }
       },
       "isRLSEnabled": false

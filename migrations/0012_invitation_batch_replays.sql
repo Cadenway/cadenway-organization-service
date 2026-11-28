@@ -3,12 +3,15 @@ CREATE TABLE "invitation_batch_replays" (
 	"actor_user_id" uuid NOT NULL,
 	"key_digest" text NOT NULL,
 	"request_digest" text NOT NULL,
-	"outcome" jsonb NOT NULL,
+	"state" text NOT NULL,
+	"lease_id" uuid,
+	"outcome" jsonb,
 	"expires_at" timestamp with time zone NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "invitation_batch_replays_pkey" PRIMARY KEY("organization_id","actor_user_id","key_digest"),
 	CONSTRAINT "invitation_batch_replays_key_digest_check" CHECK ("invitation_batch_replays"."key_digest" ~ '^[0-9a-f]{64}$'),
-	CONSTRAINT "invitation_batch_replays_request_digest_check" CHECK ("invitation_batch_replays"."request_digest" ~ '^[0-9a-f]{64}$')
+	CONSTRAINT "invitation_batch_replays_request_digest_check" CHECK ("invitation_batch_replays"."request_digest" ~ '^[0-9a-f]{64}$'),
+	CONSTRAINT "invitation_batch_replays_state_check" CHECK (("invitation_batch_replays"."state" = 'reserved' and "invitation_batch_replays"."lease_id" is not null and "invitation_batch_replays"."outcome" is null) or ("invitation_batch_replays"."state" = 'committed' and "invitation_batch_replays"."lease_id" is null and "invitation_batch_replays"."outcome" is not null))
 );
 --> statement-breakpoint
 ALTER TABLE "invitation_batch_replays" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint

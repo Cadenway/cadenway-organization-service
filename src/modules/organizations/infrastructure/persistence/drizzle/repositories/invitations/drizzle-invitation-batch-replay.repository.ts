@@ -8,7 +8,10 @@ import type { InvitationBatchReplayKey } from '../../../../../application/models
 import type { InvitationBatchReplay } from '../../../../../application/models/invitations/invitation-batch-replay.model.js';
 import type { StoredInvitationBatch } from '../../../../../application/models/invitations/stored-invitation-batch.model.js';
 import type { InvitationBatchReplayRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-batch-replay-repository.port.js';
-import { INVITATION_BATCH_REPLAY_MS } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
+import {
+  INVITATION_BATCH_LEASE_MS,
+  INVITATION_BATCH_REPLAY_MS,
+} from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 import { members } from '../../schemas/members/member.schema.js';
@@ -120,17 +123,44 @@ function digestOf(value: string): string {
 }
 
 /**
+ * Constant LEASE_WINDOW
+ *
+ * @description
+ * `INVITATION_BATCH_LEASE_MS` as a PostgreSQL interval.
+ *
+ * @type {SQL}
+ */
+const LEASE_WINDOW: SQL = sql`make_interval(secs => ${INVITATION_BATCH_LEASE_MS / 1000})`;
+
+/**
+ * Function keyOf
+ *
+ * @description
+ * The condition that names the row of a scoped key, by its primary key.
+ *
+ * @param {InvitationBatchReplayKey} key - The scoped key.
+ * @returns {SQL | undefined} The condition.
+ */
+function keyOf(key: InvitationBatchReplayKey): SQL | undefined {
+  return and(
+    eq(invitationBatchReplays.organizationId, key.organizationId),
+    eq(invitationBatchReplays.actorUserId, key.actorUserId),
+    eq(invitationBatchReplays.keyDigest, digestOf(key.key)),
+  );
+}
+
+/**
  * Class DrizzleInvitationBatchReplayRepository
  *
  * @description
- * `InvitationBatchReplayRepository` on `invitation_batch_replays`, in the tenant transaction of the
- * batch. The in-progress marker is a transaction-level advisory lock on the scoped key and the
- * fingerprint of the batch, taken with `pg_try_advisory_xact_lock`, never awaited: PostgreSQL
- * releases it at commit or rollback, and when the connection ends, so a crashed process frees the
- * key at once and a stalled transaction holds it no longer than the `statement_timeout` (10 s) and
- * `idle_in_transaction_session_timeout` (30 s) of the application role. Another batch under the
- * same key takes another lock; the primary key of the table decides between them, the second
- * storing nothing once the first commits.
+ * `InvitationBatchReplayRepository` on `invitation_batch_replays`, in the tenant transaction of its
+ * unit of work. A reservation is a `reserved` row with a `lease_id` and a 30-second lease, written
+ * by one `insert … on conflict do update … where expires_at <= clock_timestamp()` statement: the
+ * primary key decides between two requests under one key (the second waits only for the first's
+ * short reservation transaction), and a row whose time ran out is taken over in the same statement.
+ * The batch's transaction turns the reservation into a `committed` record by its `lease_id`; a
+ * failed batch deletes it. Every instant is the database's `clock_timestamp()`, except in the purges,
+ * which compare with `statement_timestamp()` to range-scan their indexes.
  */
 export class DrizzleInvitationBatchReplayRepository implements InvitationBatchReplayRepository {
   // #region Properties
@@ -166,12 +196,13 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    * Method findLive
    *
    * @description
-   * Loads the committed record of the scoped key that expires after `clock_timestamp()`, and
-   * whether its fingerprint is the one of the batch of the request.
+   * Loads the reservation or record of the scoped key that expires after `clock_timestamp()`, with
+   * the actor's active membership in the same statement and without a lock, and whether its
+   * fingerprint is the one of the batch of the request.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<StoredInvitationBatch | null>} The record, or `null`.
+   * @returns {Promise<StoredInvitationBatch | null>} The reservation or record, or `null`.
    */
   public async findLive(
     key: InvitationBatchReplayKey,
@@ -179,6 +210,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
   ): Promise<StoredInvitationBatch | null> {
     const rows = await this.db
       .select({
+        state: invitationBatchReplays.state,
         requestDigest: invitationBatchReplays.requestDigest,
         outcome: invitationBatchReplays.outcome,
         actorRole: members.role,
@@ -192,90 +224,121 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           isNull(members.removedAt),
         ),
       )
-      .where(
-        and(
-          eq(invitationBatchReplays.organizationId, key.organizationId),
-          eq(invitationBatchReplays.actorUserId, key.actorUserId),
-          eq(invitationBatchReplays.keyDigest, digestOf(key.key)),
-          gt(invitationBatchReplays.expiresAt, REPLAY_CLOCK),
-        ),
-      )
+      .where(and(keyOf(key), gt(invitationBatchReplays.expiresAt, REPLAY_CLOCK)))
       .limit(1);
     const row = rows[0];
     return row === undefined
       ? null
       : {
+          state: row.state,
           sameRequest: row.requestDigest === digestOf(request.canonical),
-          invitations: row.outcome,
+          invitations: row.outcome ?? [],
           actorRole: row.actorRole,
         };
   }
 
   /**
-   * Method tryClaim
+   * Method reserve
    *
    * @description
-   * Takes the advisory lock of the scoped key and the batch's fingerprint for the transaction,
-   * without waiting, so a request never holds a pooled connection while another batch runs.
+   * Inserts the reservation of the key, or takes over its row when that row's time ran out.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<boolean>} `false` when another transaction holds it.
+   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is live.
    */
-  public async tryClaim(
+  public async reserve(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
-  ): Promise<boolean> {
-    const name: string = `invitation-batch:${key.organizationId.toLowerCase()}:${key.actorUserId.toLowerCase()}:${digestOf(key.key)}:${digestOf(request.canonical)}`;
-    const result = await this.db.execute<{ acquired: boolean }>(
-      sql`select pg_try_advisory_xact_lock(hashtextextended(${name}, 0)) as acquired`,
-    );
-    return result.rows[0]?.acquired === true;
-  }
-
-  /**
-   * Method record
-   *
-   * @description
-   * Deletes the expired record of the key, and at most `INLINE_PURGE_LIMIT` other expired records
-   * of the organization that no other transaction holds, then inserts the record unless one of the
-   * key exists. The insert waits for a transaction that inserted the same key first, and stores
-   * nothing once it commits. `expires_at` is `REPLAY_WINDOW` after `clock_timestamp()` at the
-   * insert, the last statement of the batch, so the time it waited on its locks does not count.
-   *
-   * @param {InvitationBatchReplayKey} key - The scoped key.
-   * @param {InvitationBatchReplay} replay - The batch and its outcome.
-   * @returns {Promise<boolean>} `false` when a record of the key already exists.
-   */
-  public async record(
-    key: InvitationBatchReplayKey,
-    replay: InvitationBatchReplay,
-  ): Promise<boolean> {
-    const keyDigest: string = digestOf(key.key);
-    await this.db
-      .delete(invitationBatchReplays)
-      .where(
-        and(
-          eq(invitationBatchReplays.organizationId, key.organizationId),
-          eq(invitationBatchReplays.actorUserId, key.actorUserId),
-          eq(invitationBatchReplays.keyDigest, keyDigest),
-          lte(invitationBatchReplays.expiresAt, PURGE_CUTOFF),
-        ),
-      );
-    await this.db.execute(inlinePurgeOf(key.organizationId));
-    const inserted: { readonly organizationId: string }[] = await this.db
+  ): Promise<string | null> {
+    const lease = {
+      requestDigest: digestOf(request.canonical),
+      state: 'reserved' as const,
+      leaseId: sql`uuidv7()`,
+      outcome: null,
+      expiresAt: sql`${REPLAY_CLOCK} + ${LEASE_WINDOW}`,
+      createdAt: sql`now()`,
+    };
+    const rows: { readonly leaseId: string | null }[] = await this.db
       .insert(invitationBatchReplays)
       .values({
         organizationId: key.organizationId,
         actorUserId: key.actorUserId,
-        keyDigest,
+        keyDigest: digestOf(key.key),
+        ...lease,
+      })
+      .onConflictDoUpdate({
+        target: [
+          invitationBatchReplays.organizationId,
+          invitationBatchReplays.actorUserId,
+          invitationBatchReplays.keyDigest,
+        ],
+        set: lease,
+        setWhere: lte(invitationBatchReplays.expiresAt, REPLAY_CLOCK),
+      })
+      .returning({ leaseId: invitationBatchReplays.leaseId });
+    return rows[0]?.leaseId ?? null;
+  }
+
+  /**
+   * Method complete
+   *
+   * @description
+   * Deletes at most `INLINE_PURGE_LIMIT` expired rows of the organization, then turns the
+   * reservation of `leaseId` into the record, replayed for 24 hours from the database's
+   * `clock_timestamp()` at this last statement of the batch.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch holds.
+   * @param {InvitationBatchReplay} replay - The batch and its outcome.
+   * @returns {Promise<boolean>} `false` when the lease is no longer the batch's.
+   */
+  public async complete(
+    key: InvitationBatchReplayKey,
+    leaseId: string,
+    replay: InvitationBatchReplay,
+  ): Promise<boolean> {
+    await this.db.execute(inlinePurgeOf(key.organizationId));
+    const rows: { readonly keyDigest: string }[] = await this.db
+      .update(invitationBatchReplays)
+      .set({
+        state: 'committed',
+        leaseId: null,
         requestDigest: digestOf(replay.request.canonical),
         outcome: replay.invitations,
         expiresAt: sql`${REPLAY_CLOCK} + ${REPLAY_WINDOW}`,
       })
-      .onConflictDoNothing()
-      .returning({ organizationId: invitationBatchReplays.organizationId });
-    return inserted.length === 1;
+      .where(
+        and(
+          keyOf(key),
+          eq(invitationBatchReplays.state, 'reserved'),
+          eq(invitationBatchReplays.leaseId, leaseId),
+        ),
+      )
+      .returning({ keyDigest: invitationBatchReplays.keyDigest });
+    return rows.length === 1;
+  }
+
+  /**
+   * Method release
+   *
+   * @description
+   * Deletes the reservation of `leaseId`, if it is still there.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {string} leaseId - The lease the batch held.
+   * @returns {Promise<void>} Resolves once deleted.
+   */
+  public async release(key: InvitationBatchReplayKey, leaseId: string): Promise<void> {
+    await this.db
+      .delete(invitationBatchReplays)
+      .where(
+        and(
+          keyOf(key),
+          eq(invitationBatchReplays.state, 'reserved'),
+          eq(invitationBatchReplays.leaseId, leaseId),
+        ),
+      );
   }
   // #endregion
 }
