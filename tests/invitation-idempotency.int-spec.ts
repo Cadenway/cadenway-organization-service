@@ -129,6 +129,28 @@ describe('idempotent invitation batches and the invitation state', () => {
   }
 
   /**
+   * Sends two different batches under one key at once and settles both against the winner. The
+   * loser answers `422` when it reads the winner's reservation, but under load it can give up on
+   * the 100 ms key lock the winner's reservation holds and answer the retryable `409` instead, as
+   * the contract allows; once both answered, the winner's record is committed, so the loser's
+   * retry (the same request) must answer `422`.
+   *
+   * @param send - Sends one of the two batches, by its index.
+   * @returns The two final responses, in the order of their indexes.
+   */
+  async function contend(send: (index: 0 | 1) => Promise<Response>): Promise<Response[]> {
+    const first: Response[] = await Promise.all([send(0), send(1)]);
+    return Promise.all(
+      first.map((response: Response, index: number) =>
+        response.status === 409 &&
+        (response.body as { code?: unknown }).code === 'idempotency.request-in-progress'
+          ? send(index === 0 ? 0 : 1)
+          : Promise.resolve(response),
+      ),
+    );
+  }
+
+  /**
    * Counts rows of an organization.
    *
    * @param text - A `select count(*)::int as count` query with the organization as `$1`.
@@ -392,15 +414,18 @@ describe('idempotent invitation batches and the invitation state', () => {
       const contested = 'members-page-batch-contested';
       const before: Record<string, number> = await effects(atelierNordId);
 
-      const [left, right] = await Promise.all([
-        invite(ines, atelierNordId, contested, ['leo@ateliernord.fr']),
-        invite(ines, atelierNordId, contested, ['mia@ateliernord.fr']),
-      ]);
+      const emails: readonly (readonly string[])[] = [
+        ['leo@ateliernord.fr'],
+        ['mia@ateliernord.fr'],
+      ];
+      const [left, right] = await contend((index) =>
+        invite(ines, atelierNordId, contested, emails[index] ?? []),
+      );
 
-      const statuses: number[] = [left.status, right.status].sort();
+      const statuses: number[] = [left?.status ?? 0, right?.status ?? 0].sort();
       expect(statuses).toEqual([200, 422]);
-      const refused: Response = left.status === 422 ? left : right;
-      expect(refused.body).toMatchObject({ code: 'idempotency.key-reused' });
+      const refused: Response | undefined = left?.status === 422 ? left : right;
+      expect(refused?.body).toMatchObject({ code: 'idempotency.key-reused' });
       expect(await effects(atelierNordId)).toEqual({
         invitations: (before.invitations ?? 0) + 1,
         emails: (before.emails ?? 0) + 1,
@@ -473,16 +498,19 @@ describe('idempotent invitation batches and the invitation state', () => {
         [lyonId, anchor?.id],
       );
       const lock = await holdSenderLock();
-      const pending: Promise<Response>[] = [
-        invite(ines, lyonId, key, ['noe@ateliernord.fr']),
-        invite(ines, lyonId, key, ['oscar@ateliernord.fr']),
+      const emails: readonly (readonly string[])[] = [
+        ['noe@ateliernord.fr'],
+        ['oscar@ateliernord.fr'],
       ];
+      const pending: Promise<Response[]> = contend((index) =>
+        invite(ines, lyonId, key, emails[index] ?? []),
+      );
       try {
         await lock.waiting(1);
       } finally {
         await lock.release();
       }
-      const responses: Response[] = await Promise.all(pending);
+      const responses: Response[] = await pending;
 
       expect(responses.map((response) => response.status).sort()).toEqual([200, 422]);
       expect(responses.find((response) => response.status === 422)?.body).toMatchObject({
