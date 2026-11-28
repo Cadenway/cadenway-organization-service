@@ -13,6 +13,7 @@ import {
   INVITATION_BATCH_REPLAY_MS,
 } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import type { KeyedInvitationBatchUsage } from '../../../../../domain/value-objects/invitations/keyed-invitation-batch-usage.value-object.js';
 import { isLockTimeout } from '../../mappers/postgres/lock-timeout.mapper.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 import { members } from '../../schemas/members/member.schema.js';
@@ -152,6 +153,53 @@ const RESERVATION_LOCK_TIMEOUT: string = '100ms';
 const LEASE_WINDOW: SQL = sql`make_interval(secs => ${INVITATION_BATCH_LEASE_MS / 1000})`;
 
 /**
+ * Function keyedBatchUsageOf
+ *
+ * @description
+ * The read of the replay record budget of an organization, one statement and so one snapshot,
+ * both parts range-scanning `invitation_batch_replays_organization_expiry_index`:
+ *
+ * - its reservations under a live lease, counted up to `budget`, among the rows expiring within
+ *   the next lease window (and a second of margin) only: a lease ends at the clock of the
+ *   statement that wrote it plus `INVITATION_BATCH_LEASE_MS`, and every reservation this statement
+ *   sees was committed before it, since `lockReservations` serializes the reservations of the
+ *   organization and a renewal stays uncommitted until its batch turns it into a record;
+ * - the expiries of its newest live records, backward from the newest, no more than the places the
+ *   reservations leave.
+ *
+ * Neither part reads more than `budget` index entries plus the reservations among them, whatever
+ * the organization holds. A row counts while its time runs at `statement_timestamp()`, the instant
+ * of the read; expiries come back in whole milliseconds, rounded up, so a place is never announced
+ * before it frees up.
+ *
+ * @param {string} organizationId - The organization.
+ * @param {number} budget - The replay record budget.
+ * @returns {SQL} The statement, answering `running`, `read_at` and `stored` (epoch milliseconds).
+ */
+export function keyedBatchUsageOf(organizationId: string, budget: number): SQL {
+  return sql`with running as materialized (
+      select count(*)::int as count from (
+        select 1 from ${invitationBatchReplays}
+        where organization_id = ${organizationId}::uuid
+          and expires_at > ${PURGE_CUTOFF}
+          and expires_at <= ${PURGE_CUTOFF} + ${LEASE_WINDOW} + interval '1 second'
+          and state = 'reserved'
+        limit ${budget}::int) as live),
+    stored as materialized (
+      select expires_at from ${invitationBatchReplays}
+      where organization_id = ${organizationId}::uuid
+        and expires_at > ${PURGE_CUTOFF}
+        and state = 'committed'
+      order by expires_at desc
+      limit greatest(${budget}::int - (select count from running), 0))
+    select (select count from running) as running,
+      floor(extract(epoch from ${PURGE_CUTOFF}) * 1000)::float8 as read_at,
+      coalesce(
+        (select json_agg(ceil(extract(epoch from expires_at) * 1000)::float8) from stored),
+        '[]'::json) as stored`;
+}
+
+/**
  * Function keyOf
  *
  * @description
@@ -257,13 +305,67 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
   }
 
   /**
+   * Method lockReservations
+   *
+   * @description
+   * Takes a `for key share` lock on the organization, the lock the foreign key of an insert needs,
+   * under the normal lock timeout of the role, so that a long change of the organization is waited
+   * for, not mistaken for a held key; then a transaction advisory lock on the reservations of the
+   * organization, under the same timeout, which serializes the check of its replay record budget
+   * and the reservation of a key per organization. Only the short reservation transactions take
+   * it, never a running batch, so it is never held for longer than a few statements.
+   *
+   * @param {string} organizationId - The organization of the transaction.
+   * @returns {Promise<void>} Resolves once both locks are held.
+   */
+  public async lockReservations(organizationId: string): Promise<void> {
+    // The foreign key of an insert takes this lock too: taken here, under the normal lock timeout
+    // of the role, a long change of the organization makes the reservation wait for it rather than
+    // time out in the claim and answer a false 409.
+    await this.db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .where(eq(organizations.id, organizationId))
+      .for('key share');
+    await this.db.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`invitation-batch-budget:${organizationId.toLowerCase()}`}, 0))`,
+    );
+  }
+
+  /**
+   * Method usage
+   *
+   * @description
+   * Counts, in one statement and so one snapshot, the reservations of the organization under a
+   * live lease, up to `budget`, then reads the expiries of its newest live records, no more than
+   * the places the reservations leave. Both range-scan
+   * `invitation_batch_replays_organization_expiry_index`: the reservations within the next lease
+   * window only, the records backward from the newest (`keyedBatchUsageOf`).
+   *
+   * @param {string} organizationId - The organization of the transaction.
+   * @param {number} budget - The replay record budget.
+   * @returns {Promise<KeyedInvitationBatchUsage>} The usage.
+   */
+  public async usage(organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage> {
+    const result = await this.db.execute<{
+      running: number;
+      read_at: number;
+      stored: number[];
+    }>(keyedBatchUsageOf(organizationId, budget));
+    const row = result.rows[0];
+    return {
+      running: row?.running ?? 0,
+      newestStoredExpiries: (row?.stored ?? []).map((epochMs: number) => new Date(epochMs)),
+      readAt: new Date(row?.read_at ?? 0),
+    };
+  }
+
+  /**
    * Method reserve
    *
    * @description
-   * Reserves the key without ever waiting on a batch in flight. It first takes a `for key share`
-   * lock on the organization, the lock the foreign key of an insert needs, under the normal lock
-   * timeout of the role, so that a long change of the organization is waited for, not mistaken for a
-   * held key. The claim then runs in a savepoint under
+   * Reserves the key without ever waiting on a batch in flight, once `lockReservations` holds the
+   * organization and its reservations. The claim runs in a savepoint under
    * a `lock_timeout` of `RESERVATION_LOCK_TIMEOUT`: a wait that reaches it rolls the savepoint back
    * and answers `null`. A transaction advisory lock on the key, held only by the short reservation
    * transactions, serializes the requests that reserve one key: the second waits for the first to
@@ -280,14 +382,6 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
   ): Promise<string | null> {
-    // The foreign key of an insert takes this lock too: taken here, under the normal lock timeout
-    // of the role, a long change of the organization makes the reservation wait for it rather than
-    // time out in the claim below and answer a false 409.
-    await this.db
-      .select({ id: organizations.id })
-      .from(organizations)
-      .where(eq(organizations.id, key.organizationId))
-      .for('key share');
     await this.db.execute(
       sql`select set_config('lock_timeout', ${RESERVATION_LOCK_TIMEOUT}, true)`,
     );

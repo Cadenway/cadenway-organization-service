@@ -1,4 +1,5 @@
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import type { KeyedInvitationBatchUsage } from '../../../../../domain/value-objects/invitations/keyed-invitation-batch-usage.value-object.js';
 import type { InvitationBatchReplayKey } from '../../../../models/invitations/invitation-batch-replay-key.model.js';
 import type { InvitationBatchReplay } from '../../../../models/invitations/invitation-batch-replay.model.js';
 import type { StoredInvitationBatch } from '../../../../models/invitations/stored-invitation-batch.model.js';
@@ -33,13 +34,46 @@ export interface InvitationBatchReplayRepository {
   ): Promise<StoredInvitationBatch | null>;
 
   /**
+   * Method lockReservations
+   *
+   * @description
+   * Serializes the reservations of the organization until the end of the transaction, so that the
+   * check of its replay record budget and the reservation of a key are one step: first the
+   * `for key share` lock on the organization that the reservation's foreign key needs, then a
+   * transaction lock on the organization's reservations, both under the normal lock timeout of
+   * the role. Only reservation steps take the second one, never a running batch. To call before
+   * `usage` and `reserve`, in their transaction.
+   *
+   * @param {string} organizationId - The organization of the transaction.
+   * @returns {Promise<void>} Resolves once both locks are held.
+   */
+  lockReservations(organizationId: string): Promise<void>;
+
+  /**
+   * Method usage
+   *
+   * @description
+   * What the organization holds of its replay record budget, in one statement and read up to the
+   * budget only: its reservations under a live lease, then the expiries of its newest records
+   * still inside their 24 hours, no more than the places the reservations leave
+   * (`keyedInvitationBatchStoredToRead`). Index-backed and O(budget) whatever the organization
+   * holds.
+   *
+   * @param {string} organizationId - The organization of the transaction.
+   * @param {number} budget - The replay record budget.
+   * @returns {Promise<KeyedInvitationBatchUsage>} The usage, on the clock of the store.
+   */
+  usage(organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage>;
+
+  /**
    * Method reserve
    *
    * @description
    * Reserves the key for the batch, with a lease of `INVITATION_BATCH_LEASE_MS`, unless a live
    * reservation or record of the key exists; a row whose time ran out (a crashed holder's lease, an
    * expired record) is taken over. One atomic statement, decided by the primary key: of two
-   * requests that reserve one key, the second answers once the first's transaction ends.
+   * requests that reserve one key, the second answers once the first's transaction ends. Runs
+   * after `lockReservations`, in the same transaction.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.

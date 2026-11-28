@@ -3,6 +3,7 @@ import { OrganizationLogoError } from '../../../domain/errors/logo/organization-
 import { InvitationAnsweredError } from '../../../domain/errors/invitations/invitation-answered.error.js';
 import { InvitationBatchKeyReusedError } from '../../../domain/errors/invitations/invitation-batch-key-reused.error.js';
 import { InvitationDailyLimitReachedError } from '../../../domain/errors/invitations/invitation-daily-limit-reached.error.js';
+import { InvitationKeyedBatchLimitReachedError } from '../../../domain/errors/invitations/invitation-keyed-batch-limit-reached.error.js';
 import { InvitationExpiredError } from '../../../domain/errors/invitations/invitation-expired.error.js';
 import { InvitationResendThrottledError } from '../../../domain/errors/invitations/invitation-resend-throttled.error.js';
 import { InvitationRevokedError } from '../../../domain/errors/invitations/invitation-revoked.error.js';
@@ -81,6 +82,12 @@ function refusalOf(error: unknown): Refusal | null {
     return {
       reason: 'invitation-daily-limit-reached',
       remaining: error.remaining,
+      nextAvailableAt: error.nextAvailableAt,
+    };
+  }
+  if (error instanceof InvitationKeyedBatchLimitReachedError) {
+    return {
+      reason: 'invitation-keyed-batch-limit-reached',
       nextAvailableAt: error.nextAvailableAt,
     };
   }

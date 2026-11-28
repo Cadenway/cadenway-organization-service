@@ -78,6 +78,15 @@ describe('answerRefusals', () => {
         'invitation.daily-limit-reached',
         { remaining: 2, nextAvailableAt: '2026-11-07T09:12:00.000Z' },
       ],
+      [
+        {
+          reason: 'invitation-keyed-batch-limit-reached',
+          nextAvailableAt: new Date('2026-11-07T10:05:00Z'),
+        },
+        429,
+        'invitation.keyed-batch-limit-reached',
+        { nextAvailableAt: '2026-11-07T10:05:00.000Z' },
+      ],
       [{ reason: 'user-not-found' }, 404, 'user.not-found', undefined],
       [{ reason: 'user-not-synchronized' }, 404, 'user.not-synchronized', undefined],
       [
@@ -129,11 +138,23 @@ describe('answerRefusals', () => {
       remaining: 0,
       nextAvailableAt: new Date(now - 5_000),
     });
+    const keyedRunning = await headersOf({
+      reason: 'invitation-keyed-batch-limit-reached',
+      nextAvailableAt: new Date(now + 29_200),
+    });
+    const keyedPast = await headersOf({
+      reason: 'invitation-keyed-batch-limit-reached',
+      nextAvailableAt: new Date(now - 1),
+    });
     const notLimited = await headersOf({ reason: 'invitation-revoked' });
 
     expect(Number(throttled['Retry-After'])).toBeGreaterThanOrEqual(3599);
     expect(Number(throttled['Retry-After'])).toBeLessThanOrEqual(3600);
     expect(limited['Retry-After']).toBe('1');
+    // 29.2 seconds round up to 30, unless the call itself took a second.
+    expect(Number(keyedRunning['Retry-After'])).toBeGreaterThanOrEqual(29);
+    expect(Number(keyedRunning['Retry-After'])).toBeLessThanOrEqual(30);
+    expect(keyedPast['Retry-After']).toBe('1');
     expect(notLimited).toEqual({});
   });
 

@@ -3,6 +3,10 @@ import type { Member } from '../../../../../domain/aggregates/member/member.aggr
 import type { Organization } from '../../../../../domain/aggregates/organization/organization.aggregate.js';
 import { distinctAddresses } from '../../../../../domain/policies/invitations/invitation-batch.policy.js';
 import {
+  assertKeyedInvitationBatchAvailable,
+  KEYED_INVITATION_BATCH_BUDGET,
+} from '../../../../../domain/policies/invitations/keyed-invitation-batch-budget.policy.js';
+import {
   assertInvitationBatchAvailable,
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
@@ -11,6 +15,7 @@ import { assertManagesOrganization } from '../../../../../domain/policies/member
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationEmailUsage } from '../../../../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
+import type { KeyedInvitationBatchUsage } from '../../../../../domain/value-objects/invitations/keyed-invitation-batch-usage.value-object.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import type { InvitationBatchReplayKey } from '../../../../models/invitations/invitation-batch-replay-key.model.js';
 import type { InvitationMail } from '../../../../models/invitations/invitation-mail.model.js';
@@ -110,6 +115,12 @@ interface PlannedAddress {
  * same transaction: the invitations, their ledger entries, their `invitation.issued.v1` and the
  * record commit together, and a refusal (a 429 included) or a failure records nothing and deletes
  * the reservation.
+ *
+ * A key without a live row is reserved only while the organization holds fewer keyed batches than
+ * its replay record budget, its live records plus its reservations under a live lease: the check
+ * and the reservation are one step, serialized per organization, after the replay lookup and
+ * before the daily allowances. A full budget answers `invitation-keyed-batch-limit-reached` and
+ * reserves, writes, sends and emits nothing. A batch without a key never counts.
  */
 export class InviteMembers {
   // #region Properties
@@ -134,6 +145,17 @@ export class InviteMembers {
    * @readonly
    */
   private readonly clock: Clock;
+
+  /**
+   * Property budget
+   *
+   * @description
+   * The replay record budget of an organization: how many keyed batches it holds at once.
+   *
+   * @type {number}
+   * @readonly
+   */
+  private readonly budget: number;
   // #endregion
 
   // #region Constructor
@@ -141,15 +163,21 @@ export class InviteMembers {
    * Constructor
    *
    * @description
-   * Takes the ports of the batch.
+   * Takes the ports of the batch and the replay record budget.
    *
    * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
    * @param {Clock} clock - The time of the sending.
+   * @param {number} budget - The replay record budget, `KEYED_INVITATION_BATCH_BUDGET` by default.
    * @constructor
    */
-  public constructor(unitOfWork: OrganizationsUnitOfWork, clock: Clock) {
+  public constructor(
+    unitOfWork: OrganizationsUnitOfWork,
+    clock: Clock,
+    budget: number = KEYED_INVITATION_BATCH_BUDGET,
+  ) {
     this.unitOfWork = unitOfWork;
     this.clock = clock;
+    this.budget = budget;
   }
   // #endregion
 
@@ -163,7 +191,8 @@ export class InviteMembers {
    * @param {InviteMembersInput} input - The actor, the organization, the addresses and the role.
    * @returns {Promise<InviteMembersOutput>} The outcome of each distinct address.
    * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden`,
-   * `invitation-daily-limit-reached`, `idempotency-key-reused` or
+   * `invitation-daily-limit-reached`, `invitation-keyed-batch-limit-reached`,
+   * `idempotency-key-reused` or
    * `idempotency-request-in-progress`.
    */
   public async execute(input: InviteMembersInput): Promise<InviteMembersOutput> {
@@ -210,14 +239,15 @@ export class InviteMembers {
    * instant.
    * @returns {Promise<InviteMembersOutput>} The outcome, replayed or fresh.
    * @throws {OrganizationRefusal} `idempotency-request-in-progress`, `role-forbidden`,
-   * `organization-not-found` or `invitation-daily-limit-reached`.
+   * `organization-not-found`, `invitation-keyed-batch-limit-reached` or
+   * `invitation-daily-limit-reached`.
    * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
    */
   private async keyed(input: InviteMembersInput, batch: KeyedBatch): Promise<InviteMembersOutput> {
     const { key, request, addresses, now } = batch;
     const settled: InviteMembersOutput | string = await this.unitOfWork.runInRequestOrganization(
       (store: OrganizationsStore): Promise<InviteMembersOutput | string> =>
-        InviteMembers.reserve(store, input, batch),
+        InviteMembers.reserve(store, input, batch, this.budget),
     );
     if (typeof settled !== 'string') {
       return settled;
@@ -311,22 +341,30 @@ export class InviteMembers {
    * reservation (another request reserves it at that moment, or a transaction holds its expired
    * row), the request is settled from a live row if one is committed by then, and otherwise answers
    * the retryable `idempotency-request-in-progress`, whatever the body: an expired reservation's
-   * fingerprint never decides a terminal `idempotency-key-reused`. Nothing waits on a batch.
+   * fingerprint never decides a terminal `idempotency-key-reused`. A key without a live row is
+   * reserved only within the replay record budget of the organization (`admit`). Nothing waits on
+   * a batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
    * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @param {number} budget - The replay record budget of the organization.
    * @returns {Promise<InviteMembersOutput | string>} The replayed outcome, or the id of the lease.
    */
   private static async reserve(
     store: OrganizationsStore,
     input: InviteMembersInput,
     batch: KeyedBatch,
+    budget: number,
   ): Promise<InviteMembersOutput | string> {
     await InviteMembers.authorize(store, input);
     const settled: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
     if (settled !== null) {
       return settled;
+    }
+    const budgeted: InviteMembersOutput | null = await InviteMembers.admit(store, batch, budget);
+    if (budgeted !== null) {
+      return budgeted;
     }
     const leaseId: string | null = await store.invitationBatchReplays.reserve(
       batch.key,
@@ -343,6 +381,47 @@ export class InviteMembers {
     // a takeover or a purge holds its expired row. Who holds it, and with which batch, is unknown,
     // so the answer is the retryable one whatever the body, never a terminal 422.
     throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+  }
+
+  /**
+   * Method admit
+   *
+   * @description
+   * Checks the replay record budget of the organization for a key without a live row, as one step
+   * with its reservation: the reservations of the organization are serialized from here to the
+   * commit of the reservation, so concurrent new keys never take it past the budget. When no place
+   * is left, a row of the key committed by a request that reserved it before this one took the
+   * lock still answers as before (a replay, `409` or `422`); otherwise the batch answers
+   * `invitation-keyed-batch-limit-reached` and the key is not reserved.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {KeyedBatch} batch - The scoped key and the canonical batch.
+   * @param {number} budget - The replay record budget of the organization.
+   * @returns {Promise<InviteMembersOutput | null>} The stored outcome of the key, or `null` once a
+   * place is left for it.
+   * @throws {InvitationKeyedBatchLimitReachedError} When the organization holds `budget` keyed
+   * batches.
+   */
+  private static async admit(
+    store: OrganizationsStore,
+    batch: KeyedBatch,
+    budget: number,
+  ): Promise<InviteMembersOutput | null> {
+    await store.invitationBatchReplays.lockReservations(batch.key.organizationId);
+    const usage: KeyedInvitationBatchUsage = await store.invitationBatchReplays.usage(
+      batch.key.organizationId,
+      budget,
+    );
+    try {
+      assertKeyedInvitationBatchAvailable(budget, usage);
+      return null;
+    } catch (error) {
+      const meanwhile: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
+      if (meanwhile !== null) {
+        return meanwhile;
+      }
+      throw error;
+    }
   }
 
   /**

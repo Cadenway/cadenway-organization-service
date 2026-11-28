@@ -453,3 +453,116 @@ describe('InviteMembers with an Idempotency-Key', () => {
     expect(scenario.store.tables.replays.size).toBe(1);
   });
 });
+
+describe('InviteMembers within the replay record budget', () => {
+  /** A budget of two keyed batches, so a third new key meets it. */
+  const BUDGET: number = 2;
+
+  let scenario: AtelierNord;
+  let invite: InviteMembers;
+
+  beforeEach(async () => {
+    scenario = await atelierNord();
+    invite = new InviteMembers(scenario.store, scenario.clock, BUDGET);
+  });
+
+  /**
+   * A keyed batch of Inès Robert whose address is already a member, so it sends no email.
+   *
+   * @param key - The `Idempotency-Key`.
+   * @param emails - The addresses.
+   * @returns The input.
+   */
+  function keyed(
+    key: string,
+    emails: readonly string[] = ['hugo.dubois@ateliernord.fr'],
+  ): InviteMembersInput {
+    return {
+      actorUserId: INES.id,
+      organizationId: scenario.organizationId,
+      emails,
+      role: 'member',
+      idempotencyKey: key,
+    };
+  }
+
+  it('refuses a new key once the organization holds the budget, even for batches that send no email', async () => {
+    await invite.execute(keyed('members-page-1'));
+    scenario.clock.advance(HOUR);
+    await invite.execute(keyed('members-page-2'));
+    const replays: number = scenario.store.tables.replays.size;
+    const events: number = scenario.store.tables.events.length;
+    const invitations: number = scenario.store.tables.invitations.size;
+
+    await expect(
+      invite.execute(keyed('members-page-3', ['lucie@exemple.fr'])),
+    ).rejects.toMatchObject({
+      refusal: {
+        reason: 'invitation-keyed-batch-limit-reached',
+        // The oldest record, stored at 09:00, frees the place 24 hours later.
+        nextAvailableAt: new Date('2026-11-09T09:00:00Z'),
+      },
+    });
+    expect(scenario.store.tables.replays.size).toBe(replays);
+    expect(scenario.store.tables.events).toHaveLength(events);
+    expect(scenario.store.tables.invitations.size).toBe(invitations);
+  });
+
+  it('still replays and refuses a reused key when the budget is used up', async () => {
+    const first: InviteMembersOutput = await invite.execute(keyed('members-page-1'));
+    await invite.execute(keyed('members-page-2'));
+
+    await expect(invite.execute(keyed('members-page-1'))).resolves.toEqual(first);
+    await expect(
+      invite.execute(keyed('members-page-1', ['lucie@exemple.fr'])),
+    ).rejects.toMatchObject({ refusal: { reason: 'idempotency-key-reused' } });
+  });
+
+  it('counts a running batch until its lease runs out, a lease away when they alone fill it', async () => {
+    scenario.store.failReplayRecords = true;
+    const crashed: InviteMembers = new InviteMembers(scenario.store, scenario.clock, BUDGET);
+    // The release of a crashed process never runs: keep the rows the reservations wrote.
+    vi.spyOn(crashed as unknown as { release: () => Promise<void> }, 'release').mockResolvedValue();
+    await expect(crashed.execute(keyed('members-page-1'))).rejects.toThrow();
+    await expect(crashed.execute(keyed('members-page-2'))).rejects.toThrow();
+    scenario.store.failReplayRecords = false;
+
+    await expect(invite.execute(keyed('members-page-3'))).rejects.toMatchObject({
+      refusal: {
+        reason: 'invitation-keyed-batch-limit-reached',
+        nextAvailableAt: new Date(scenario.clock.now().getTime() + 30_000),
+      },
+    });
+
+    scenario.clock.advance(31_000);
+    const admitted: InviteMembersOutput = await invite.execute(keyed('members-page-3'));
+    expect(admitted.invitations[0]?.outcome).toBe('already-member');
+  });
+
+  it('frees the place of a stored outcome once its 24 hours are over', async () => {
+    await invite.execute(keyed('members-page-1'));
+    await invite.execute(keyed('members-page-2'));
+    scenario.clock.advance(24 * HOUR);
+
+    const admitted: InviteMembersOutput = await invite.execute(keyed('members-page-3'));
+
+    expect(admitted.invitations[0]?.outcome).toBe('already-member');
+  });
+
+  it('never counts nor refuses a batch without a key', async () => {
+    await invite.execute(keyed('members-page-1'));
+    await invite.execute(keyed('members-page-2'));
+    const locks: number = scenario.store.reservationLocks;
+
+    const unkeyed: InviteMembersOutput = await invite.execute({
+      actorUserId: INES.id,
+      organizationId: scenario.organizationId,
+      emails: ['lucie@exemple.fr'],
+      role: 'member',
+    });
+
+    expect(unkeyed.invitations[0]?.outcome).toBe('invited');
+    expect(scenario.store.reservationLocks).toBe(locks);
+    expect(scenario.store.tables.replays.size).toBe(2);
+  });
+});

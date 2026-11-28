@@ -13,10 +13,12 @@ import {
   INVITATION_BATCH_LEASE_MS,
   invitationBatchReplayExpiresAt,
 } from '../../domain/policies/invitations/invitation-batch-replay.policy.js';
+import { keyedInvitationBatchStoredToRead } from '../../domain/policies/invitations/keyed-invitation-batch-budget.policy.js';
 import type { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
+import type { KeyedInvitationBatchUsage } from '../../domain/value-objects/invitations/keyed-invitation-batch-usage.value-object.js';
 import type { MemberDraft } from '../../domain/value-objects/members/member-draft.value-object.js';
 import type { MemberState } from '../../domain/value-objects/members/member-state.value-object.js';
 import type { Role } from '../../domain/value-objects/members/role.value-object.js';
@@ -190,6 +192,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
 
   /** Makes every completion of a replay record fail, as a failure after the invitations would. */
   public failReplayRecords: boolean = false;
+
+  /** How many times a reservation step locked the reservations of its organization. */
+  public reservationLocks: number = 0;
 
   /** Leases handed out so far. */
   private leases: number = 0;
@@ -677,6 +682,33 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                     )?.role ?? null,
                 },
           );
+        },
+        lockReservations: (): Promise<void> => {
+          // One request at a time in these tests: the lock of PostgreSQL is proven by the
+          // integration tests.
+          this.reservationLocks += 1;
+          return Promise.resolve();
+        },
+        usage: (organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage> => {
+          // Reservations are visible as soon as they are written, records once committed.
+          const now: Date = this.databaseNow();
+          const live: StoredReplay[] = [...this.tables.replays.values()].filter(
+            (entry: StoredReplay) =>
+              entry.organizationId === organizationId && entry.expiresAt.getTime() > now.getTime(),
+          );
+          const running: number = Math.min(
+            budget,
+            live.filter((entry: StoredReplay) => entry.state === 'reserved').length,
+          );
+          return Promise.resolve({
+            running,
+            newestStoredExpiries: live
+              .filter((entry: StoredReplay) => entry.state === 'committed')
+              .map((entry: StoredReplay) => entry.expiresAt)
+              .sort((left: Date, right: Date) => right.getTime() - left.getTime())
+              .slice(0, keyedInvitationBatchStoredToRead(budget, running)),
+            readAt: now,
+          });
         },
         reserve: (
           key: InvitationBatchReplayKey,
