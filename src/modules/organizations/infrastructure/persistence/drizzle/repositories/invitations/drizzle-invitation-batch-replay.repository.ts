@@ -16,6 +16,7 @@ import type { InvitationBatchRequest } from '../../../../../domain/value-objects
 import { isLockTimeout } from '../../mappers/postgres/lock-timeout.mapper.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 import { members } from '../../schemas/members/member.schema.js';
+import { organizations } from '../../schemas/organizations/organization.schema.js';
 
 /**
  * Constant INLINE_PURGE_LIMIT
@@ -256,50 +257,13 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
   }
 
   /**
-   * Method findHeld
-   *
-   * @description
-   * Loads the reservation of the scoped key whatever its lease, with the actor's active membership,
-   * in one statement and without a lock: the reservation of a batch still running past its lease,
-   * whose row its transaction holds, is still the key's.
-   *
-   * @param {InvitationBatchReplayKey} key - The scoped key.
-   * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<StoredInvitationBatch | null>} The reservation, or `null`.
-   */
-  public async findHeld(
-    key: InvitationBatchReplayKey,
-    request: InvitationBatchRequest,
-  ): Promise<StoredInvitationBatch | null> {
-    const rows = await this.db
-      .select({ requestDigest: invitationBatchReplays.requestDigest, actorRole: members.role })
-      .from(invitationBatchReplays)
-      .leftJoin(
-        members,
-        and(
-          eq(members.organizationId, invitationBatchReplays.organizationId),
-          eq(members.userId, invitationBatchReplays.actorUserId),
-          isNull(members.removedAt),
-        ),
-      )
-      .where(and(keyOf(key), eq(invitationBatchReplays.state, 'reserved')))
-      .limit(1);
-    const row = rows[0];
-    return row === undefined
-      ? null
-      : {
-          state: 'reserved',
-          sameRequest: row.requestDigest === digestOf(request.canonical),
-          invitations: [],
-          actorRole: row.actorRole,
-        };
-  }
-
-  /**
    * Method reserve
    *
    * @description
-   * Reserves the key without ever waiting on a batch in flight. Everything runs in a savepoint under
+   * Reserves the key without ever waiting on a batch in flight. It first takes a `for key share`
+   * lock on the organization, the lock the foreign key of an insert needs, under the normal lock
+   * timeout of the role, so that a long change of the organization is waited for, not mistaken for a
+   * held key. The claim then runs in a savepoint under
    * a `lock_timeout` of `RESERVATION_LOCK_TIMEOUT`: a wait that reaches it rolls the savepoint back
    * and answers `null`. A transaction advisory lock on the key, held only by the short reservation
    * transactions, serializes the requests that reserve one key: the second waits for the first to
@@ -316,6 +280,14 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
   ): Promise<string | null> {
+    // The foreign key of an insert takes this lock too: taken here, under the normal lock timeout
+    // of the role, a long change of the organization makes the reservation wait for it rather than
+    // time out in the claim below and answer a false 409.
+    await this.db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .where(eq(organizations.id, key.organizationId))
+      .for('key share');
     await this.db.execute(
       sql`select set_config('lock_timeout', ${RESERVATION_LOCK_TIMEOUT}, true)`,
     );

@@ -33,23 +33,6 @@ export interface InvitationBatchReplayRepository {
   ): Promise<StoredInvitationBatch | null>;
 
   /**
-   * Method findHeld
-   *
-   * @description
-   * The reservation of a key whatever its lease, compared with the batch of the request, with the
-   * actor's current role, or `null`: a batch running past its lease still holds its key. One
-   * statement, no row lock.
-   *
-   * @param {InvitationBatchReplayKey} key - The scoped key.
-   * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<StoredInvitationBatch | null>} The reservation.
-   */
-  findHeld(
-    key: InvitationBatchReplayKey,
-    request: InvitationBatchRequest,
-  ): Promise<StoredInvitationBatch | null>;
-
-  /**
    * Method reserve
    *
    * @description

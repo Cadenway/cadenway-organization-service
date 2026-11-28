@@ -594,15 +594,18 @@ The Search readers open their snapshots directly with the kit's transaction runn
   from that snapshot. A record answers its stored body to an equivalent batch, taking neither
   allowance lock; a reservation answers `409` to the same batch, still running; either answers
   `422` to another batch, and a member who lost the role answers `403`. A free key is reserved
-  under a `lock_timeout` of 100 ms, in a savepoint: a transaction advisory lock on the key, held
+  after a `for key share` lock on the organization, the lock the foreign key of the insert needs,
+  taken under the normal lock timeout of the role (a long change of the organization is waited
+  for), then under a `lock_timeout` of 100 ms, in a savepoint: a transaction advisory lock on the key, held
   only by reservations, serializes the requests that reserve one key (the second waits for the
   first's short reservation to commit, then settles as above); a row whose time ran out and that no
   transaction holds is taken over atomically (`for update skip locked`); a plain read keeps a row
   that is live or held by its batch's transaction; only a key without any row gets an
   `insert … on conflict do nothing`. A wait that reaches the timeout rolls the savepoint back.
-  When the key is not free, the request settles from what is committed: a live row as above, the
-  reservation of a batch running past its lease by its fingerprint (`409` for the same batch, `422`
-  for another), and with nothing committed yet a retryable `409`. The reservation step never waits
+  When the key is not free, the request settles from a live row as above if one is committed by
+  then; otherwise (another reservation in progress, a batch running past its lease, a takeover or
+  a purge holding the expired row) it answers the retryable `409` whatever the body. The
+  reservation step never waits
   on a batch, only on another reservation and never beyond 100 ms. The first batch that reserves a
   key is the only one that runs. The reservation commits. The second transaction first renews the lease and
   locks the reservation for its whole duration, so that past its lease neither a takeover nor a
@@ -674,6 +677,13 @@ Any failure rolls back the business rows and the outbox rows together
   (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists.
+- An expired reservation never decides a terminal answer: once its lease has run out, whoever holds
+  its row (the batch running late, a takeover not committed yet for this very batch, a purge) and
+  with which batch is unknown, so a request answers the retryable
+  `409 idempotency.request-in-progress` whatever its body, and learns the outcome on a later try.
+  Only a live reservation answers `409` or `422` by its fingerprint, and a committed record a replay
+  or `422`. Safe over precise: a terminal `422` given to the equivalent retry of a takeover would
+  make the client drop a batch that may run.
 - A replay authorizes the actor from the snapshot of its record, read in one statement with the
   active membership and without a lock, while a fresh batch rechecks the role under a share lock on
   the membership before it plans anything. A replay creates no new effect: authorizing it against a

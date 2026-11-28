@@ -308,11 +308,10 @@ export class InviteMembers {
    * @description
    * The first transaction of a keyed batch: once the actor and the organization are found, settles
    * the key from its live reservation or record, or reserves it. When the key is not free for the
-   * reservation (another request reserves it at that moment, or a batch holds it), the request is
-   * settled from what is committed: a live row, or the reservation of a batch running past its
-   * lease, whose fingerprint still tells `idempotency-request-in-progress` from
-   * `idempotency-key-reused`; with nothing committed yet, the retryable
-   * `idempotency-request-in-progress`. Nothing waits on another request or batch.
+   * reservation (another request reserves it at that moment, or a transaction holds its expired
+   * row), the request is settled from a live row if one is committed by then, and otherwise answers
+   * the retryable `idempotency-request-in-progress`, whatever the body: an expired reservation's
+   * fingerprint never decides a terminal `idempotency-key-reused`. Nothing waits on a batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
@@ -340,16 +339,9 @@ export class InviteMembers {
     if (meanwhile !== null) {
       return meanwhile;
     }
-    // A batch running past its lease still holds its reservation, which the live read leaves out.
-    const held: StoredInvitationBatch | null = await store.invitationBatchReplays.findHeld(
-      batch.key,
-      batch.request,
-    );
-    if (held !== null) {
-      return InviteMembers.answer(held);
-    }
-    // The key is being reserved by another request, or its row is gone already: the client may
-    // try again.
+    // The key is held without a live row: another request reserves it, a batch runs past its lease,
+    // a takeover or a purge holds its expired row. Who holds it, and with which batch, is unknown,
+    // so the answer is the retryable one whatever the body, never a terminal 422.
     throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
   }
 

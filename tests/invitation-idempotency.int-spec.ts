@@ -537,10 +537,10 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
 
       expect(purged).toBe(0);
-      // Past its visible lease, the reservation is still the running batch's: its fingerprint
-      // tells the same batch from another one.
-      expect(competitor.status).toBe(422);
-      expect(competitor.body).toMatchObject({ code: 'idempotency.key-reused' });
+      // Past its visible lease, who holds the key is unknown: the answer is the retryable one
+      // whatever the body.
+      expect(competitor.status).toBe(409);
+      expect(competitor.body).toMatchObject({ code: 'idempotency.request-in-progress' });
       expect(retry.status).toBe(409);
       expect(retry.body).toMatchObject({ code: 'idempotency.request-in-progress' });
       expect(original.status).toBe(200);
@@ -551,6 +551,91 @@ describe('idempotent invitation batches and the invitation state', () => {
       const replayed: Response = await invite(ines, atelierNordId, slow, ['sven@ateliernord.fr']);
       expect(replayed.status).toBe(200);
       expect(replayed.body).toEqual(original.body);
+    });
+
+    it('answers 409, never 422, to an equivalent retry while a takeover of the expired key is uncommitted', async () => {
+      const taken = 'members-page-batch-taken-over';
+      const emails: readonly string[] = ['abby@ateliernord.fr'];
+      await reservedBy(taken, ['old.batch@ateliernord.fr'], -10);
+      const takeover: pg.PoolClient = await stack.migrator.connect();
+      let retry: Response;
+      try {
+        await takeover.query('begin');
+        await takeover.query(`select set_config('app.system_access', 'on', true)`);
+        // A request takes the expired reservation over for this very batch and has not committed.
+        await takeover.query(
+          `update invitation_batch_replays
+           set request_digest = $4, lease_id = uuidv7(),
+               expires_at = clock_timestamp() + interval '30 seconds'
+           where organization_id = $1 and actor_user_id = $2 and key_digest = $3`,
+          [atelierNordId, ines.id, digestOf(taken), digestOf(canonicalOf(emails))],
+        );
+        retry = await invite(ines, atelierNordId, taken, emails);
+      } finally {
+        await takeover.query('rollback');
+        takeover.release();
+      }
+
+      expect(retry.status).toBe(409);
+      expect(retry.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      const runs: Response = await invite(ines, atelierNordId, taken, emails);
+      expect(runs.status).toBe(200);
+      expect((runs.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
+    });
+
+    it('answers 409 while a purge holds the expired row of a key, then runs the key once it is free', async () => {
+      const purged = 'members-page-batch-purging';
+      const emails: readonly string[] = ['bert@ateliernord.fr'];
+      await reservedBy(purged, emails, -10);
+      const purge: pg.PoolClient = await stack.migrator.connect();
+      let held: Response;
+      try {
+        await purge.query('begin');
+        await purge.query(`select set_config('app.system_access', 'on', true)`);
+        await purge.query(
+          `select key_digest from invitation_batch_replays
+           where organization_id = $1 and actor_user_id = $2 and key_digest = $3 for update`,
+          [atelierNordId, ines.id, digestOf(purged)],
+        );
+        held = await invite(ines, atelierNordId, purged, emails);
+      } finally {
+        await purge.query('rollback');
+        purge.release();
+      }
+
+      expect(held.status).toBe(409);
+      expect(held.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      const runs: Response = await invite(ines, atelierNordId, purged, emails);
+      expect(runs.status).toBe(200);
+    });
+
+    it('waits for a long change of the organization to reserve a new key, instead of a false 409', async () => {
+      const patched = 'members-page-batch-organization-locked';
+      const editor: pg.PoolClient = await stack.migrator.connect();
+      let response: Response;
+      let durationMs: number;
+      try {
+        await editor.query('begin');
+        await editor.query(`select set_config('app.system_access', 'on', true)`);
+        // A change of the organization in progress, as a patch of its profile holds it.
+        await editor.query('select id from organizations where id = $1 for update', [
+          atelierNordId,
+        ]);
+        const started: number = Date.now();
+        const pending: Promise<Response> = invite(ines, atelierNordId, patched, [
+          'cleo@ateliernord.fr',
+        ]);
+        await new Promise<void>((resolve) => setTimeout(resolve, 600));
+        await editor.query('commit');
+        response = await pending;
+        durationMs = Date.now() - started;
+      } finally {
+        editor.release();
+      }
+
+      expect(response.status).toBe(200);
+      expect((response.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
+      expect(durationMs).toBeGreaterThanOrEqual(500);
     });
 
     it('never waits to reserve a key that another transaction is writing, answering 409 at once', async () => {
