@@ -165,9 +165,11 @@ tables, the invitation lifecycle, the invitation email limits (the hour between 
 with its redeliveries and the schedule of its consumers, and the rollback of a failed creation.
 `tests/invitation-idempotency.int-spec.ts` drives the `Idempotency-Key` of the invitation batches
 (replay, key reuse, a key held by another transaction or a dead one, concurrent retries of a
-committed batch, concurrent equivalent and different batches, the stored fingerprint,
+committed batch or racing an uncommitted one, concurrent equivalent and different batches, the
+stored fingerprint,
 authorization checked again, scoping to the user and the organization, a `429` not stored, the
-rollback of a failed batch, the bounded purges of expired records) and the read of an invitation
+rollback of a failed batch, the bounded purges of expired records, a burst drained in one tick,
+the index plans of the purges) and the read of an invitation
 in each state.
 `tests/account-changes.int-spec.ts` follows the changes of address and the deletions of accounts
 of identity-service to the member list, the memberships, `member.removed.v1` and the pending

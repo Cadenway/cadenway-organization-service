@@ -176,6 +176,12 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
   /** How each tenant transaction of a request was asked to open, in order. */
   public readonly requestOptions: UnitOfWorkOptions[] = [];
 
+  /**
+   * Refuses the next claim, as another transaction holding it after its wait would, after running
+   * what that transaction does meanwhile (committing a replay record, for instance).
+   */
+  public refuseNextClaim: (() => void) | null = null;
+
   /** Makes every replay record fail, as a database failure after the invitations would. */
   public failReplayRecords: boolean = false;
 
@@ -642,6 +648,12 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           request: InvitationBatchRequest,
         ): Promise<boolean> => {
           const claim: string = JSON.stringify([replayKeyOf(key), request.canonical]);
+          const refusal: (() => void) | null = this.refuseNextClaim;
+          if (refusal !== null) {
+            this.refuseNextClaim = null;
+            refusal();
+            return Promise.resolve(false);
+          }
           if (this.claimedReplayKeys.has(claim)) {
             return Promise.resolve(false);
           }

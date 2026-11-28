@@ -353,6 +353,25 @@ describe('InviteMembers with an Idempotency-Key', () => {
     expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
   });
 
+  it('replays a batch that committed while its claim was refused, and answers 409 only without a record', async () => {
+    const first: InviteMembersOutput = await invite.execute(keyed(['marc.roux@ateliernord.fr']));
+    const [key, record] = [...scenario.store.tables.replays][0] ?? [];
+    if (key === undefined || record === undefined) throw new Error('No replay was recorded.');
+    scenario.store.tables.replays.delete(key);
+    scenario.store.refuseNextClaim = (): void => {
+      scenario.store.tables.replays.set(key, record);
+    };
+
+    await expect(invite.execute(keyed(['marc.roux@ateliernord.fr']))).resolves.toEqual(first);
+
+    scenario.store.tables.replays.delete(key);
+    scenario.store.refuseNextClaim = (): void => undefined;
+    await expect(invite.execute(keyed(['marc.roux@ateliernord.fr']))).rejects.toMatchObject({
+      refusal: { reason: 'idempotency-request-in-progress' },
+    });
+    expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
+  });
+
   it('commits nothing when the replay record fails, and lets the key run again', async () => {
     const invitations: number = scenario.store.tables.invitations.size;
     scenario.store.failReplayRecords = true;

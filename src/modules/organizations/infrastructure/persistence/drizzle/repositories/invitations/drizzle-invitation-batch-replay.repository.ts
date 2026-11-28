@@ -10,6 +10,7 @@ import type { StoredInvitationBatch } from '../../../../../application/models/in
 import type { InvitationBatchReplayRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-batch-replay-repository.port.js';
 import { INVITATION_BATCH_REPLAY_MS } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import { isLockTimeout } from '../../mappers/postgres/lock-timeout.mapper.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 
 /**
@@ -25,16 +26,63 @@ import { invitationBatchReplays } from '../../schemas/invitations/invitation-bat
 const INLINE_PURGE_LIMIT: number = 10;
 
 /**
- * Constant DATABASE_NOW
+ * Constant REPLAY_CLOCK
  *
  * @description
- * The clock every replay instant is written, read and purged on: the database's, at the statement
- * that uses it (`clock_timestamp()`, not the start of the transaction), so neither the clock of a
- * replica nor the time a batch waited on its locks moves the 24 hours.
+ * The clock a replay window is written and read on: the database's, at the moment of the call
+ * (`clock_timestamp()`, not the start of the transaction), so neither the clock of a replica nor the
+ * time a batch waited on its locks moves the 24 hours. The live read selects one row by its
+ * primary key, so the volatility of the function costs no index there.
  *
  * @type {SQL<Date>}
  */
-export const DATABASE_NOW: SQL<Date> = sql<Date>`clock_timestamp()`;
+const REPLAY_CLOCK: SQL<Date> = sql<Date>`clock_timestamp()`;
+
+/**
+ * Constant PURGE_CUTOFF
+ *
+ * @description
+ * The instant a purge deletes the records expired at: the database's, fixed for the statement
+ * (`statement_timestamp()`), so PostgreSQL can range-scan an expiry index with it, which a volatile
+ * `clock_timestamp()` prevents. It is never earlier than the clock of a read the same transaction
+ * made before, so a record the batch found expired is purged.
+ *
+ * @type {SQL<Date>}
+ */
+export const PURGE_CUTOFF: SQL<Date> = sql<Date>`statement_timestamp()`;
+
+/**
+ * Constant CLAIM_WAIT
+ *
+ * @description
+ * How long a claim waits for an equivalent batch of its key in flight before it gives up: well
+ * under the `statement_timeout` (10 s) of the application role, and long enough for a retry that
+ * races the batch it repeats to replay it once that one commits.
+ *
+ * @type {string}
+ */
+const CLAIM_WAIT: string = '2s';
+
+/**
+ * Function inlinePurgeOf
+ *
+ * @description
+ * The bounded delete a keyed batch runs: at most `INLINE_PURGE_LIMIT` expired records of its
+ * organization, oldest first, by `invitation_batch_replays_organization_expiry_index`, skipping the
+ * rows another transaction is deleting.
+ *
+ * @param {string} organizationId - The organization of the batch.
+ * @returns {SQL} The statement.
+ */
+export function inlinePurgeOf(organizationId: string): SQL {
+  return sql`delete from ${invitationBatchReplays}
+    where (organization_id, actor_user_id, key_digest) in (
+      select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
+      where organization_id = ${organizationId}::uuid and expires_at <= ${PURGE_CUTOFF}
+      order by expires_at
+      limit ${INLINE_PURGE_LIMIT}
+      for update skip locked)`;
+}
 
 /**
  * Constant REPLAY_WINDOW
@@ -66,9 +114,9 @@ function digestOf(value: string): string {
  * @description
  * `InvitationBatchReplayRepository` on `invitation_batch_replays`, in the tenant transaction of the
  * batch. The in-progress marker is a transaction-level advisory lock on the scoped key and the
- * fingerprint of the batch, taken with `pg_try_advisory_xact_lock`: PostgreSQL releases it at
- * commit or rollback, and when the connection ends, so a crashed process frees the key at once and
- * a stalled transaction holds it no longer than the `statement_timeout` (10 s) and
+ * fingerprint of the batch, taken with `pg_advisory_xact_lock` within `CLAIM_WAIT`: PostgreSQL
+ * releases it at commit or rollback, and when the connection ends, so a crashed process frees the
+ * key at once and a stalled transaction holds it no longer than the `statement_timeout` (10 s) and
  * `idle_in_transaction_session_timeout` (30 s) of the application role. Another batch under the
  * same key takes another lock; the primary key of the table decides between them, the second
  * storing nothing once the first commits.
@@ -129,7 +177,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           eq(invitationBatchReplays.organizationId, key.organizationId),
           eq(invitationBatchReplays.actorUserId, key.actorUserId),
           eq(invitationBatchReplays.keyDigest, digestOf(key.key)),
-          gt(invitationBatchReplays.expiresAt, DATABASE_NOW),
+          gt(invitationBatchReplays.expiresAt, REPLAY_CLOCK),
         ),
       )
       .limit(1);
@@ -147,20 +195,39 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    *
    * @description
    * Takes the advisory lock of the scoped key and the batch's fingerprint for the transaction,
-   * without waiting.
+   * waiting at most `CLAIM_WAIT` for the transaction that holds it. The wait runs in a savepoint
+   * under its own `lock_timeout`: a timeout rolls the savepoint back, which leaves the transaction
+   * usable and its `lock_timeout` as it was; a lock taken stays held until the transaction ends.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<boolean>} `false` when another transaction holds it.
+   * @returns {Promise<boolean>} `false` when another transaction still holds it after the wait.
    */
   public async tryClaim(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
   ): Promise<boolean> {
-    const result = await this.db.execute<{ acquired: boolean }>(
-      sql`select pg_try_advisory_xact_lock(hashtextextended('invitation-batch:' || ${key.organizationId}::uuid::text || ':' || ${key.actorUserId}::uuid::text || ':' || ${digestOf(key.key)} || ':' || ${digestOf(request.canonical)}, 0)) as acquired`,
+    const name: string = `invitation-batch:${key.organizationId.toLowerCase()}:${key.actorUserId.toLowerCase()}:${digestOf(key.key)}:${digestOf(request.canonical)}`;
+    const current = await this.db.execute<{ timeout: string }>(
+      sql`select current_setting('lock_timeout') as timeout`,
     );
-    return result.rows[0]?.acquired === true;
+    await this.db.execute(sql`savepoint invitation_batch_claim`);
+    try {
+      await this.db.execute(sql`select set_config('lock_timeout', ${CLAIM_WAIT}, true)`);
+      await this.db.execute(sql`select pg_advisory_xact_lock(hashtextextended(${name}, 0))`);
+      await this.db.execute(
+        sql`select set_config('lock_timeout', ${current.rows[0]?.timeout ?? '0'}, true)`,
+      );
+      await this.db.execute(sql`release savepoint invitation_batch_claim`);
+      return true;
+    } catch (error) {
+      if (!isLockTimeout(error)) {
+        throw error;
+      }
+      await this.db.execute(sql`rollback to savepoint invitation_batch_claim`);
+      await this.db.execute(sql`release savepoint invitation_batch_claim`);
+      return false;
+    }
   }
 
   /**
@@ -189,19 +256,10 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           eq(invitationBatchReplays.organizationId, key.organizationId),
           eq(invitationBatchReplays.actorUserId, key.actorUserId),
           eq(invitationBatchReplays.keyDigest, keyDigest),
-          lte(invitationBatchReplays.expiresAt, DATABASE_NOW),
+          lte(invitationBatchReplays.expiresAt, PURGE_CUTOFF),
         ),
       );
-    await this.db.execute(
-      sql`delete from ${invitationBatchReplays}
-          where (organization_id, actor_user_id, key_digest) in (
-            select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
-            where organization_id = ${key.organizationId}::uuid
-              and expires_at <= ${DATABASE_NOW}
-            order by expires_at
-            limit ${INLINE_PURGE_LIMIT}
-            for update skip locked)`,
-    );
+    await this.db.execute(inlinePurgeOf(key.organizationId));
     const inserted: { readonly organizationId: string }[] = await this.db
       .insert(invitationBatchReplays)
       .values({
@@ -210,7 +268,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
         keyDigest,
         requestDigest: digestOf(replay.request.canonical),
         outcome: replay.invitations,
-        expiresAt: sql`${DATABASE_NOW} + ${REPLAY_WINDOW}`,
+        expiresAt: sql`${REPLAY_CLOCK} + ${REPLAY_WINDOW}`,
       })
       .onConflictDoNothing()
       .returning({ organizationId: invitationBatchReplays.organizationId });

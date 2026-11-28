@@ -10,6 +10,8 @@ import type {
 } from '@cadenway/contracts/types/internal/organization-service';
 import { SystemTransactionRunner } from '@cadenway/nest-common/database';
 import { JobScheduler } from '@cadenway/nest-jobs/runtime';
+import { sql } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type pg from 'pg';
 import request from 'supertest';
@@ -19,7 +21,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
 import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
 import { InvitationBatchRequest } from '../src/modules/organizations/domain/value-objects/invitations/invitation-batch-request.value-object.js';
-import { ExpiredInvitationBatchReplays } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
+import { inlinePurgeOf } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-batch-replay.repository.js';
+import {
+  ExpiredInvitationBatchReplays,
+  expiredPurgeOf,
+} from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
 import { PurgeInvitationBatchReplaysHandler } from '../src/modules/organizations/presentation/jobs/handlers/invitations/purge-invitation-batch-replays.handler.js';
 import { DeclaredErrors } from './support/declared-errors.js';
 import type { SeenError } from './support/declared-errors.js';
@@ -526,6 +532,56 @@ describe('idempotent invitation batches and the invitation state', () => {
       );
     });
 
+    it('replays to retries that waited on the claim of the batch they repeat, once it commits', async () => {
+      const racing = 'members-page-batch-claimed';
+      const emails: readonly string[] = ['ruth@ateliernord.fr'];
+      const outcome: InvitationBatchResult = {
+        invitations: [{ email: 'ruth@ateliernord.fr', outcome: 'invited', invitationId: newId() }],
+      };
+      // The original batch, in flight: its claim is held and its record written, not committed.
+      const original: pg.PoolClient = await stack.migrator.connect();
+      let responses: Response[];
+      try {
+        await original.query('begin');
+        await original.query(`select set_config('app.system_access', 'on', true)`);
+        await original.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          lockName(atelierNordId, ines, racing, emails),
+        ]);
+        await original.query(
+          `insert into invitation_batch_replays
+             (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
+           values ($1, $2, $3, $4, $5, clock_timestamp() + interval '24 hours')`,
+          [
+            atelierNordId,
+            ines.id,
+            digestOf(racing),
+            digestOf(canonicalOf(emails)),
+            JSON.stringify(outcome.invitations),
+          ],
+        );
+        const pending: Promise<Response>[] = [
+          invite(ines, atelierNordId, racing, emails),
+          invite(ines, atelierNordId, racing, emails),
+        ];
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const rows = await stack.migrator.query<{ blocked: number }>(
+            `select count(*)::int as blocked from pg_locks where locktype = 'advisory' and not granted`,
+          );
+          if ((rows.rows[0]?.blocked ?? 0) >= 2) break;
+          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        }
+        await original.query('commit');
+        responses = await Promise.all(pending);
+      } finally {
+        original.release();
+      }
+
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      for (const response of responses) {
+        expect(response.body).toEqual(outcome);
+      }
+    });
+
     it('keeps a fingerprint of the batch, never its addresses, beside the body to replay', async () => {
       const rows = await stack.system<{ columns: string[] }>(
         `select array_agg(column_name::text order by ordinal_position) as columns
@@ -797,6 +853,83 @@ describe('idempotent invitation batches and the invitation state', () => {
           atelierNordId,
         ),
       ).toBe(live);
+    });
+
+    it('drains a burst of more than 500 expired records across organizations in one tick', async () => {
+      await expired(atelierNordId, 700, 'burst-a-');
+      await expired(lumenId, 650, 'burst-l-');
+      const live: number = await count(
+        `select count(*)::int as count from invitation_batch_replays
+         where organization_id = $1 and expires_at > now()`,
+        atelierNordId,
+      );
+
+      await app
+        .get(PurgeInvitationBatchReplaysHandler)
+        .handle({ organizationId: null, signal: new AbortController().signal });
+
+      expect(await swept(atelierNordId)).toBe(0);
+      expect(await swept(lumenId)).toBe(0);
+      expect(live).toBeGreaterThan(0);
+      expect(
+        await count(
+          `select count(*)::int as count from invitation_batch_replays
+           where organization_id = $1 and expires_at > now()`,
+          atelierNordId,
+        ),
+      ).toBe(live);
+    });
+
+    it('finds the expired records of both purges by an index range on their expiry', async () => {
+      /**
+       * The index scans of the plan of a statement, sequential scans disabled.
+       *
+       * @param statement - The statement.
+       * @returns Each index scan with its index and condition.
+       */
+      async function indexScansOf(
+        statement: SQL,
+      ): Promise<{ readonly index: string; readonly condition: string }[]> {
+        const plan: unknown = await app.get(SystemTransactionRunner).run(
+          async ({ db }) => {
+            await db.execute(sql`set local enable_seqscan = off`);
+            const result = await db.execute<{ 'QUERY PLAN': unknown }>(
+              sql`explain (format json) ${statement}`,
+            );
+            return result.rows[0]?.['QUERY PLAN'];
+          },
+          { readOnly: true },
+        );
+        const scans: { readonly index: string; readonly condition: string }[] = [];
+        const visit = (node: unknown): void => {
+          if (Array.isArray(node)) {
+            node.forEach(visit);
+            return;
+          }
+          if (typeof node !== 'object' || node === null) return;
+          const fields = node as Record<string, unknown>;
+          if (typeof fields['Index Name'] === 'string') {
+            scans.push({
+              index: fields['Index Name'],
+              condition: typeof fields['Index Cond'] === 'string' ? fields['Index Cond'] : '',
+            });
+          }
+          Object.values(fields).forEach(visit);
+        };
+        visit(plan);
+        return scans;
+      }
+
+      expect(await indexScansOf(expiredPurgeOf(500))).toContainEqual({
+        index: 'invitation_batch_replays_expiry_index',
+        condition: '(expires_at <= statement_timestamp())',
+      });
+      expect(await indexScansOf(inlinePurgeOf(atelierNordId))).toContainEqual({
+        index: 'invitation_batch_replays_organization_expiry_index',
+        condition: expect.stringMatching(
+          /organization_id = .*expires_at <= statement_timestamp\(\)/u,
+        ) as string,
+      });
     });
   });
 

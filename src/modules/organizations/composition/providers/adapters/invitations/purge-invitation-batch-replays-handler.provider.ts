@@ -16,11 +16,10 @@ export const purgeInvitationBatchReplaysHandlerProvider: FactoryProvider<PurgeIn
       scheduler: JobScheduler,
       system: SystemTransactionRunner,
     ): PurgeInvitationBatchReplaysHandler => {
-      const expired = new ExpiredInvitationBatchReplays(system);
       return new PurgeInvitationBatchReplaysHandler(
         workers,
         scheduler,
-        (limit: number) => expired.purge(limit),
+        new ExpiredInvitationBatchReplays(system),
         PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
       );
     },

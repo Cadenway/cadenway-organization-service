@@ -83,18 +83,24 @@ version that writes it, since earlier entries do not identify the sender of each
 sent with an `Idempotency-Key`: the SHA-256 digest of the key, never the key, the SHA-256
 fingerprint of the canonical batch (`request_digest`: the role and the distinct addresses in
 order), never the batch, the `200` outcome to replay (`outcome`) and `expires_at`, 24 hours after
-the insert of the record on the database clock (`clock_timestamp()`), which every read and purge
-of the table uses too. **`outcome` holds the invited addresses**, the body the contract replays, until the
+the insert of the record on the database clock (`clock_timestamp()`), which the live read uses too;
+the purges compare with `statement_timestamp()`, fixed for their statement, so they range-scan the
+expiry indexes. **`outcome` holds the invited addresses**, the body the contract replays, until the
 record is purged: 24 hours, plus the delay of the purge. A record is written once, in the
 transaction of its batch, and never changed. Two purges delete expired records, both bounded:
 
 - a keyed batch deletes its own key's expired record and at most 10 other expired records of its
   organization (`invitation_batch_replays_organization_expiry_index`, `skip locked`), so it never
   holds its allowance locks for a long delete;
-- the system job `organization.purge-invitation-batch-replays` deletes at most 500 expired records
-  of any organization each minute (`invitation_batch_replays_expiry_index`, oldest first,
-  `skip locked`), whatever the tenants' traffic. A tick that leaves rows lets the next continue; a
-  failed tick is retried by its queue, which the migrator provisions with the others.
+- the system job `organization.purge-invitation-batch-replays` runs each minute, whatever the
+  tenants' traffic: bounded deletes of at most 500 expired records of any organization
+  (`invitation_batch_replays_expiry_index`, oldest first, `skip locked`), each in its own system
+  transaction, one after the other until one deletes fewer than 500 or 5 seconds have passed (under
+  the 8 s shutdown timeout of the job runtime). A keyed batch stores a record even when it sends
+  nothing, so the email allowance does not bound how many records expire; a tick that stops on its
+  budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
+  next tick continues. A failed tick is retried by its queue, which the migrator provisions with
+  the others.
 
 The migration is additive: the previous release never reads the table, and a rollback keeps it
 (see "Rollout and rollback of idempotent batches").
@@ -213,17 +219,27 @@ in the same deployment as this module or before, otherwise they reach the browse
 ### Rollout and rollback of idempotent batches
 
 A release before this one ignores `Idempotency-Key`: behind it, a retried keyed batch runs again,
-sends its emails again and charges the allowances again. Nothing in the service tells the gateway
-which behavior it gets, so the order is operational:
+sends its emails again and charges the allowances again, and could invite again an address whose
+invitation was revoked meanwhile. Nothing in the service tells the gateway which behavior it gets,
+so the gateway owns the decision with a configuration switch, and the order is operational.
+
+The contract this service asks of the gateway: **a request that carries `Idempotency-Key` is
+either forwarded with its key to a release that replays, or refused; the key is never stripped.**
+Whenever replay support is unavailable (the switch turned off after it had been on, or during a
+rollback of this service), the gateway answers such a request with a retryable
+`503 service.unavailable` problem and `Retry-After`, so the client retries the same key later
+instead of running the batch afresh. A request without the key keeps being forwarded as usual.
+The gateway change implements it; nothing in this service does.
 
 1. Deploy this release (migration `0012` first, as every migration) in the environment.
-2. Only then enable the gateway's configuration switch that forwards `Idempotency-Key` on
-   `POST /v1/invitations`, and expose `GET /v1/invitations/{invitationId}`.
-3. To roll this service back below this release, first turn the gateway's switch off and wait
-   until no forwarded request is in flight, then roll the service back. Keep
-   `invitation_batch_replays`: the previous release never reads it. Rolling forward again restores
-   the replays of the records still live; a batch the previous release ran in between was not
-   recorded and is not replayed.
+2. Only then turn the gateway's switch on: it forwards `Idempotency-Key` on
+   `POST /v1/invitations` and exposes `GET /v1/invitations/{invitationId}`.
+3. To roll this service back below this release, first turn the gateway's switch to refusing
+   keyed requests with the `503` above, wait until no forwarded keyed request is in flight, then
+   roll the service back. Keep `invitation_batch_replays`: the previous release never reads it.
+   Leave the switch refusing for as long as the previous release runs. Rolling forward again
+   restores the replays of the records still live, and the switch can forward keys again; no keyed
+   batch ran in between, since the gateway refused them all.
 4. Once no replica of this release runs (a replica that starts registers the schedule again),
    clean up what the previous release leaves behind, since it has no purge worker:
    - remove the persisted schedule of `organization.purge-invitation-batch-replays`, which would
@@ -535,16 +551,19 @@ The Search readers open their snapshots directly with the kit's transaction runn
   checks, it reads the committed live record of the key first, without any lock: a replay checks
   the actor's role again under a share lock on the membership and answers the stored body, taking
   neither allowance lock, and another batch answers `422`. Without a record, it takes a
-  transaction-level advisory lock on the scoped key and the fingerprint of the batch with
-  `pg_try_advisory_xact_lock`, without waiting (`409` when an equivalent batch holds it), and reads
-  the record again, since a batch of the key may have committed in between. A fresh batch runs as
+  transaction-level advisory lock on the scoped key and the fingerprint of the batch, waiting at
+  most 2 s for an equivalent batch that holds it (the wait runs in a savepoint under its own
+  `lock_timeout`, so a timeout leaves the transaction usable), and reads the record again in either
+  case, since a batch of the key may have committed in between: a refused claim answers `409` only
+  while the key still has no record. A fresh batch runs as
   without a key and inserts its record last: the invitations, their ledger entries, their
   `invitation.issued.v1` outbox rows and the record commit together, and any failure rolls them all
   back. The primary key of `invitation_batch_replays` decides between two different batches of one
   key: the insert of the second waits for the first, stores nothing once it commits, and the second
-  answers `422` and rolls back. The key lock is never awaited, so it adds no lock ordering to the
-  one above.
-- The purge job runs in a system transaction, a bounded exception: one `delete` of at most 500
+  answers `422` and rolls back. The key lock is the first lock the batch takes, before the sender
+  and organization locks, and an equivalent batch holding it never waits on the waiter, so it adds
+  no deadlock to the order above.
+- The purge job runs in system transactions, a bounded exception: each one `delete` of at most 500
   expired replay records, chosen by expiry and skipping the rows a batch is deleting.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
   - the creation of an organization: the organization does not exist before it and PostgreSQL
@@ -589,17 +608,25 @@ Any failure rolls back the business rows and the outbox rows together
   `organization_app`. The lock covers the key and the fingerprint of the batch, so `409` means an
   equivalent request in flight only; a different batch runs, and the primary key of the table
   refuses it with `422` if the other commits the key first. A committed record is read before the
-  lock, so retries of a committed batch never contend. A batch that waited on the allowance locks
+  lock, so retries of a committed batch never contend; a retry that races the batch it repeats
+  waits up to 2 s on its claim and replays it once it commits, and reads the record again after a
+  refused claim, so `409` never hides a stored `200`. A batch that waited on the allowance locks
   reads the record once more under them, before it plans or counts anything, so losing to another
   batch of its key that took the last send answers `422`, never `429`. The 24 hours start at the
   insert of the record and are read on the database's `clock_timestamp()`, not on the clock of a
   replica nor at the start of the request, so the time a batch waited on its locks never shortens
-  them; the allowances keep the clock of the service.
+  them; the allowances keep the clock of the service. The live read finds one row by its primary
+  key, where the volatile function costs nothing, while the purges compare with
+  `statement_timestamp()`, which PostgreSQL can use as an index range bound
+  (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists. The service exposes no version or capability signal (its only
   unauthenticated routes are `/health/live` and `/health/ready`, from the kit), so the gateway
-  cannot detect support for the key; the rollout order below is operational and the gateway gates
-  the forwarding behind its own configuration switch.
+  cannot detect support for the key; the rollout order is operational and the gateway gates the
+  forwarding behind its own configuration switch. When the switch does not forward, the gateway
+  refuses keyed requests with a retryable `503 service.unavailable` rather than stripping the key:
+  a stripped retry would run the batch afresh (re-inviting an address revoked meanwhile, sending
+  and charging again), while a refused one keeps its key for a later replay.
 - Reserved addresses (B19 of the webapp rebuild): a new code `organization.slug-reserved` rather
   than a reason on `organization.slug-invalid`, so that a client that only knows the latter never
   shows its length message for a reserved address. An address that becomes reserved after it was

@@ -59,9 +59,13 @@ The `cadenway-api-contracts` repository owns HTTP and event specifications. Cons
 Idempotent invitation batches (`Idempotency-Key` on `inviteMembers`, `@cadenway/contracts` 0.45.0)
 need one more ordering rule, since a release of this service before it ignores the key and a
 keyed retry would run again: deploy this service first; the gateway forwards keys only after,
-behind its own configuration switch; to roll this service back below that release, turn the
-gateway's switch off first. The service exposes no version or capability signal the gateway could
-check. See "Rollout and rollback of idempotent batches" in `src/modules/organizations/MODULE.md`.
+behind its own configuration switch. The gateway never strips the key: whenever replay support is
+unavailable (the switch turned off after it had been on, or during a rollback of this service), it
+refuses a request that carries `Idempotency-Key` with a retryable `503 service.unavailable` and
+`Retry-After`, while requests without the key keep working. To roll this service back below that
+release, set the gateway's switch to refusing keyed requests first. The service exposes no version
+or capability signal the gateway could check. See "Rollout and rollback of idempotent batches" in
+`src/modules/organizations/MODULE.md`.
 
 ## References
 
