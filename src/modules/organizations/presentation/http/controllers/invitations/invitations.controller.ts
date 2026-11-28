@@ -2,20 +2,35 @@ import type {
   Invitation,
   InvitationBatchResult,
   InvitationPage,
+  InvitationState,
 } from '@cadenway/contracts/types/internal/organization-service';
 import { InternalAccess } from '@cadenway/nest-common';
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Headers,
+  HttpCode,
+  Param,
+  Post,
+  Query,
+  Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 
 import type { PagePosition } from '../../../../application/models/pagination/page-position.model.js';
+import type { InvitationStateView } from '../../../../application/projections/invitations/invitation-state-view.projection.js';
 import type { InvitationView } from '../../../../application/projections/invitations/invitation-view.projection.js';
 import type { InviteMembersOutput } from '../../../../application/use-cases/commands/invitations/invite-members/invite-members.output.js';
 import { InviteMembers } from '../../../../application/use-cases/commands/invitations/invite-members/invite-members.use-case.js';
 import { ResendInvitation } from '../../../../application/use-cases/commands/invitations/resend-invitation/resend-invitation.use-case.js';
 import { RevokeInvitation } from '../../../../application/use-cases/commands/invitations/revoke-invitation/revoke-invitation.use-case.js';
+import { GetInvitation } from '../../../../application/use-cases/queries/invitations/get-invitation/get-invitation.use-case.js';
 import type { ListInvitationsOutput } from '../../../../application/use-cases/queries/invitations/list-invitations/list-invitations.output.js';
 import { ListInvitations } from '../../../../application/use-cases/queries/invitations/list-invitations/list-invitations.use-case.js';
 import { EmptyBody } from '../../dto/input/invitations/empty-body.dto.js';
+import { GetInvitationPath } from '../../dto/input/invitations/get-invitation-path.dto.js';
 import { InvitationPath } from '../../dto/input/invitations/invitation-path.dto.js';
 import { InviteMembersBody } from '../../dto/input/invitations/invite-members-body.dto.js';
 import { ListInvitationsQuery } from '../../dto/input/invitations/list-invitations-query.dto.js';
@@ -24,8 +39,10 @@ import { toActorUserId, toOrganizationId } from '../../mappers/context/request-c
 import {
   toInvitationResponse,
   toInvitationResultResponse,
+  toInvitationStateResponse,
 } from '../../mappers/invitations/invitation-response.mapper.js';
 import { isInstant, toNextCursor, toPagePosition } from '../../mappers/pagination/cursor.mapper.js';
+import { invitationBatchKey } from '../../validation/invitations/invitation.validation.js';
 
 /**
  * Constant PENDING_LIST
@@ -60,6 +77,17 @@ export class InvitationsController {
    * @readonly
    */
   private readonly inviteMembers: InviteMembers;
+
+  /**
+   * Property getInvitation
+   *
+   * @description
+   * Use case of the read of one invitation.
+   *
+   * @type {GetInvitation}
+   * @readonly
+   */
+  private readonly getInvitation: GetInvitation;
 
   /**
    * Property listInvitations
@@ -103,6 +131,7 @@ export class InvitationsController {
    * Takes the use cases, provided by `OrganizationsModule`.
    *
    * @param {InviteMembers} inviteMembers - Use case of the batch.
+   * @param {GetInvitation} getInvitation - Use case of the read of one invitation.
    * @param {ListInvitations} listInvitations - Use case of the pending list.
    * @param {ResendInvitation} resendInvitation - Use case of the resend.
    * @param {RevokeInvitation} revokeInvitation - Use case of the revocation.
@@ -110,11 +139,13 @@ export class InvitationsController {
    */
   public constructor(
     inviteMembers: InviteMembers,
+    getInvitation: GetInvitation,
     listInvitations: ListInvitations,
     resendInvitation: ResendInvitation,
     revokeInvitation: RevokeInvitation,
   ) {
     this.inviteMembers = inviteMembers;
+    this.getInvitation = getInvitation;
     this.listInvitations = listInvitations;
     this.resendInvitation = resendInvitation;
     this.revokeInvitation = revokeInvitation;
@@ -126,11 +157,14 @@ export class InvitationsController {
    * Method invite
    *
    * @description
-   * `POST /internal/v1/invitations`: `200` with the outcome of each distinct address; `400`,
+   * `POST /internal/v1/invitations`: `200` with the outcome of each distinct address, replayed for
+   * an equivalent batch under the same `Idempotency-Key`; `400`,
    * `403 organization.role-forbidden`, `404 organization.not-found`,
+   * `409 idempotency.request-in-progress`, `422 idempotency.key-reused`,
    * `429 invitation.daily-limit-reached` with `Retry-After`.
    *
    * @param {InviteMembersBody} body - The addresses and the role.
+   * @param {string | undefined} requestKey - The `Idempotency-Key` header, if sent.
    * @param {Response} response - The response, for `Retry-After`.
    * @returns {Promise<InvitationBatchResult>} The outcomes.
    */
@@ -138,8 +172,10 @@ export class InvitationsController {
   @HttpCode(200)
   public async invite(
     @Body() body: InviteMembersBody,
+    @Headers('idempotency-key') requestKey: string | undefined,
     @Res({ passthrough: true }) response: Response,
   ): Promise<InvitationBatchResult> {
+    const idempotencyKey: string | undefined = invitationBatchKey(requestKey);
     const output: InviteMembersOutput = await answerRefusals(
       () =>
         this.inviteMembers.execute({
@@ -147,10 +183,33 @@ export class InvitationsController {
           organizationId: toOrganizationId(),
           emails: body.emails,
           role: body.role,
+          ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         }),
       response,
     );
     return { invitations: output.invitations.map(toInvitationResultResponse) };
+  }
+
+  /**
+   * Method get
+   *
+   * @description
+   * `GET /internal/v1/invitations/{invitationId}`: `200` with the invitation in any state; `400`,
+   * `403 organization.role-forbidden`, `404 invitation.not-found` or `organization.not-found`.
+   *
+   * @param {GetInvitationPath} path - The id of the invitation.
+   * @returns {Promise<InvitationState>} The invitation and its state.
+   */
+  @Get(':invitationId')
+  public async get(@Param() path: GetInvitationPath): Promise<InvitationState> {
+    const view: InvitationStateView = await answerRefusals(() =>
+      this.getInvitation.execute({
+        actorUserId: toActorUserId(),
+        organizationId: toOrganizationId(),
+        invitationId: path.invitationId,
+      }),
+    );
+    return toInvitationStateResponse(view);
   }
 
   /**

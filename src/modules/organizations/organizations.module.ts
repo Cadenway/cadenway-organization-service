@@ -15,6 +15,7 @@ import { projectTwoStepVerificationChangeProvider } from './composition/provider
 import { projectUserSignUpProvider } from './composition/providers/use-cases/directory/project-user-sign-up.provider.js';
 import { acceptInvitationProvider } from './composition/providers/use-cases/invitations/accept-invitation.provider.js';
 import { inviteMembersProvider } from './composition/providers/use-cases/invitations/invite-members.provider.js';
+import { getInvitationProvider } from './composition/providers/use-cases/invitations/get-invitation.provider.js';
 import { listInvitationsProvider } from './composition/providers/use-cases/invitations/list-invitations.provider.js';
 import { listReceivedInvitationsProvider } from './composition/providers/use-cases/invitations/list-received-invitations.provider.js';
 import { refuseInvitationProvider } from './composition/providers/use-cases/invitations/refuse-invitation.provider.js';
@@ -97,6 +98,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     changeMemberRoleProvider,
     removeMemberProvider,
     inviteMembersProvider,
+    getInvitationProvider,
     listInvitationsProvider,
     resendInvitationProvider,
     revokeInvitationProvider,

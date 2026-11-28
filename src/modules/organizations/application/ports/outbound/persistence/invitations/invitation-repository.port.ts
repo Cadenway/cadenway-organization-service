@@ -1,6 +1,7 @@
 import type { Invitation } from '../../../../../domain/aggregates/invitation/invitation.aggregate.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import type { InvitationDraft } from '../../../../../domain/value-objects/invitations/invitation-draft.value-object.js';
+import type { InvitationWithInviter } from '../../../../models/invitations/invitation-with-inviter.model.js';
 import type { Page } from '../../../../models/pagination/page.model.js';
 import type { PagePosition } from '../../../../models/pagination/page-position.model.js';
 import type { InvitationView } from '../../../../projections/invitations/invitation-view.projection.js';
@@ -52,6 +53,22 @@ export interface InvitationRepository {
    * @returns {Promise<Invitation | null>} The invitation, or `null`.
    */
   findForUpdate(organizationId: string, invitationId: string): Promise<Invitation | null>;
+
+  /**
+   * Method findWithInviter
+   *
+   * @description
+   * Loads an invitation of an organization by its id, in any state, with the name of its sender as
+   * the lists show it.
+   *
+   * @param {string} organizationId - The organization.
+   * @param {string} invitationId - Id of the invitation.
+   * @returns {Promise<InvitationWithInviter | null>} The invitation, or `null`.
+   */
+  findWithInviter(
+    organizationId: string,
+    invitationId: string,
+  ): Promise<InvitationWithInviter | null>;
 
   /**
    * Method find

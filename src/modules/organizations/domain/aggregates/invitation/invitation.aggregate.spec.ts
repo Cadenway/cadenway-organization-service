@@ -144,4 +144,46 @@ describe('Invitation', () => {
       InvalidStoredStateError,
     );
   });
+
+  it('reads a pending invitation as pending, then expired, without a closing instant', () => {
+    expect(marcRoux().lifecycleAt(after(6.9))).toEqual({
+      status: 'pending',
+      answeredAt: null,
+      revokedAt: null,
+    });
+    expect(marcRoux().lifecycleAt(after(7))).toEqual({
+      status: 'expired',
+      answeredAt: null,
+      revokedAt: null,
+    });
+  });
+
+  it('reads an answer as answeredAt and a revocation as revokedAt, whatever the expiry', () => {
+    expect(marcRoux().accept(after(1)).lifecycleAt(after(30))).toEqual({
+      status: 'accepted',
+      answeredAt: after(1),
+      revokedAt: null,
+    });
+    expect(marcRoux().refuse(after(2)).lifecycleAt(after(30))).toEqual({
+      status: 'refused',
+      answeredAt: after(2),
+      revokedAt: null,
+    });
+    expect(marcRoux().revoke(after(3)).lifecycleAt(after(30))).toEqual({
+      status: 'revoked',
+      answeredAt: null,
+      revokedAt: after(3),
+    });
+  });
+
+  it('refuses to read a stored closed invitation without its closing instant', () => {
+    const closed: Invitation = Invitation.restore({
+      ...marcRoux().snapshot,
+      status: 'accepted',
+      answeredAt: null,
+      version: 2,
+    });
+
+    expect(() => closed.lifecycleAt(after(1))).toThrow(InvalidStoredStateError);
+  });
 });

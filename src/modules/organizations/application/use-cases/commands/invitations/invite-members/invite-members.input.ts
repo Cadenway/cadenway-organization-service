@@ -51,5 +51,16 @@ export interface InviteMembersInput {
    * @readonly
    */
   readonly role: AssignableRole;
+
+  /**
+   * Property idempotencyKey
+   *
+   * @description
+   * The `Idempotency-Key` of the request, when the client sent one.
+   *
+   * @type {string | undefined}
+   * @readonly
+   */
+  readonly idempotencyKey?: string;
   // #endregion
 }

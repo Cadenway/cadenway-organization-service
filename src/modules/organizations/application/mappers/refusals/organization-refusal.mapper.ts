@@ -1,6 +1,7 @@
 import { InvalidEmailAddressError } from '../../../domain/errors/directory/invalid-email-address.error.js';
 import { OrganizationLogoError } from '../../../domain/errors/logo/organization-logo.error.js';
 import { InvitationAnsweredError } from '../../../domain/errors/invitations/invitation-answered.error.js';
+import { InvitationBatchKeyReusedError } from '../../../domain/errors/invitations/invitation-batch-key-reused.error.js';
 import { InvitationDailyLimitReachedError } from '../../../domain/errors/invitations/invitation-daily-limit-reached.error.js';
 import { InvitationExpiredError } from '../../../domain/errors/invitations/invitation-expired.error.js';
 import { InvitationResendThrottledError } from '../../../domain/errors/invitations/invitation-resend-throttled.error.js';
@@ -82,6 +83,9 @@ function refusalOf(error: unknown): Refusal | null {
       remaining: error.remaining,
       nextAvailableAt: error.nextAvailableAt,
     };
+  }
+  if (error instanceof InvitationBatchKeyReusedError) {
+    return { reason: 'idempotency-key-reused' };
   }
   return null;
 }

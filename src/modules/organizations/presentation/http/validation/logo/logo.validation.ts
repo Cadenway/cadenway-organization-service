@@ -5,7 +5,8 @@ import {
 } from '@cadenway/contracts/validators/internal/organization-service';
 import { ProblemException, ZodValidationPipe } from '@cadenway/nest-common';
 import type { ArgumentMetadata, PipeTransform } from '@nestjs/common';
-import type { z } from 'zod';
+
+import { validateHeaders } from '../headers/header.validation.js';
 
 /** Applies the contract schema while preserving its explicit media refusal statuses. */
 export class LogoDeclarationPipe implements PipeTransform {
@@ -56,22 +57,4 @@ export function logoExpectedVersion(value: string | undefined): number | undefin
     'If-Match'
   ];
   return header === undefined ? undefined : Number(header.slice(1, -1));
-}
-
-/** Keeps header validation problems in the standard contract location. */
-function validateHeaders<TResult>(schema: z.ZodType<TResult>, value: unknown): TResult {
-  const result = schema.safeParse(value);
-  if (result.success) return result.data;
-  throw new ProblemException({
-    status: 400,
-    code: 'request.invalid',
-    details: {
-      issues: result.error.issues.map((issue) => ({
-        in: 'header',
-        path: issue.path.join('.'),
-        code: issue.code,
-        message: issue.message,
-      })),
-    },
-  });
 }

@@ -135,6 +135,10 @@ function shapeOf(refusal: Refusal): ProblemShape {
         },
         retryAt: refusal.nextAvailableAt,
       };
+    case 'idempotency-key-reused':
+      return { status: 422, code: 'idempotency.key-reused' };
+    case 'idempotency-request-in-progress':
+      return { status: 409, code: 'idempotency.request-in-progress' };
     case 'user-not-found':
       return { status: 404, code: 'user.not-found' };
     case 'user-not-synchronized':

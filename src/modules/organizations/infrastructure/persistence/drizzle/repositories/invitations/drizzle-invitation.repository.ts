@@ -2,6 +2,7 @@ import type { TransactionDatabase } from '@cadenway/nest-common/database';
 import { and, desc, eq, gt, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
+import type { InvitationWithInviter } from '../../../../../application/models/invitations/invitation-with-inviter.model.js';
 import type { Page } from '../../../../../application/models/pagination/page.model.js';
 import type { PagePosition } from '../../../../../application/models/pagination/page-position.model.js';
 import type { InvitationRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-repository.port.js';
@@ -334,6 +335,38 @@ export class DrizzleInvitationRepository implements InvitationRepository {
       .for('update');
     const row: InvitationRow | undefined = rows[0];
     return row === undefined ? null : toInvitation(row);
+  }
+
+  /**
+   * Method findWithInviter
+   *
+   * @description
+   * Loads an invitation of an organization in any state, with the name of its sender.
+   *
+   * @param {string} organizationId - The organization.
+   * @param {string} invitationId - Id of the invitation.
+   * @returns {Promise<InvitationWithInviter | null>} The invitation, or `null`.
+   */
+  public async findWithInviter(
+    organizationId: string,
+    invitationId: string,
+  ): Promise<InvitationWithInviter | null> {
+    const rows: { readonly invitation: InvitationRow; readonly inviterName: string }[] =
+      await this.db
+        .select({ invitation: invitations, inviterName: INVITER_NAME })
+        .from(invitations)
+        .leftJoin(directoryUsers, eq(directoryUsers.userId, invitations.invitedByUserId))
+        .where(
+          and(eq(invitations.organizationId, organizationId), eq(invitations.id, invitationId)),
+        )
+        .limit(1);
+    const row = rows[0];
+    return row === undefined
+      ? null
+      : {
+          invitation: toInvitation(row.invitation),
+          invitedBy: { userId: row.invitation.invitedByUserId, name: row.inviterName },
+        };
   }
 
   /**

@@ -5,6 +5,7 @@ import { InvitationRevokedError } from '../../errors/invitations/invitation-revo
 import { InvalidStoredStateError } from '../../errors/organizations/invalid-stored-state.error.js';
 import { EmailAddress } from '../../value-objects/email/email-address.value-object.js';
 import type { InvitationDraft } from '../../value-objects/invitations/invitation-draft.value-object.js';
+import type { InvitationLifecycle } from '../../value-objects/invitations/invitation-lifecycle.value-object.js';
 import type { InvitationState } from '../../value-objects/invitations/invitation-state.value-object.js';
 import type { PendingInvitationStatus } from '../../value-objects/invitations/pending-invitation-status.value-object.js';
 import type { AssignableRole } from '../../value-objects/members/assignable-role.value-object.js';
@@ -166,6 +167,40 @@ export class Invitation {
    */
   public static pendingStatusAt(expiresAt: Date, now: Date): PendingInvitationStatus {
     return now.getTime() >= expiresAt.getTime() ? 'expired' : 'pending';
+  }
+
+  /**
+   * Method lifecycleAt
+   *
+   * @description
+   * Where the invitation stands at `now`, as `getInvitation` answers it (`InvitationState` of
+   * `openapi/internal/organization-service.yaml`): a pending one is `pending` or `expired` by its
+   * expiry, with no closing instant; an accepted or refused one carries `answeredAt`, a revoked one
+   * `revokedAt`. The stored status tells the three apart, and `answered_at` holds the instant that
+   * closed the invitation, whichever it was (`close`).
+   *
+   * @param {Date} now - The instant of the read.
+   * @returns {InvitationLifecycle} The state and its closing instants.
+   * @throws {InvalidStoredStateError} When a closed invitation has no closing instant.
+   */
+  public lifecycleAt(now: Date): InvitationLifecycle {
+    const { status, answeredAt, expiresAt } = this.state;
+    if (status === 'pending') {
+      return {
+        status: Invitation.pendingStatusAt(expiresAt, now),
+        answeredAt: null,
+        revokedAt: null,
+      };
+    }
+    if (answeredAt === null) {
+      throw new InvalidStoredStateError(
+        'invitation',
+        'a closed invitation has its closing instant',
+      );
+    }
+    return status === 'revoked'
+      ? { status, answeredAt: null, revokedAt: answeredAt }
+      : { status, answeredAt, revokedAt: null };
   }
 
   /**

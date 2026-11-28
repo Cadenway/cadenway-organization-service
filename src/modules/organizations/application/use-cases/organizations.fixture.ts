@@ -9,6 +9,8 @@ import { FREE_SEAT_ENTITLEMENT } from '../../domain/value-objects/billing/seat-e
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
+import { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import type { InvitationBatchRequestState } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
@@ -18,7 +20,10 @@ import type { Role } from '../../domain/value-objects/members/role.value-object.
 import type { OrganizationDraft } from '../../domain/value-objects/organizations/organization-draft.value-object.js';
 import type { OrganizationState } from '../../domain/value-objects/organizations/organization-state.value-object.js';
 import { searchKeyOf } from '../../domain/value-objects/search/search-key.value-object.js';
+import type { InvitationBatchReplayKey } from '../models/invitations/invitation-batch-replay-key.model.js';
+import type { InvitationBatchReplay } from '../models/invitations/invitation-batch-replay.model.js';
 import type { InvitationMail } from '../models/invitations/invitation-mail.model.js';
+import type { InvitationWithInviter } from '../models/invitations/invitation-with-inviter.model.js';
 import type { MemberFilters } from '../models/members/member-filters.model.js';
 import type { Page } from '../models/pagination/page.model.js';
 import type { PagePosition } from '../models/pagination/page-position.model.js';
@@ -26,6 +31,7 @@ import type { OrganizationsStore } from '../models/transactions/organizations-st
 import type { Clock } from '../ports/outbound/time/organizations/clock.port.js';
 import type { VerifiedEmailAuthority } from '../ports/outbound/identity/invitations/verified-email-authority.port.js';
 import type { OrganizationsUnitOfWork } from '../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
+import type { InvitationOutcome } from '../projections/invitations/invitation-outcome.projection.js';
 import type { InvitationView } from '../projections/invitations/invitation-view.projection.js';
 import type { ReceivedInvitationView } from '../projections/invitations/received-invitation-view.projection.js';
 import type { MemberView } from '../projections/members/member-view.projection.js';
@@ -57,6 +63,33 @@ export interface RecordedEmail {
   // #endregion
 }
 
+/** A fake replay record of an invitation batch. */
+interface StoredReplay {
+  // #region Properties
+  /** The organization of the key. */
+  readonly organizationId: string;
+
+  /** The canonical batch. */
+  readonly request: InvitationBatchRequestState;
+
+  /** The outcome replayed. */
+  readonly invitations: readonly InvitationOutcome[];
+
+  /** When the replay ends. */
+  readonly expiresAt: Date;
+  // #endregion
+}
+
+/**
+ * The scoped key of a replay record, as the primary key of `invitation_batch_replays` holds it.
+ *
+ * @param key - The organization, the actor and the key.
+ * @returns One string per scoped key.
+ */
+function replayKeyOf(key: InvitationBatchReplayKey): string {
+  return JSON.stringify([key.organizationId, key.actorUserId.toLowerCase(), key.key]);
+}
+
 /** The data of the fake database. */
 interface Tables {
   // #region Properties
@@ -83,6 +116,9 @@ interface Tables {
 
   /** The fake sender ledger, independent of tenant retention. */
   senderEmails: { readonly senderId: string; readonly sentAt: Date }[];
+
+  /** The fake replay records, by scoped key. */
+  replays: Map<string, StoredReplay>;
 
   /** The fake outbox. */
   events: RecordedEvent[];
@@ -128,8 +164,15 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
     deletionAttempts: new Map(),
     invitationEmails: [],
     senderEmails: [],
+    replays: new Map(),
     events: [],
   };
+
+  /** Makes every replay record fail, as a database failure after the invitations would. */
+  public failReplayRecords: boolean = false;
+
+  /** Replay keys claimed by a run still under way, as the advisory locks of PostgreSQL. */
+  private readonly claimedReplayKeys: Set<string> = new Set<string>();
 
   /** Ids assigned so far. */
   private ids: number = 0;
@@ -222,15 +265,23 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
       deletionAttempts: new Map(this.tables.deletionAttempts),
       invitationEmails: [...this.tables.invitationEmails],
       senderEmails: [...this.tables.senderEmails],
+      replays: new Map(this.tables.replays),
       events: [...this.tables.events],
     };
-    const result: TResult = await work(this.storeOf(tables));
-    this.tables = tables;
-    return result;
+    const claims: Set<string> = new Set<string>();
+    try {
+      const result: TResult = await work(this.storeOf(tables, claims));
+      this.tables = tables;
+      return result;
+    } finally {
+      for (const claim of claims) {
+        this.claimedReplayKeys.delete(claim);
+      }
+    }
   }
 
-  /** The repositories and the outbox bound to a copy of the data. */
-  private storeOf(tables: Tables): OrganizationsStore {
+  /** The repositories and the outbox bound to a copy of the data and the claims of its run. */
+  private storeOf(tables: Tables, claims: Set<string>): OrganizationsStore {
     const activeMembers = (organizationId: string): MemberState[] =>
       [...tables.members.values()].filter(
         (member: MemberState) =>
@@ -469,6 +520,20 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
             state?.organizationId === organizationId ? Invitation.restore(state) : null,
           );
         },
+        findWithInviter: (
+          organizationId: string,
+          invitationId: string,
+        ): Promise<InvitationWithInviter | null> => {
+          const state: InvitationState | undefined = tables.invitations.get(invitationId);
+          return Promise.resolve(
+            state?.organizationId === organizationId
+              ? {
+                  invitation: Invitation.restore(state),
+                  invitedBy: { userId: state.invitedByUserId, name: nameOf(state.invitedByUserId) },
+                }
+              : null,
+          );
+        },
         find: (invitationId: string): Promise<Invitation | null> => {
           const state: InvitationState | undefined = tables.invitations.get(invitationId);
           return Promise.resolve(state === undefined ? null : Invitation.restore(state));
@@ -551,6 +616,59 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                   ];
             });
           return Promise.resolve(pageOf(items, after, limit));
+        },
+      },
+      invitationBatchReplays: {
+        tryClaim: (key: InvitationBatchReplayKey): Promise<boolean> => {
+          const claim: string = replayKeyOf(key);
+          if (this.claimedReplayKeys.has(claim)) {
+            return Promise.resolve(false);
+          }
+          this.claimedReplayKeys.add(claim);
+          claims.add(claim);
+          return Promise.resolve(true);
+        },
+        findLive: (
+          key: InvitationBatchReplayKey,
+          now: Date,
+        ): Promise<InvitationBatchReplay | null> => {
+          const stored: StoredReplay | undefined = tables.replays.get(replayKeyOf(key));
+          return Promise.resolve(
+            stored === undefined || stored.expiresAt.getTime() <= now.getTime()
+              ? null
+              : {
+                  request: InvitationBatchRequest.restore(stored.request),
+                  invitations: stored.invitations,
+                },
+          );
+        },
+        record: (
+          key: InvitationBatchReplayKey,
+          replay: InvitationBatchReplay,
+          window: { readonly now: Date; readonly expiresAt: Date },
+        ): Promise<boolean> => {
+          if (this.failReplayRecords) {
+            return Promise.reject(new Error('The replay record could not be written.'));
+          }
+          for (const [stored, entry] of tables.replays) {
+            if (
+              entry.organizationId === key.organizationId &&
+              entry.expiresAt.getTime() <= window.now.getTime()
+            ) {
+              tables.replays.delete(stored);
+            }
+          }
+          const claim: string = replayKeyOf(key);
+          if (tables.replays.has(claim)) {
+            return Promise.resolve(false);
+          }
+          tables.replays.set(claim, {
+            organizationId: key.organizationId,
+            request: replay.request.snapshot,
+            invitations: replay.invitations,
+            expiresAt: window.expiresAt,
+          });
+          return Promise.resolve(true);
         },
       },
       invitationEmails: {
