@@ -10,7 +10,6 @@ import type { StoredInvitationBatch } from '../../../../../application/models/in
 import type { InvitationBatchReplayRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-batch-replay-repository.port.js';
 import { INVITATION_BATCH_REPLAY_MS } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
-import { isLockTimeout } from '../../mappers/postgres/lock-timeout.mapper.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 
 /**
@@ -50,18 +49,6 @@ const REPLAY_CLOCK: SQL<Date> = sql<Date>`clock_timestamp()`;
  * @type {SQL<Date>}
  */
 export const PURGE_CUTOFF: SQL<Date> = sql<Date>`statement_timestamp()`;
-
-/**
- * Constant CLAIM_WAIT
- *
- * @description
- * How long a claim waits for an equivalent batch of its key in flight before it gives up: well
- * under the `statement_timeout` (10 s) of the application role, and long enough for a retry that
- * races the batch it repeats to replay it once that one commits.
- *
- * @type {string}
- */
-const CLAIM_WAIT: string = '2s';
 
 /**
  * Function inlinePurgeOf
@@ -137,7 +124,7 @@ function digestOf(value: string): string {
  * @description
  * `InvitationBatchReplayRepository` on `invitation_batch_replays`, in the tenant transaction of the
  * batch. The in-progress marker is a transaction-level advisory lock on the scoped key and the
- * fingerprint of the batch, taken with `pg_advisory_xact_lock` within `CLAIM_WAIT`: PostgreSQL
+ * fingerprint of the batch, taken with `pg_try_advisory_xact_lock`, never awaited: PostgreSQL
  * releases it at commit or rollback, and when the connection ends, so a crashed process frees the
  * key at once and a stalled transaction holds it no longer than the `statement_timeout` (10 s) and
  * `idle_in_transaction_session_timeout` (30 s) of the application role. Another batch under the
@@ -218,39 +205,21 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    *
    * @description
    * Takes the advisory lock of the scoped key and the batch's fingerprint for the transaction,
-   * waiting at most `CLAIM_WAIT` for the transaction that holds it. The wait runs in a savepoint
-   * under its own `lock_timeout`: a timeout rolls the savepoint back, which leaves the transaction
-   * usable and its `lock_timeout` as it was; a lock taken stays held until the transaction ends.
+   * without waiting, so a request never holds a pooled connection while another batch runs.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<boolean>} `false` when another transaction still holds it after the wait.
+   * @returns {Promise<boolean>} `false` when another transaction holds it.
    */
   public async tryClaim(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
   ): Promise<boolean> {
     const name: string = `invitation-batch:${key.organizationId.toLowerCase()}:${key.actorUserId.toLowerCase()}:${digestOf(key.key)}:${digestOf(request.canonical)}`;
-    const current = await this.db.execute<{ timeout: string }>(
-      sql`select current_setting('lock_timeout') as timeout`,
+    const result = await this.db.execute<{ acquired: boolean }>(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${name}, 0)) as acquired`,
     );
-    await this.db.execute(sql`savepoint invitation_batch_claim`);
-    try {
-      await this.db.execute(sql`select set_config('lock_timeout', ${CLAIM_WAIT}, true)`);
-      await this.db.execute(sql`select pg_advisory_xact_lock(hashtextextended(${name}, 0))`);
-      await this.db.execute(
-        sql`select set_config('lock_timeout', ${current.rows[0]?.timeout ?? '0'}, true)`,
-      );
-      await this.db.execute(sql`release savepoint invitation_batch_claim`);
-      return true;
-    } catch (error) {
-      if (!isLockTimeout(error)) {
-        throw error;
-      }
-      await this.db.execute(sql`rollback to savepoint invitation_batch_claim`);
-      await this.db.execute(sql`release savepoint invitation_batch_claim`);
-      return false;
-    }
+    return result.rows[0]?.acquired === true;
   }
 
   /**

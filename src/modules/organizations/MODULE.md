@@ -98,9 +98,11 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   tenants' traffic: bounded deletes of at most 500 expired records of any organization
   (`invitation_batch_replays_expiry_index`, oldest first, `skip locked`), each in its own system
   transaction, one after the other until one deletes fewer than 500 or 5 seconds have passed (under
-  the 8 s shutdown timeout of the job runtime). Each transaction sets the time left to the tick as
-  its `statement_timeout`, keeping the last 500 ms for the read of the backlog, which is skipped
-  when no time remains; a delete cut short rolls back and fails the tick, which its queue retries.
+  the 8 s shutdown timeout of the job runtime). Each call gets the absolute deadline of the tick
+  (less the last 500 ms, kept for the read of the backlog) and the job's abort signal; once its
+  transaction holds a pooled connection, the wait for one included, it runs nothing if either has
+  passed, and otherwise sets the time left as its `statement_timeout`. A delete cut short rolls
+  back and fails the tick, which its queue retries.
   A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
@@ -194,7 +196,7 @@ members keep their access if the organization is over the reduced limit.
 | `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`, 409 `idempotency.request-in-progress`, 422 `idempotency.key-reused`, 429 `invitation.daily-limit-reached`         |
 | `POST /internal/v1/invitation-batches`                     | Required     | 200                     | As above; 400 also without `Idempotency-Key`, which it requires                                                                                           |
 | `GET /internal/v1/invitations`                             | Required     | 200                     | 400, 403, 404                                                                                                                                             |
-| `GET /internal/v1/invitations/{invitationId}`              | Required     | 200                     | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
+| `GET /internal/v1/invitations/{invitationId}`              | Required     | 200, `no-store`         | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
 | `DELETE /internal/v1/invitations/{invitationId}`           | Required     | 204                     | 400, 403, 404 `invitation.not-found`, 409 `invitation.answered`                                                                                           |
 | `POST /internal/v1/invitations/{invitationId}/resend`      | Required     | 200, `ETag`             | 400, 403, 404, 409 `invitation.revoked`, `invitation.answered`, 429 `invitation.resend-throttled`, `invitation.daily-limit-reached`                       |
 | `GET /internal/v1/users/{userId}/invitations`              | None         | 200                     | 400, 404 `user.not-found`                                                                                                                                 |
@@ -502,7 +504,10 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `accepted`, `refused` or `revoked` as stored. `answeredAt` is set for an acceptance or a refusal,
   `revokedAt` for a revocation, from `answered_at`, which holds the instant that closed it; a
   revocation keeps the row with its status, so the three are stored, never inferred. The actor's
-  role and the invitation are read from one snapshot.
+  role and the invitation are read from one snapshot. The answer is `Cache-Control: private,
+no-store` and never conditional (`If-None-Match` and `If-Modified-Since` are ignored): an
+  invitation becomes `expired` without a new `version`, so the `ETag` the kit derives from the
+  version cannot validate a copy and a `304` could show a stale state.
 - Received invitations use the current verified address from Identity. The local directory
   still tracks account existence and deletion. Acceptance and refusal check that the invitation
   still matches the address from Identity under the invitation lock. These routes require
@@ -564,11 +569,10 @@ The Search readers open their snapshots directly with the kit's transaction runn
   checks the actor's role again under a share lock on the membership, then answers the stored body
   to an equivalent batch, taking neither allowance lock, and `422` to another: a member who lost the
   role answers `403` either way. Without a record, it takes a
-  transaction-level advisory lock on the scoped key and the fingerprint of the batch, waiting at
-  most 2 s for an equivalent batch that holds it (the wait runs in a savepoint under its own
-  `lock_timeout`, so a timeout leaves the transaction usable), and reads the record again in either
-  case, since a batch of the key may have committed in between: a refused claim answers `409` only
-  while the key still has no record. A fresh batch runs as
+  transaction-level advisory lock on the scoped key and the fingerprint of the batch with
+  `pg_try_advisory_xact_lock`, never waiting, and reads the record again in either case, since a
+  batch of the key may have committed in between: a refused claim answers `409` only while the key
+  still has no record. A fresh batch runs as
   without a key and inserts its record last: the invitations, their ledger entries, their
   `invitation.issued.v1` outbox rows and the record commit together, and any failure rolls them all
   back. The primary key of `invitation_batch_replays` decides between two different batches of one
@@ -621,9 +625,12 @@ Any failure rolls back the business rows and the outbox rows together
   `organization_app`. The lock covers the key and the fingerprint of the batch, so `409` means an
   equivalent request in flight only; a different batch runs, and the primary key of the table
   refuses it with `422` if the other commits the key first. A committed record is read before the
-  lock, so retries of a committed batch never contend; a retry that races the batch it repeats
-  waits up to 2 s on its claim and replays it once it commits, and reads the record again after a
-  refused claim, so `409` never hides a stored `200`. A batch that waited on the allowance locks
+  lock, so retries of a committed batch never contend, and a refused claim reads the record again,
+  so `409` never hides a `200` committed by then. The claim never waits: a retry that lands while
+  the batch it repeats is still running answers the retryable `409` at once, and replays on its
+  next attempt. A bounded wait (tried in an earlier revision) let the retries of one slow batch
+  each hold one of the five pooled connections, starving the readiness probe and other tenants;
+  pool safety wins over sparing a client a retryable `409`. A batch that waited on the allowance locks
   reads the record once more under them, before it plans or counts anything, so losing to another
   batch of its key that took the last send answers `422`, never `429`. The 24 hours start at the
   insert of the record and are read on the database's `clock_timestamp()`, not on the clock of a

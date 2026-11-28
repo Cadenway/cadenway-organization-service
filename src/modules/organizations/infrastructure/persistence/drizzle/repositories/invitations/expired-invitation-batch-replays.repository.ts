@@ -35,15 +35,48 @@ function timeoutOf(timeoutMs: number): string {
 }
 
 /**
+ * Interface PurgeWindow
+ *
+ * @description
+ * When a call of the purge must be over, and the signal that cancels it sooner.
+ */
+export interface PurgeWindow {
+  // #region Properties
+  /**
+   * Property deadline
+   *
+   * @description
+   * The instant, in milliseconds on the clock of the repository, the call must be over by.
+   *
+   * @type {number}
+   * @readonly
+   */
+  readonly deadline: number;
+
+  /**
+   * Property signal
+   *
+   * @description
+   * The abort signal of the job.
+   *
+   * @type {AbortSignal}
+   * @readonly
+   */
+  readonly signal: AbortSignal;
+  // #endregion
+}
+
+/**
  * Class ExpiredInvitationBatchReplays
  *
  * @description
  * Deletes expired replay records of every organization, a bounded batch at a time, independently
  * of the tenants' traffic. Each batch is a system transaction of its own, a bounded exception of
- * `MODULE.md`: it names only rows whose replay is over. Each transaction caps its own statements
- * at the time its caller has left (`statement_timeout`, which counts lock waits too), so a purge
- * never outlasts its tick: a statement cut short fails, rolls its batch back and leaves the rows
- * to the next tick.
+ * `MODULE.md`: it names only rows whose replay is over. A call takes an absolute deadline: once its
+ * transaction holds a connection (the wait for one counts), it runs nothing when the deadline or
+ * the job's abort has come, and otherwise caps its statements at the time left
+ * (`statement_timeout`, which counts lock waits too), so a purge never outlasts its tick: a
+ * statement cut short fails, rolls its batch back and leaves the rows to the next tick.
  */
 export class ExpiredInvitationBatchReplays {
   // #region Constructor
@@ -54,9 +87,13 @@ export class ExpiredInvitationBatchReplays {
    * Binds the purge to the system runner because it spans organizations.
    *
    * @param {SystemTransactionRunner} system - The system transaction runner.
+   * @param {() => number} now - The clock of the deadlines, in milliseconds.
    * @constructor
    */
-  public constructor(private readonly system: SystemTransactionRunner) {}
+  public constructor(
+    private readonly system: SystemTransactionRunner,
+    private readonly now: () => number = Date.now,
+  ) {}
   // #endregion
 
   // #region Methods
@@ -64,16 +101,21 @@ export class ExpiredInvitationBatchReplays {
    * Method purge
    *
    * @description
-   * Deletes at most `limit` expired records, the oldest first, in one system transaction whose
-   * statements stop after `timeoutMs`.
+   * Deletes at most `limit` expired records, the oldest first, in one system transaction that ends
+   * by the deadline of `window`.
    *
    * @param {number} limit - The most rows one call deletes.
-   * @param {number} timeoutMs - The time the call may take, in milliseconds.
-   * @returns {Promise<number>} How many rows it deleted.
+   * @param {PurgeWindow} window - The deadline and the abort signal.
+   * @returns {Promise<number | null>} How many rows it deleted, or `null` when no time was left
+   * once the transaction began.
    */
-  public purge(limit: number, timeoutMs: number): Promise<number> {
+  public purge(limit: number, window: PurgeWindow): Promise<number | null> {
     return this.system.run(async ({ db }) => {
-      await db.execute(sql`select set_config('statement_timeout', ${timeoutOf(timeoutMs)}, true)`);
+      const timeout: string | null = this.timeoutWithin(window);
+      if (timeout === null) {
+        return null;
+      }
+      await db.execute(sql`select set_config('statement_timeout', ${timeout}, true)`);
       const result = await db.execute(expiredPurgeOf(limit));
       return result.rowCount ?? 0;
     });
@@ -86,15 +128,18 @@ export class ExpiredInvitationBatchReplays {
    * How long ago, in whole seconds, the oldest record still in the table expired, read from the
    * start of `invitation_batch_replays_expiry_index`; the backlog of the purge.
    *
-   * @param {number} timeoutMs - The time the read may take, in milliseconds.
-   * @returns {Promise<number | null>} The age, or `null` when no expired record remains.
+   * @param {PurgeWindow} window - The deadline and the abort signal.
+   * @returns {Promise<number | null>} The age, or `null` when no expired record remains or no time
+   * was left once the transaction began.
    */
-  public oldestExpiredAgeSeconds(timeoutMs: number): Promise<number | null> {
+  public oldestExpiredAgeSeconds(window: PurgeWindow): Promise<number | null> {
     return this.system.run(
       async ({ db }) => {
-        await db.execute(
-          sql`select set_config('statement_timeout', ${timeoutOf(timeoutMs)}, true)`,
-        );
+        const timeout: string | null = this.timeoutWithin(window);
+        if (timeout === null) {
+          return null;
+        }
+        await db.execute(sql`select set_config('statement_timeout', ${timeout}, true)`);
         const result = await db.execute<{ age: number | null }>(
           sql`select floor(extract(epoch from ${PURGE_CUTOFF} - min(expires_at)))::int as age
               from ${invitationBatchReplays} where expires_at <= ${PURGE_CUTOFF}`,
@@ -103,6 +148,21 @@ export class ExpiredInvitationBatchReplays {
       },
       { readOnly: true },
     );
+  }
+
+  /**
+   * Method timeoutWithin
+   *
+   * @description
+   * The `statement_timeout` left to a call once its transaction holds a connection, or `null` when
+   * its deadline or its abort has come.
+   *
+   * @param {PurgeWindow} window - The deadline and the abort signal.
+   * @returns {string | null} The setting, or `null` to run nothing.
+   */
+  private timeoutWithin(window: PurgeWindow): string | null {
+    const remaining: number = window.deadline - this.now();
+    return remaining <= 0 || window.signal.aborted ? null : timeoutOf(remaining);
   }
   // #endregion
 }

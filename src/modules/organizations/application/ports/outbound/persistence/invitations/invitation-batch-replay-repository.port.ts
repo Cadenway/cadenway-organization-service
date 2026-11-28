@@ -36,17 +36,15 @@ export interface InvitationBatchReplayRepository {
    * Method tryClaim
    *
    * @description
-   * Marks the key and the batch as in progress for the rest of the transaction, waiting a bounded
-   * time for another transaction that holds them, so a retry racing the batch it repeats usually
-   * replays it rather than being refused. Only an equivalent batch under the same key contends;
-   * another batch under it does not. The marker lives exactly as long as the transaction: it goes
-   * with its commit or rollback, and with its connection when the process stops, so a crashed
-   * request never holds the key.
+   * Marks the key and the batch as in progress for the rest of the transaction, without waiting, so
+   * no request holds a pooled connection while another batch runs. Only an equivalent batch under
+   * the same key contends; another batch under it does not. The marker lives exactly as long as the
+   * transaction: it goes with its commit or rollback, and with its connection when the process
+   * stops, so a crashed request never holds the key.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<boolean>} `false` when another transaction still runs the same batch with the
-   * key once the wait is over.
+   * @returns {Promise<boolean>} `false` when another transaction runs the same batch with the key.
    */
   tryClaim(key: InvitationBatchReplayKey, request: InvitationBatchRequest): Promise<boolean>;
 

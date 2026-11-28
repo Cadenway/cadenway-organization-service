@@ -31,24 +31,34 @@ export interface ExpiredInvitationBatchReplayPurge {
    * Method purge
    *
    * @description
-   * Deletes at most `limit` expired records in one transaction that stops after `timeoutMs`.
+   * Deletes at most `limit` expired records in one transaction over by `window.deadline`, on the
+   * same clock as the handler's.
    *
    * @param {number} limit - The most rows to delete.
-   * @param {number} timeoutMs - The time the call may take, in milliseconds.
-   * @returns {Promise<number>} How many were deleted.
+   * @param {{ readonly deadline: number; readonly signal: AbortSignal }} window - The absolute
+   * deadline and the abort signal of the job.
+   * @returns {Promise<number | null>} How many were deleted, or `null` when no time was left.
    */
-  purge(limit: number, timeoutMs: number): Promise<number>;
+  purge(
+    limit: number,
+    window: { readonly deadline: number; readonly signal: AbortSignal },
+  ): Promise<number | null>;
 
   /**
    * Method oldestExpiredAgeSeconds
    *
    * @description
-   * How long ago the oldest record still in the table expired, read within `timeoutMs`.
+   * How long ago the oldest record still in the table expired, read by `window.deadline`.
    *
-   * @param {number} timeoutMs - The time the read may take, in milliseconds.
-   * @returns {Promise<number | null>} The age in seconds, or `null` without an expired record.
+   * @param {{ readonly deadline: number; readonly signal: AbortSignal }} window - The absolute
+   * deadline and the abort signal of the job.
+   * @returns {Promise<number | null>} The age in seconds, or `null` without an expired record or
+   * without time left.
    */
-  oldestExpiredAgeSeconds(timeoutMs: number): Promise<number | null>;
+  oldestExpiredAgeSeconds(window: {
+    readonly deadline: number;
+    readonly signal: AbortSignal;
+  }): Promise<number | null>;
   // #endregion
 }
 
@@ -60,8 +70,10 @@ export interface ExpiredInvitationBatchReplayPurge {
  * and runs it as a system job each minute: bounded deletes of at most
  * `INVITATION_BATCH_REPLAY_PURGE_LIMIT` rows, one after the other, until a delete removes fewer
  * (the backlog is drained) or `INVITATION_BATCH_REPLAY_PURGE_BUDGET_MS` has passed. Each delete
- * gets the time left as its own statement timeout, so the tick never outlasts its budget, and the
- * backlog is read only with time left. A tick that stops on its budget logs, at `warn`, how many
+ * gets the absolute deadline of the tick, less the reserve of the backlog read, and the job's
+ * signal: the store checks them again once its transaction holds a connection, runs nothing when
+ * they have passed and otherwise caps its statements at the time left, so the tick never outlasts
+ * its budget, and the backlog is read only with time left. A tick that stops on its budget logs, at `warn`, how many
  * rows it deleted and how old the oldest expired row still is (`null` when there was no time to
  * read it), then leaves the rest to the next tick; a failed tick, a delete cut short included, is
  * retried by the queue.
@@ -124,22 +136,24 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
       throw new Error('The invitation batch replay purge requires a system job.');
     }
     const deadline: number = this.now() + INVITATION_BATCH_REPLAY_PURGE_BUDGET_MS;
+    const deletes = { deadline: deadline - BACKLOG_READ_RESERVE_MS, signal: job.signal };
     let deleted: number = 0;
-    let remaining: number = deadline - this.now();
-    while (remaining > BACKLOG_READ_RESERVE_MS) {
+    while (deletes.deadline - this.now() > 0) {
       job.signal.throwIfAborted();
-      const last: number = await this.expired.purge(
+      const last: number | null = await this.expired.purge(
         INVITATION_BATCH_REPLAY_PURGE_LIMIT,
-        remaining - BACKLOG_READ_RESERVE_MS,
+        deletes,
       );
+      if (last === null) {
+        break;
+      }
       deleted += last;
-      remaining = deadline - this.now();
       if (last < INVITATION_BATCH_REPLAY_PURGE_LIMIT) {
         return;
       }
     }
     this.logger.warn(
-      { deleted, oldestExpiredAgeSeconds: await this.backlog(deadline) },
+      { deleted, oldestExpiredAgeSeconds: await this.backlog(deadline, job.signal) },
       'invitation batch replay purge stopped on its budget with expired records left',
     );
   }
@@ -149,15 +163,17 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
    *
    * @description
    * The age of the oldest expired record left, read only while the budget of the tick still has
-   * time for it.
+   * time for it and the job runs.
    *
    * @param {number} deadline - The end of the budget, on `now`.
+   * @param {AbortSignal} signal - The abort signal of the job.
    * @returns {Promise<number | null>} The age in seconds, or `null` when it was not read or there
    * is none.
    */
-  private async backlog(deadline: number): Promise<number | null> {
-    const remaining: number = deadline - this.now();
-    return remaining > 0 ? this.expired.oldestExpiredAgeSeconds(remaining) : null;
+  private async backlog(deadline: number, signal: AbortSignal): Promise<number | null> {
+    return deadline - this.now() > 0 && !signal.aborted
+      ? this.expired.oldestExpiredAgeSeconds({ deadline, signal })
+      : null;
   }
   // #endregion
 }

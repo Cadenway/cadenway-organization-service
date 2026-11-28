@@ -184,10 +184,9 @@ export class InviteMembers {
    * @description
    * Runs a keyed batch. A committed live record is resolved first, without any lock, so retries of
    * a committed batch all replay (or answer `idempotency-key-reused`) and never contend. Otherwise
-   * the key and the batch are claimed, waiting a bounded time for an equivalent batch in flight; the
-   * record is read again in either case (a batch with the same key may have committed in between),
-   * so a refused claim answers `idempotency-request-in-progress` only while the key still has no
-   * record. Then the batch runs and records its outcome last. A record that another transaction
+   * the key and the batch are claimed without waiting; the record is read again in either case (a
+   * batch with the same key may have committed in between), so a refused claim answers
+   * `idempotency-request-in-progress` only while the key still has no record. Then the batch runs and records its outcome last. A record that another transaction
    * committed first for the key can only be of another batch, since an equivalent one holds the same
    * claim: that answers `idempotency-key-reused` and rolls back.
    *

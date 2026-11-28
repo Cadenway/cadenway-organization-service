@@ -534,7 +534,7 @@ describe('idempotent invitation batches and the invitation state', () => {
       );
     });
 
-    it('replays to retries that waited on the claim of the batch they repeat, once it commits', async () => {
+    it('answers 409 at once to retries of a batch in flight, keeping the pool free, then replays it', async () => {
       const racing = 'members-page-batch-claimed';
       const emails: readonly string[] = ['ruth@ateliernord.fr'];
       const outcome: InvitationBatchResult = {
@@ -542,7 +542,9 @@ describe('idempotent invitation batches and the invitation state', () => {
       };
       // The original batch, in flight: its claim is held and its record written, not committed.
       const original: pg.PoolClient = await stack.migrator.connect();
-      let responses: Response[];
+      let retries: Response[];
+      let probes: { readonly status: number; readonly durationMs: number }[];
+      let retriesMs: number;
       try {
         await original.query('begin');
         await original.query(`select set_config('app.system_access', 'on', true)`);
@@ -561,27 +563,49 @@ describe('idempotent invitation batches and the invitation state', () => {
             JSON.stringify(outcome.invitations),
           ],
         );
-        const pending: Promise<Response>[] = [
+        /**
+         * Times a request.
+         *
+         * @param pending - The request.
+         * @returns Its status and how long it took.
+         */
+        const timed = async (
+          pending: PromiseLike<Response>,
+        ): Promise<{ readonly status: number; readonly durationMs: number }> => {
+          const started: number = Date.now();
+          const response: Response = await pending;
+          return { status: response.status, durationMs: Date.now() - started };
+        };
+        // More retries than the five connections of the pool, with a readiness probe and a read of
+        // another tenant at the same time.
+        const started: number = Date.now();
+        const pendingRetries: Promise<Response>[] = Array.from({ length: 12 }, () =>
           invite(ines, atelierNordId, racing, emails),
-          invite(ines, atelierNordId, racing, emails),
+        );
+        const pendingProbes = [
+          timed(request(app.getHttpServer()).get('/health/ready')),
+          timed(call('get', '/internal/v1/organization', ines, lumenId)),
         ];
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          const rows = await stack.migrator.query<{ blocked: number }>(
-            `select count(*)::int as blocked from pg_locks where locktype = 'advisory' and not granted`,
-          );
-          if ((rows.rows[0]?.blocked ?? 0) >= 2) break;
-          await new Promise<void>((resolve) => setTimeout(resolve, 20));
-        }
-        await original.query('commit');
-        responses = await Promise.all(pending);
+        retries = await Promise.all(pendingRetries);
+        retriesMs = Date.now() - started;
+        probes = await Promise.all(pendingProbes);
       } finally {
+        await original.query('commit');
         original.release();
       }
+      const replayed: Response = await invite(ines, atelierNordId, racing, emails);
 
-      expect(responses.map((response) => response.status)).toEqual([200, 200]);
-      for (const response of responses) {
-        expect(response.body).toEqual(outcome);
+      expect(retries.map((response) => response.status)).toEqual(Array(12).fill(409));
+      for (const response of retries) {
+        expect(response.body).toMatchObject({ code: 'idempotency.request-in-progress' });
       }
+      expect(retriesMs).toBeLessThan(3_000);
+      expect(probes.map((probe) => probe.status)).toEqual([200, 200]);
+      for (const probe of probes) {
+        expect(probe.durationMs).toBeLessThan(1_000);
+      }
+      expect(replayed.status).toBe(200);
+      expect(replayed.body).toEqual(outcome);
     });
 
     it('keeps a fingerprint of the batch, never its addresses, beside the body to replay', async () => {
@@ -941,9 +965,9 @@ describe('idempotent invitation batches and the invitation state', () => {
         atelierNordId,
       );
 
-      const deleted: number = await new ExpiredInvitationBatchReplays(
+      const deleted: number | null = await new ExpiredInvitationBatchReplays(
         app.get(SystemTransactionRunner),
-      ).purge(3, 5_000);
+      ).purge(3, { deadline: Date.now() + 5_000, signal: new AbortController().signal });
       expect(deleted).toBe(3);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(9);
 
@@ -998,9 +1022,14 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(await swept(atelierNordId)).toBe(30);
 
       const purge = new ExpiredInvitationBatchReplays(system);
-      const batches: number[] = [];
+      const batches: (number | null)[] = [];
       for (let round = 0; round < 3; round += 1) {
-        batches.push(await purge.purge(500, 5_000));
+        batches.push(
+          await purge.purge(500, {
+            deadline: Date.now() + 5_000,
+            signal: new AbortController().signal,
+          }),
+        );
       }
 
       expect(batches).toEqual([500, 500, 230]);
@@ -1175,6 +1204,32 @@ describe('idempotent invitation batches and the invitation state', () => {
         answeredAt: null,
         revokedAt: null,
       });
+    });
+
+    it('never answers 304 to a copy validated by the tag of an earlier state', async () => {
+      const invitationId: string = await invited('xena@ateliernord.fr');
+      const path = `${INVITATIONS}/${invitationId}`;
+      const pending: Response = await request(app.getHttpServer())
+        .get(path)
+        .set('Authorization', await stack.bearer(camille.id, atelierNordId));
+      const tag: unknown = pending.headers.etag;
+      await stack.system(
+        `update invitations set sent_at = now() - interval '8 days',
+         expires_at = now() - interval '1 day' where id = $1`,
+        [invitationId],
+      );
+
+      const revalidated: Response = await request(app.getHttpServer())
+        .get(path)
+        .set('Authorization', await stack.bearer(camille.id, atelierNordId))
+        .set('If-None-Match', typeof tag === 'string' ? tag : '"1"')
+        .set('If-Modified-Since', new Date().toUTCString());
+
+      expect(pending.status).toBe(200);
+      expect(pending.headers['cache-control']).toBe('private, no-store');
+      expect(revalidated.status).toBe(200);
+      expect(revalidated.headers['cache-control']).toBe('private, no-store');
+      expect(revalidated.body).toMatchObject({ id: invitationId, status: 'expired', version: 1 });
     });
 
     it('tells an accepted, a refused and a revoked invitation apart', async () => {
