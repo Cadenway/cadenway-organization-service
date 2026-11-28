@@ -341,7 +341,8 @@ export class DrizzleInvitationRepository implements InvitationRepository {
    * Method findWithInviter
    *
    * @description
-   * Loads an invitation of an organization in any state, with the name of its sender.
+   * Loads an invitation of an organization in any state, with the name of its sender and the
+   * instant of the read on the database clock (`statement_timestamp()`, in milliseconds).
    *
    * @param {string} organizationId - The organization.
    * @param {string} invitationId - Id of the invitation.
@@ -351,21 +352,27 @@ export class DrizzleInvitationRepository implements InvitationRepository {
     organizationId: string,
     invitationId: string,
   ): Promise<InvitationWithInviter | null> {
-    const rows: { readonly invitation: InvitationRow; readonly inviterName: string }[] =
-      await this.db
-        .select({ invitation: invitations, inviterName: INVITER_NAME })
-        .from(invitations)
-        .leftJoin(directoryUsers, eq(directoryUsers.userId, invitations.invitedByUserId))
-        .where(
-          and(eq(invitations.organizationId, organizationId), eq(invitations.id, invitationId)),
-        )
-        .limit(1);
+    const rows: {
+      readonly invitation: InvitationRow;
+      readonly inviterName: string;
+      readonly readAtMs: number;
+    }[] = await this.db
+      .select({
+        invitation: invitations,
+        inviterName: INVITER_NAME,
+        readAtMs: sql<number>`(extract(epoch from statement_timestamp()) * 1000)::float8`,
+      })
+      .from(invitations)
+      .leftJoin(directoryUsers, eq(directoryUsers.userId, invitations.invitedByUserId))
+      .where(and(eq(invitations.organizationId, organizationId), eq(invitations.id, invitationId)))
+      .limit(1);
     const row = rows[0];
     return row === undefined
       ? null
       : {
           invitation: toInvitation(row.invitation),
           invitedBy: { userId: row.invitation.invitedByUserId, name: row.inviterName },
+          readAt: new Date(row.readAtMs),
         };
   }
 

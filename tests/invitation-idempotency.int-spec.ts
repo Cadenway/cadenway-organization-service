@@ -849,12 +849,16 @@ describe('idempotent invitation batches and the invitation state', () => {
 
     it('replays on the keyed route a batch keyed on the former route, and the reverse', async () => {
       const before: Record<string, number> = await effects(atelierNordId);
-      const formerKey = 'members-page-batch-1';
-      const fromFormer: Response = await inviteKeyed(formerKey, [
-        'paul.lefevre@ateliernord.fr',
-        'sarah.morel@ateliernord.fr',
+      const formerKey = 'members-page-batch-former';
+      const original: Response = await invite(ines, atelierNordId, formerKey, [
+        'xavi@ateliernord.fr',
+        'yara@ateliernord.fr',
       ]);
-      const reusedOnKeyed: Response = await inviteKeyed(formerKey, ['sarah.morel@ateliernord.fr']);
+      const fromFormer: Response = await inviteKeyed(formerKey, [
+        'Xavi@AtelierNord.fr',
+        'yara@ateliernord.fr',
+      ]);
+      const reusedOnKeyed: Response = await inviteKeyed(formerKey, ['yara@ateliernord.fr']);
 
       const keyedKey = 'members-page-batch-keyed';
       const created: Response = await inviteKeyed(keyedKey, ['yves@ateliernord.fr']);
@@ -865,8 +869,12 @@ describe('idempotent invitation batches and the invitation state', () => {
         'zack@ateliernord.fr',
       ]);
 
+      expect(original.status).toBe(200);
+      expect(
+        (original.body as InvitationBatchResult).invitations.map((outcome) => outcome.outcome),
+      ).toEqual(['invited', 'invited']);
       expect(fromFormer.status).toBe(200);
-      expect(fromFormer.body).toEqual(first);
+      expect(fromFormer.body).toEqual(original.body);
       expect(InviteMembersInternalResponse.parse(fromFormer.body)).toEqual(fromFormer.body);
       expect(reusedOnKeyed.status).toBe(422);
       expect(reusedOnKeyed.body).toMatchObject({ code: 'idempotency.key-reused' });
@@ -875,11 +883,52 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(fromKeyed.body).toEqual(created.body);
       expect(reusedOnFormer.status).toBe(422);
       expect(await effects(atelierNordId)).toEqual({
-        invitations: (before.invitations ?? 0) + 1,
-        emails: (before.emails ?? 0) + 1,
-        events: (before.events ?? 0) + 1,
-        replays: (before.replays ?? 0) + 1,
+        invitations: (before.invitations ?? 0) + 3,
+        emails: (before.emails ?? 0) + 3,
+        events: (before.events ?? 0) + 3,
+        replays: (before.replays ?? 0) + 2,
       });
+    });
+
+    it('replays from a snapshot, never waiting on a membership row a stalled change holds', async () => {
+      const committed = 'members-page-batch-stalled-role';
+      const emails: readonly string[] = ['zelie@ateliernord.fr'];
+      const original: Response = await inviteKeyed(committed, emails);
+      expect(original.status).toBe(200);
+      const stalled: pg.PoolClient = await stack.migrator.connect();
+      let replays: Response[];
+      let probe: { readonly status: number; readonly durationMs: number };
+      let replaysMs: number;
+      try {
+        await stalled.query('begin');
+        await stalled.query(`select set_config('app.system_access', 'on', true)`);
+        // A role change or a removal in progress: the membership row is locked, not committed.
+        await stalled.query(
+          `update members set version = version
+           where organization_id = $1 and user_id = $2 and removed_at is null`,
+          [atelierNordId, ines.id],
+        );
+        const started: number = Date.now();
+        const pending: Promise<Response>[] = Array.from({ length: 12 }, () =>
+          inviteKeyed(committed, emails),
+        );
+        const probeStarted: number = Date.now();
+        const ready: Response = await request(app.getHttpServer()).get('/health/ready');
+        probe = { status: ready.status, durationMs: Date.now() - probeStarted };
+        replays = await Promise.all(pending);
+        replaysMs = Date.now() - started;
+      } finally {
+        await stalled.query('rollback');
+        stalled.release();
+      }
+
+      expect(replays.map((response) => response.status)).toEqual(Array(12).fill(200));
+      for (const response of replays) {
+        expect(response.body).toEqual(original.body);
+      }
+      expect(replaysMs).toBeLessThan(3_000);
+      expect(probe.status).toBe(200);
+      expect(probe.durationMs).toBeLessThan(1_000);
     });
 
     it('applies concurrent equivalent requests split across both routes once', async () => {

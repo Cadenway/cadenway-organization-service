@@ -6,7 +6,6 @@ import { toOrganizationRefusal } from '../../../../mappers/refusals/organization
 import type { InvitationWithInviter } from '../../../../models/invitations/invitation-with-inviter.model.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
-import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
 import type { OrganizationsUnitOfWork } from '../../../../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
 import type { InvitationStateView } from '../../../../projections/invitations/invitation-state-view.projection.js';
 import { requireActorMembership } from '../../../../services/members/actor-membership.service.js';
@@ -37,17 +36,6 @@ export class GetInvitation {
    * @readonly
    */
   private readonly unitOfWork: OrganizationsUnitOfWork;
-
-  /**
-   * Property clock
-   *
-   * @description
-   * The instant that tells `pending` from `expired`.
-   *
-   * @type {Clock}
-   * @readonly
-   */
-  private readonly clock: Clock;
   // #endregion
 
   // #region Constructor
@@ -55,15 +43,14 @@ export class GetInvitation {
    * Constructor
    *
    * @description
-   * Takes the ports of the read.
+   * Takes the transactions of the module. The instant that tells `pending` from `expired` is the
+   * one of the read, on the clock of the store, never the arrival of the request.
    *
    * @param {OrganizationsUnitOfWork} unitOfWork - The transactions of the module.
-   * @param {Clock} clock - The instant of the read.
    * @constructor
    */
-  public constructor(unitOfWork: OrganizationsUnitOfWork, clock: Clock) {
+  public constructor(unitOfWork: OrganizationsUnitOfWork) {
     this.unitOfWork = unitOfWork;
-    this.clock = clock;
   }
   // #endregion
 
@@ -80,7 +67,6 @@ export class GetInvitation {
    * `invitation-not-found`.
    */
   public async execute(input: GetInvitationInput): Promise<InvitationStateView> {
-    const now: Date = this.clock.now();
     try {
       return await this.unitOfWork.runInRequestOrganization(
         async (store: OrganizationsStore): Promise<InvitationStateView> => {
@@ -98,7 +84,7 @@ export class GetInvitation {
             throw new OrganizationRefusal({ reason: 'invitation-not-found' });
           }
           const state: InvitationState = found.invitation.snapshot;
-          const lifecycle: InvitationLifecycle = found.invitation.lifecycleAt(now);
+          const lifecycle: InvitationLifecycle = found.invitation.lifecycleAt(found.readAt);
           return {
             id: state.id,
             email: state.email,

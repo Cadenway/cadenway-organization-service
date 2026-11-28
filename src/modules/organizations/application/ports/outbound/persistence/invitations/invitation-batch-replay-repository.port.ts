@@ -21,7 +21,9 @@ export interface InvitationBatchReplayRepository {
    *
    * @description
    * The committed record of a key still replayed at the instant of the read, compared with the
-   * batch of the request, or `null`.
+   * batch of the request, with the actor's current role, or `null`. One statement, one snapshot,
+   * no row lock: a membership locked by a role change or a removal in progress never makes the
+   * read wait.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.

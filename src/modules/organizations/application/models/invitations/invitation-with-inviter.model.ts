@@ -30,5 +30,17 @@ export interface InvitationWithInviter {
    * @readonly
    */
   readonly invitedBy: InviterView;
+
+  /**
+   * Property readAt
+   *
+   * @description
+   * The instant of the read on the clock of the store, which tells `pending` from `expired`: the
+   * time a request waited for its connection never makes an expired invitation look pending.
+   *
+   * @type {Date}
+   * @readonly
+   */
+  readonly readAt: Date;
   // #endregion
 }

@@ -176,6 +176,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
   /** How each tenant transaction of a request was asked to open, in order. */
   public readonly requestOptions: UnitOfWorkOptions[] = [];
 
+  /** Runs when a transaction gets its connection, as a slow checkout of the pool would. */
+  public onCheckout: (() => void) | null = null;
+
   /**
    * Refuses the next claim, as another transaction holding it after its wait would, after running
    * what that transaction does meanwhile (committing a replay record, for instance).
@@ -292,6 +295,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
       replays: new Map(this.tables.replays),
       events: [...this.tables.events],
     };
+    this.onCheckout?.();
     const claims: Set<string> = new Set<string>();
     try {
       const result: TResult = await work(this.storeOf(tables, claims));
@@ -554,6 +558,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
               ? {
                   invitation: Invitation.restore(state),
                   invitedBy: { userId: state.invitedByUserId, name: nameOf(state.invitedByUserId) },
+                  readAt: this.databaseNow(),
                 }
               : null,
           );
@@ -674,6 +679,10 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
               : {
                   sameRequest: stored.request === request.canonical,
                   invitations: stored.invitations,
+                  actorRole:
+                    activeMembers(key.organizationId).find(
+                      (member: MemberState) => member.userId === key.actorUserId.toLowerCase(),
+                    )?.role ?? null,
                 },
           );
         },

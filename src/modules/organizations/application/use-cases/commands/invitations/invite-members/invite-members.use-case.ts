@@ -78,8 +78,8 @@ interface PlannedAddress {
  *
  * With an `Idempotency-Key` (scoped to the organization, the actor and this operation), the
  * authorization and the organization are checked first, as for a fresh batch. A committed record
- * still live is then replayed for an equivalent batch once the actor's role is checked again under
- * a share lock, without locking the allowances, writing, sending or emitting; another batch is
+ * still live is then replayed for an equivalent batch once the actor's role is checked again in the
+ * snapshot of the record, without any lock, writing, sending or emitting; another batch is
  * refused (`idempotency-key-reused`). Without a record, the key and the batch are claimed for the
  * transaction without waiting (`idempotency-request-in-progress` while an equivalent batch runs
  * with the key), and the batch runs as without a key and records its outcome last, in the same
@@ -252,8 +252,9 @@ export class InviteMembers {
    * Method replay
    *
    * @description
-   * Answers the live record of the key, if any, once the actor still manages the organization
-   * under a share lock: its outcome for an equivalent batch, `idempotency-key-reused` for another.
+   * Answers the live record of the key, if any, once the actor still manages the organization in
+   * the snapshot of the record: its outcome for an equivalent batch, `idempotency-key-reused` for
+   * another.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest }}
@@ -278,14 +279,13 @@ export class InviteMembers {
       return null;
     }
     // Authorization first, as for a fresh batch: a member who lost the role answers 403, never
-    // what the key holds, whether the batch matches it or not.
-    const actor: Member = await requireActorMembership(
-      store,
-      key.organizationId,
-      key.actorUserId,
-      'share',
-    );
-    assertManagesOrganization(actor.role);
+    // what the key holds, whether the batch matches it or not. The role comes from the snapshot of
+    // the record itself, without a lock: a replay creates nothing, so it may not wait on a role
+    // change in progress (`MODULE.md`, Decisions).
+    if (stored.actorRole === null) {
+      throw new OrganizationRefusal({ reason: 'organization-not-found' });
+    }
+    assertManagesOrganization(stored.actorRole);
     if (!stored.sameRequest) {
       throw new InvitationBatchKeyReusedError();
     }

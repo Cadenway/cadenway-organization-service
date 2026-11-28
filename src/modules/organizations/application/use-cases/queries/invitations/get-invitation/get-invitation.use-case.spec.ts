@@ -25,7 +25,7 @@ describe('GetInvitation', () => {
   beforeEach(async () => {
     scenario = await atelierNord();
     scenario.store.withAccount(MARC.id, 'Marc Roux', MARC.email);
-    read = new GetInvitation(scenario.store, scenario.clock);
+    read = new GetInvitation(scenario.store);
     owner = { actorUserId: CAMILLE.id, organizationId: scenario.organizationId };
     const batch: InviteMembersOutput = await new InviteMembers(
       scenario.store,
@@ -105,6 +105,18 @@ describe('GetInvitation', () => {
     await expect(
       read.execute({ ...owner, invitationId: revokedBatch.invitations[0]?.invitationId ?? '' }),
     ).resolves.toMatchObject({ status: 'revoked', answeredAt: null, revokedAt });
+  });
+
+  it('tells pending from expired at the read, not at the arrival of a request that waited', async () => {
+    scenario.clock.advance(7 * DAY - 1_000);
+    scenario.store.onCheckout = (): void => {
+      scenario.clock.advance(2_000);
+    };
+
+    const waited: InvitationStateView = await read.execute({ ...owner, invitationId });
+    scenario.store.onCheckout = null;
+
+    expect(waited.status).toBe('expired');
   });
 
   it('reads the role of the actor and the invitation in one read-only snapshot', async () => {

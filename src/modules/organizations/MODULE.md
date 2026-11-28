@@ -102,8 +102,10 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   (less the last 500 ms, kept for the read of the backlog) and the job's abort signal. The wait
   for a pooled connection races both: if either comes first, the call answers at once, and the
   transaction, whenever it gets its connection, runs no statement and ends, giving it back. A
-  transaction that gets its connection in time sets the time left as its `statement_timeout`. A
-  delete cut short rolls back and fails the tick, which its queue retries.
+  transaction that gets its connection in time sets the time left as its `statement_timeout`, then
+  checks the deadline and the abort once more right before its statement, which it skips if either
+  came meanwhile; the statement can thus overrun the deadline by one `set_config` round trip at
+  most. A delete cut short rolls back and fails the tick, which its queue retries.
   A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
@@ -505,7 +507,9 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `accepted`, `refused` or `revoked` as stored. `answeredAt` is set for an acceptance or a refusal,
   `revokedAt` for a revocation, from `answered_at`, which holds the instant that closed it; a
   revocation keeps the row with its status, so the three are stored, never inferred. The actor's
-  role and the invitation are read from one snapshot. The answer is `Cache-Control: private,
+  role and the invitation are read from one snapshot, and `pending` is told from `expired` at the
+  `statement_timestamp()` of the read, never at the arrival of a request that may have waited for
+  its connection. The answer is `Cache-Control: private,
 no-store`, carries no `ETag` and is never conditional: an invitation becomes `expired` without
   a new `version`, so a tag derived from the version could validate a stale copy. The handler
   writes the body itself, so neither the kit's `EtagInterceptor` nor Express adds a tag or
@@ -567,10 +571,10 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - `GET /internal/v1/invitations/{invitationId}` opens a tenant `REPEATABLE READ READ ONLY`
   transaction for the actor's membership and the invitation.
 - A keyed invitation batch runs in the same tenant transaction. After the role and organization
-  checks, it reads the committed live record of the key first, without any lock. With a record, it
-  checks the actor's role again under a share lock on the membership, then answers the stored body
-  to an equivalent batch, taking neither allowance lock, and `422` to another: a member who lost the
-  role answers `403` either way. Without a record, it takes a
+  checks, it reads the committed live record of the key first, with the actor's active membership,
+  in one statement and without any lock. With a record, it checks the actor's role from that same
+  snapshot, then answers the stored body to an equivalent batch, taking neither allowance lock, and
+  `422` to another: a member who lost the role answers `403` either way. Without a record, it takes a
   transaction-level advisory lock on the scoped key and the fingerprint of the batch with
   `pg_try_advisory_xact_lock`, never waiting, and reads the record again in either case, since a
   batch of the key may have committed in between: a refused claim answers `409` only while the key
@@ -643,6 +647,14 @@ Any failure rolls back the business rows and the outbox rows together
   (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists.
+- A replay authorizes the actor from the snapshot of its record, read in one statement with the
+  active membership and without a lock, while a fresh batch rechecks the role under a share lock on
+  the membership before it plans anything. A replay creates no new effect: authorizing it against a
+  snapshot that may predate a concurrent demotion by a moment only returns a result that already
+  happened, while a blocking share lock let a stalled role change or removal (which holds the row
+  exclusively) make every replay of that actor wait, each holding one of the five pooled
+  connections, until the readiness probe and other tenants starved. Fresh batches create effects,
+  so they keep the locked recheck.
 - No admission limit bounds the replay records. A keyed batch whose addresses are all members or
   already invited sends no email, so the email allowance does not bound its record. Accepted
   because each record is bounded (at most 50 addresses per batch, the limit of the contract's

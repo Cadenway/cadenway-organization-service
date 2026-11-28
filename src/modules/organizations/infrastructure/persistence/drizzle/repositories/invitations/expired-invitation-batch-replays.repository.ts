@@ -153,7 +153,10 @@ export class ExpiredInvitationBatchReplays {
    * included. The checkout races the deadline and the abort signal: if either comes first, the call
    * answers `null` at once, and the transaction, whenever it gets its connection, runs no statement
    * of its own and ends, which gives the connection back to the pool. Once the transaction holds its
-   * connection in time, the race is over and `statement_timeout` bounds the rest at the time left.
+   * connection in time, the race is over: `statement_timeout` is set to the time left, then the
+   * deadline and the abort are checked once more, right before `work`, which does not run if either
+   * came during that round trip. The time `work` may take is thus the time left before the setting,
+   * which overruns the deadline by the latency of one `set_config` at most.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
    * @param {TransactionOptions} options - How the transaction is opened.
@@ -199,6 +202,10 @@ export class ExpiredInvitationBatchReplays {
           await db.execute(
             sql`select set_config('statement_timeout', ${timeoutOf(remaining)}, true)`,
           );
+          // The setting took a round trip: the deadline or the abort may have come meanwhile.
+          if (this.isOver(window)) {
+            return null;
+          }
           return work(db);
         }, options)
         .then(
@@ -215,6 +222,19 @@ export class ExpiredInvitationBatchReplays {
           },
         );
     });
+  }
+
+  /**
+   * Method isOver
+   *
+   * @description
+   * Whether the deadline or the abort of a call has come, read afresh at each call.
+   *
+   * @param {PurgeWindow} window - The deadline and the abort signal.
+   * @returns {boolean} `true` when the call must stop.
+   */
+  private isOver(window: PurgeWindow): boolean {
+    return window.deadline - this.now() <= 0 || window.signal.aborted;
   }
   // #endregion
 }

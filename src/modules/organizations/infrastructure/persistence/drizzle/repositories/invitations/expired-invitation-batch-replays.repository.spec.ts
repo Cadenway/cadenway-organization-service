@@ -54,8 +54,55 @@ function saturatedPool() {
   return { replays: new ExpiredInvitationBatchReplays(system), execute, pool };
 }
 
+/**
+ * A runner whose `statement_timeout` setting takes its time on a fake clock, or aborts the job,
+ * while the deletes and reads are recorded.
+ *
+ * @param duringSetting - What happens while the setting runs.
+ * @returns The repository and the statements other than the setting.
+ */
+function slowSetting(duringSetting: (clock: { now: number }) => void) {
+  const clock = { now: 0 };
+  const dialect: PgDialect = new PgDialect();
+  const others = vi.fn();
+  const execute = vi.fn((statement: SQL) => {
+    if (dialect.sqlToQuery(statement).sql.includes('statement_timeout')) {
+      duringSetting(clock);
+    } else {
+      others(statement);
+    }
+    return Promise.resolve({ rowCount: 42, rows: [{ age: 7 }] });
+  });
+  const system = {
+    run: <TResult>(
+      work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
+    ): Promise<TResult> => work({ db: { execute } }),
+  } as unknown as SystemTransactionRunner;
+  return { replays: new ExpiredInvitationBatchReplays(system, () => clock.now), others };
+}
+
 describe('ExpiredInvitationBatchReplays', () => {
   const signal: AbortSignal = new AbortController().signal;
+
+  it('runs no delete when the deadline passes while the statement timeout is being set', async () => {
+    const { replays, others } = slowSetting((clock) => {
+      clock.now += 2_000;
+    });
+
+    await expect(replays.purge(500, { deadline: 1_000, signal })).resolves.toBeNull();
+    await expect(replays.oldestExpiredAgeSeconds({ deadline: 1_000, signal })).resolves.toBeNull();
+    expect(others).not.toHaveBeenCalled();
+  });
+
+  it('runs no delete when the job is aborted while the statement timeout is being set', async () => {
+    const job = new AbortController();
+    const { replays, others } = slowSetting(() => {
+      job.abort();
+    });
+
+    await expect(replays.purge(500, { deadline: 60_000, signal: job.signal })).resolves.toBeNull();
+    expect(others).not.toHaveBeenCalled();
+  });
 
   afterEach(() => {
     vi.useRealTimers();

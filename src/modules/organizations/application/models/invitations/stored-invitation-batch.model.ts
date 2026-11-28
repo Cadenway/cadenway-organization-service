@@ -1,3 +1,4 @@
+import type { Role } from '../../../domain/value-objects/members/role.value-object.js';
 import type { InvitationOutcome } from '../../projections/invitations/invitation-outcome.projection.js';
 
 /**
@@ -30,5 +31,17 @@ export interface StoredInvitationBatch {
    * @readonly
    */
   readonly invitations: readonly InvitationOutcome[];
+
+  /**
+   * Property actorRole
+   *
+   * @description
+   * The role of the acting user's active membership in the organization of the key, read in the
+   * same statement as the record, without a lock, or `null` when the user is no longer a member.
+   *
+   * @type {Role | null}
+   * @readonly
+   */
+  readonly actorRole: Role | null;
   // #endregion
 }

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
-import { and, eq, gt, lte, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, lte, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
 import type { InvitationBatchReplayKey } from '../../../../../application/models/invitations/invitation-batch-replay-key.model.js';
@@ -11,6 +11,7 @@ import type { InvitationBatchReplayRepository } from '../../../../../application
 import { INVITATION_BATCH_REPLAY_MS } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
+import { members } from '../../schemas/members/member.schema.js';
 
 /**
  * Constant INLINE_PURGE_LIMIT
@@ -180,8 +181,17 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
       .select({
         requestDigest: invitationBatchReplays.requestDigest,
         outcome: invitationBatchReplays.outcome,
+        actorRole: members.role,
       })
       .from(invitationBatchReplays)
+      .leftJoin(
+        members,
+        and(
+          eq(members.organizationId, invitationBatchReplays.organizationId),
+          eq(members.userId, invitationBatchReplays.actorUserId),
+          isNull(members.removedAt),
+        ),
+      )
       .where(
         and(
           eq(invitationBatchReplays.organizationId, key.organizationId),
@@ -197,6 +207,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
       : {
           sameRequest: row.requestDigest === digestOf(request.canonical),
           invitations: row.outcome,
+          actorRole: row.actorRole,
         };
   }
 
