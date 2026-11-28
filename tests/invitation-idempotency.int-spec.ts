@@ -10,16 +10,24 @@ import type {
   InvitationState,
 } from '@cadenway/contracts/types/internal/organization-service';
 import { DATABASE_POOL, SystemTransactionRunner } from '@cadenway/nest-common/database';
-import { JobScheduler, JobWorkerRegistry } from '@cadenway/nest-jobs/runtime';
+import type { TransactionDatabase, TransactionOptions } from '@cadenway/nest-common/database';
+import {
+  JobProducer,
+  JobScheduler,
+  JobsRuntimeModule,
+  JobWorkerRegistry,
+} from '@cadenway/nest-jobs/runtime';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { Test as NestTest } from '@nestjs/testing';
 import pg from 'pg';
 import request from 'supertest';
 import type { Response, Test } from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
+import { jobQueues, PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
+import { InvitationBatchReplayPurgeCutShortError } from '../src/modules/organizations/application/models/invitations/invitation-batch-replay-purge-cut-short.model.js';
 import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
 import { InvitationBatchRequest } from '../src/modules/organizations/domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import { inlinePurgeOf } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-batch-replay.repository.js';
@@ -165,6 +173,20 @@ describe('idempotent invitation batches and the invitation state', () => {
   }
 
   /**
+   * Builds the error of a purge call cut short, as the composition gives it to the store.
+   *
+   * @param phase - The phase it stood in.
+   * @param trigger - What cut it short.
+   * @returns The error.
+   */
+  function cutShortOf(
+    phase: InvitationBatchReplayPurgeCutShortError['phase'],
+    trigger: InvitationBatchReplayPurgeCutShortError['trigger'],
+  ): InvitationBatchReplayPurgeCutShortError {
+    return new InvitationBatchReplayPurgeCutShortError(phase, trigger);
+  }
+
+  /**
    * A store of the expired replay records on the pool of the application, as the purge job has.
    *
    * @param pool - The pool its transactions check connections out of.
@@ -173,7 +195,7 @@ describe('idempotent invitation batches and the invitation state', () => {
   function purgeStore(
     pool: pg.Pool = app.get<pg.Pool>(DATABASE_POOL),
   ): ExpiredInvitationBatchReplays {
-    return new ExpiredInvitationBatchReplays(new DiscardableSystemTransactions(pool));
+    return new ExpiredInvitationBatchReplays(new DiscardableSystemTransactions(pool), cutShortOf);
   }
 
   /** What a batch writes in an organization, to compare before and after a request. */
@@ -1317,12 +1339,13 @@ describe('idempotent invitation batches and the invitation state', () => {
      *
      * - `now` stalls at once;
      * - `after-error` forwards the server's messages one by one and stalls right after the first
-     *   `ErrorResponse`, withholding the `ReadyForQuery` that follows it;
+     *   `ErrorResponse`, withholding the `ReadyForQuery` that follows it: `errorWithheld` resolves
+     *   once the error went through and the bytes after it were dropped;
      * - `off` forwards everything, on new connections too.
      *
      * @param host - The host of PostgreSQL.
      * @param port - The port of PostgreSQL.
-     * @returns The port of the proxy, the switch of the stall and its closing.
+     * @returns The port of the proxy, the switch of the stall, the withheld answer and its closing.
      */
     async function stallingProxy(
       host: string,
@@ -1330,12 +1353,18 @@ describe('idempotent invitation batches and the invitation state', () => {
     ): Promise<{
       readonly port: number;
       readonly stall: (mode: 'now' | 'after-error' | 'off') => void;
+      readonly errorWithheld: Promise<void>;
       readonly close: () => Promise<void>;
     }> {
-      const state: { stalled: boolean; afterError: boolean } = {
+      const state: { stalled: boolean; afterError: boolean; errorForwarded: boolean } = {
         stalled: false,
         afterError: false,
+        errorForwarded: false,
       };
+      const withheld: { resolve: () => void } = { resolve: (): void => undefined };
+      const errorWithheld = new Promise<void>((resolve) => {
+        withheld.resolve = resolve;
+      });
       const sockets = new Set<net.Socket>();
       const server: net.Server = net.createServer({ allowHalfOpen: true }, (client: net.Socket) => {
         const upstream: net.Socket = net.connect(port, host);
@@ -1346,7 +1375,10 @@ describe('idempotent invitation batches and the invitation state', () => {
           if (!state.stalled) upstream.write(chunk);
         });
         upstream.on('data', (chunk: Buffer) => {
-          if (state.stalled) return;
+          if (state.stalled) {
+            if (state.errorForwarded) withheld.resolve();
+            return;
+          }
           if (!state.afterError) {
             client.write(chunk);
             return;
@@ -1360,6 +1392,9 @@ describe('idempotent invitation batches and the invitation state', () => {
             client.write(message);
             if (message[0] === 0x45) {
               state.stalled = true;
+              state.errorForwarded = true;
+              // The `ReadyForQuery` that follows, if it came in the same chunk, is dropped here.
+              if (unread.length > 0) withheld.resolve();
               return;
             }
           }
@@ -1391,6 +1426,7 @@ describe('idempotent invitation batches and the invitation state', () => {
           state.stalled = mode === 'now';
           state.afterError = mode === 'after-error';
         },
+        errorWithheld,
         close: (): Promise<void> => {
           for (const socket of sockets) socket.destroy();
           return new Promise<void>((resolve) => {
@@ -1403,46 +1439,125 @@ describe('idempotent invitation batches and the invitation state', () => {
     }
 
     /**
-     * A purge tick of the job, on a store of its own.
+     * A pool of the application role whose connections go through a stalling proxy.
+     *
+     * @returns The proxy and the pool, to close in that order.
+     */
+    async function proxiedPool(): Promise<{
+      readonly proxy: Awaited<ReturnType<typeof stallingProxy>>;
+      readonly pool: pg.Pool;
+    }> {
+      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
+      const proxy = await stallingProxy(target.hostname, Number(target.port));
+      target.host = `127.0.0.1:${String(proxy.port)}`;
+      // A bounded connection timeout, as the pool of the kit has (5 s there).
+      const pool = new pg.Pool({
+        connectionString: target.toString(),
+        max: 1,
+        connectionTimeoutMillis: 1_000,
+      });
+      pool.on('error', () => undefined);
+      return { proxy, pool };
+    }
+
+    /**
+     * A purge tick of the job, on a store of its own, as the job runtime runs it: a rejection
+     * fails the job, which its queue retries.
      *
      * @param store - The store of the expired records.
+     * @param signal - The abort signal of the job.
      */
-    async function tick(store: ExpiredInvitationBatchReplays): Promise<void> {
+    async function tick(
+      store: ExpiredInvitationBatchReplays,
+      signal: AbortSignal = new AbortController().signal,
+    ): Promise<void> {
       await new PurgeInvitationBatchReplaysHandler(
         app.get(JobWorkerRegistry),
         app.get(JobScheduler),
         store,
         PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
-      ).handle({ organizationId: null, signal: new AbortController().signal });
+      ).handle({ organizationId: null, signal });
     }
 
-    it('discards a connection stuck at the socket level by its deadline, so a later tick deletes', async () => {
+    /**
+     * Discardable system transactions that tell when one of them starts its rollback.
+     */
+    class RollbackWatch extends DiscardableSystemTransactions {
+      // #region Properties
+      /** Resolves once a transaction starts its rollback. */
+      public readonly rolledBack: Promise<void>;
+
+      /** Resolves `rolledBack`. */
+      private readonly rollingBack: () => void;
+      // #endregion
+
+      // #region Constructor
+      /**
+       * Binds the transactions to their pool.
+       *
+       * @param pool - The pool.
+       */
+      public constructor(pool: pg.Pool) {
+        super(pool);
+        const watch: { resolve: () => void } = { resolve: (): void => undefined };
+        this.rolledBack = new Promise<void>((resolve) => {
+          watch.resolve = resolve;
+        });
+        this.rollingBack = watch.resolve;
+      }
+      // #endregion
+
+      // #region Methods
+      /**
+       * Runs a transaction as its parent does, watching its phases.
+       *
+       * @param work - The statements.
+       * @param options - The options of the transaction.
+       * @param discard - Aborts to destroy the connection.
+       * @param onPhase - Learns each phase.
+       * @returns What `work` resolved with.
+       */
+      public override run<TResult>(
+        work: (scope: { readonly db: TransactionDatabase }) => Promise<TResult>,
+        options: TransactionOptions,
+        discard: AbortSignal,
+        onPhase: (phase: 'setup' | 'work' | 'commit' | 'rollback') => void = (): void => undefined,
+      ): Promise<TResult> {
+        return super.run(work, options, discard, (phase) => {
+          onPhase(phase);
+          if (phase === 'rollback') this.rollingBack();
+        });
+      }
+      // #endregion
+    }
+
+    it('fails a tick whose connection is stuck at the socket level, discarding it, and the retry deletes', async () => {
       await expired(lumenId, 4, 'stuck-socket-');
-      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
-      const proxy = await stallingProxy(target.hostname, Number(target.port));
-      target.host = `127.0.0.1:${String(proxy.port)}`;
-      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
-      pool.on('error', () => undefined);
+      const { proxy, pool } = await proxiedPool();
       try {
         // The purge reuses this idle connection, whose path then stalls: its statements are sent
         // and never answered, and the socket stays open.
         await pool.query('select 1');
         const store: ExpiredInvitationBatchReplays = purgeStore(pool);
         proxy.stall('now');
-        const started: number = performance.now();
 
-        await expect(
-          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
-        ).resolves.toBeNull();
-        // Without the discard, nothing would ever end that call: no answer comes back.
+        // The tick fails, so the job runtime fails the job and its queue retries it.
+        await expect(tick(store)).rejects.toMatchObject({
+          name: 'InvitationBatchReplayPurgeCutShortError',
+          phase: 'setup',
+          trigger: 'deadline',
+        });
+        // Without the discard, nothing would ever end that call: no answer comes back. The read
+        // of the backlog after it opens a new connection through the same stalled path, which the
+        // connection timeout of the pool ends.
         await vi.waitFor(
           () => {
             expect(store.stalled).toBe(false);
           },
-          { timeout: 2_000, interval: 10 },
+          { timeout: 3_000, interval: 10 },
         );
-        expect(performance.now() - started).toBeLessThan(2_000);
         expect(pool.totalCount).toBe(0);
+        expect(await swept(lumenId)).toBe(4);
 
         proxy.stall('off');
         await tick(store);
@@ -1455,34 +1570,43 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
     });
 
-    it('closes a connection whose rollback waits behind an error never followed by ReadyForQuery, so a later tick deletes', async () => {
+    it('fails a tick whose rollback waits behind an error never followed by ReadyForQuery, and the retry deletes', async () => {
       await expired(lumenId, 4, 'stuck-rollback-');
-      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
-      const proxy = await stallingProxy(target.hostname, Number(target.port));
-      target.host = `127.0.0.1:${String(proxy.port)}`;
-      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
-      pool.on('error', () => undefined);
-      // The delete of the purge fails at once with an `ErrorResponse`.
-      await stack.migrator.query(
-        `create function refuse_invitation_batch_replay_delete() returns trigger language plpgsql as
-         $$ begin raise exception 'refused by the test'; end $$`,
-      );
-      await stack.migrator.query(
-        `create trigger refuse_invitation_batch_replay_delete before delete on invitation_batch_replays
-         for each row execute function refuse_invitation_batch_replay_delete()`,
-      );
-      const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+      const { proxy, pool } = await proxiedPool();
       try {
+        const transactions = new RollbackWatch(pool);
+        const store = new ExpiredInvitationBatchReplays(transactions, cutShortOf);
         try {
+          // The delete of the purge fails at once with an `ErrorResponse`.
+          await stack.migrator.query(
+            `create function refuse_invitation_batch_replay_delete() returns trigger
+             language plpgsql as $$ begin raise exception 'refused by the test'; end $$`,
+          );
+          await stack.migrator.query(
+            `create trigger refuse_invitation_batch_replay_delete
+             before delete on invitation_batch_replays
+             for each row execute function refuse_invitation_batch_replay_delete()`,
+          );
           await pool.query('select 1');
-          // The error reaches pg, which has then no active query and queues the rollback; the
-          // `ReadyForQuery` it waits for never comes, and the socket stays open.
           proxy.stall('after-error');
-          const started: number = performance.now();
+          const job = new AbortController();
+          const outcome = { settled: false };
+          const running: Promise<void> = tick(store, job.signal).finally(() => {
+            outcome.settled = true;
+          });
+          // pg got the error, has no active query and queued the rollback, whose
+          // `ReadyForQuery` the proxy withholds: only then is the job cancelled.
+          await Promise.all([proxy.errorWithheld, transactions.rolledBack]);
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          expect(outcome.settled).toBe(false);
+          job.abort();
 
-          await expect(
-            store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
-          ).rejects.toThrow('while a delete was in flight');
+          await expect(running).rejects.toMatchObject({
+            name: 'InvitationBatchReplayPurgeCutShortError',
+            phase: 'rollback',
+            trigger: 'abort',
+          });
+          // The transaction settles: its connection was closed although pg had no active query.
           await vi.waitFor(
             () => {
               expect(store.stalled).toBe(false);
@@ -1492,12 +1616,14 @@ describe('idempotent invitation batches and the invitation state', () => {
           expect(pool.totalCount).toBe(0);
         } finally {
           await stack.migrator.query(
-            'drop trigger refuse_invitation_batch_replay_delete on invitation_batch_replays',
+            'drop trigger if exists refuse_invitation_batch_replay_delete on invitation_batch_replays',
           );
-          await stack.migrator.query('drop function refuse_invitation_batch_replay_delete()');
+          await stack.migrator.query(
+            'drop function if exists refuse_invitation_batch_replay_delete()',
+          );
         }
 
-        // The next tick deletes on a fresh connection, the stuck one being gone from the pool.
+        // The retry deletes on a fresh connection, the stuck one being gone from the pool.
         proxy.stall('off');
         await tick(store);
         expect(pool.totalCount).toBe(1);
@@ -1508,33 +1634,67 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
     });
 
-    it('drains with a later tick after a delete stalled on a held lock past its deadline', async () => {
+    it('fails the job of a tick whose delete waits on a held lock past its deadline, and its queue retries it', async () => {
       await expired(lumenId, 4, 'stuck-lock-');
-      const store: ExpiredInvitationBatchReplays = purgeStore();
+      const producer = await NestTest.createTestingModule({
+        imports: [
+          JobsRuntimeModule.forRoot({
+            connection: {
+              connectionString: app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '',
+            },
+            queues: jobQueues,
+            capabilities: ['producer'],
+            poolSize: 1,
+          }),
+        ],
+      }).compile();
+      await producer.init();
       const holder: pg.PoolClient = await stack.migrator.connect();
       try {
         await holder.query('begin');
         await holder.query('lock table invitation_batch_replays in access exclusive mode');
-        const started: number = performance.now();
+        // The worker of the application runs the job on its own store and pool.
+        const { jobId } = await app
+          .get(SystemTransactionRunner)
+          .run(({ client }) =>
+            producer
+              .get(JobProducer)
+              .enqueue(
+                { client, organizationId: null },
+                PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
+                null,
+              ),
+          );
 
-        // Whichever comes first, the deadline of the call or the server's statement timeout set
-        // to the same time left, fails the delete.
-        await expect(
-          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
-        ).rejects.toThrow();
+        // The attempt failed and the job waits for its retry, delayed by the backoff of the queue
+        // (pg-boss counts a retry once it starts).
         await vi.waitFor(
-          () => {
-            expect(store.stalled).toBe(false);
+          async () => {
+            const [job] = (
+              await stack.migrator.query<{
+                state: string;
+                retry_count: number;
+                delayed: boolean;
+              }>(
+                `select state, retry_count, start_after > now() as delayed
+                 from pgboss.job where id = $1`,
+                [jobId],
+              )
+            ).rows;
+            expect(job).toEqual({ state: 'retry', retry_count: 0, delayed: true });
           },
-          { timeout: 2_000, interval: 10 },
+          { timeout: 30_000, interval: 200 },
         );
       } finally {
         await holder.query('rollback');
         holder.release();
+        await producer.close();
       }
       expect(await swept(lumenId)).toBe(4);
 
-      await tick(store);
+      await app
+        .get(PurgeInvitationBatchReplaysHandler)
+        .handle({ organizationId: null, signal: new AbortController().signal });
       expect(await swept(lumenId)).toBe(0);
     });
 

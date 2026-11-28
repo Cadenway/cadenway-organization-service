@@ -3,6 +3,7 @@ import { JobScheduler, JobWorkerRegistry } from '@cadenway/nest-jobs/runtime';
 import type { FactoryProvider } from '@nestjs/common';
 
 import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../../../../../../config/job-queues.js';
+import { InvitationBatchReplayPurgeCutShortError } from '../../../../application/models/invitations/invitation-batch-replay-purge-cut-short.model.js';
 import { ExpiredInvitationBatchReplays } from '../../../../infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
 import { DiscardableSystemTransactions } from '../../../../infrastructure/persistence/drizzle/transactions/invitations/discardable-system.transaction.js';
 import { PurgeInvitationBatchReplaysHandler } from '../../../../presentation/jobs/handlers/invitations/purge-invitation-batch-replays.handler.js';
@@ -23,7 +24,10 @@ export const purgeInvitationBatchReplaysHandlerProvider: FactoryProvider<PurgeIn
       return new PurgeInvitationBatchReplaysHandler(
         workers,
         scheduler,
-        new ExpiredInvitationBatchReplays(new DiscardableSystemTransactions(pool)),
+        new ExpiredInvitationBatchReplays(
+          new DiscardableSystemTransactions(pool),
+          (phase, trigger) => new InvitationBatchReplayPurgeCutShortError(phase, trigger),
+        ),
         PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
       );
     },

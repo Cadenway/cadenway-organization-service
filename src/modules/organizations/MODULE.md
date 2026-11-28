@@ -105,37 +105,47 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   the 8 s shutdown timeout of the job runtime), measured on the monotonic clock of the process
   (`performance.now()`), so a step of the wall clock never stretches nor cuts a tick; the records
   keep the database clock for their expiry. Each call gets the absolute deadline of the tick
-  (less the last 500 ms, kept for the read of the backlog) and the job's abort signal. The wait
-  for a pooled connection races both: if either comes first, the call answers at once, and the
-  transaction, whenever it gets its connection, gives it back unused. A transaction that gets its
-  connection in time sets the time left as both its `statement_timeout` and its
+  (less the last 500 ms, kept for the read of the backlog) and the job's abort signal, and a tick
+  starts another delete only with 250 ms left at least. The whole call races both, from the wait
+  for a pooled connection to its commit or rollback. A transaction that gets its connection in
+  time sets the time left plus a 1 s grace as both its `statement_timeout` and its
   `idle_in_transaction_session_timeout`, then checks the deadline and the abort once more right
-  before its statement, which it skips if either came meanwhile. The race lasts until the
-  transaction ends, its commit included: when the deadline or the abort wins, the call answers at
-  once and **destroys the connection on the client side**: the purge's system transactions run on
-  a connection of the pool it can discard (`DiscardableSystemTransactions`, the same row-level
-  security settings as the kit's system runner, which gives no handle on its connection), and
-  the discard releases it to the pool with an error, once, so the pool never reuses it, and
-  destroys its socket itself, since `pg` does so on release only while a statement is its active
-  query: after an `ErrorResponse` it has none until `ReadyForQuery`, the rollback only waits in
-  its queue, and a graceful close never completes while the peer keeps the socket open. So the
-  pending statement, a stalled commit or a queued rollback included, rejects at once, even on a
-  connection stuck at the socket level that would never answer. The server rolls the transaction back once it notices the
-  disconnection, and the two timeouts still bound, on its side, the locks it may hold until then. A
-  call that had no time left before its delete started answers `null`, the normal end of a tick; a
-  deadline or an abort that comes while a delete is in flight or committing fails the call, and
-  with it the tick, since the server may cancel that delete: the queue's bounded retry then
-  applies. At most one purge call per process is in flight: the store keeps the call it gave up on
-  until it settles, which the discard makes immediate, and meanwhile every new call answers `null`
-  without checking out a connection, while a tick (or its retry) skips at once and logs
-  `skippedTicks` at `warn`, so a stalled connection is never joined by another one. That skip is a
-  fallback: only a call still waiting for a pooled connection outlives its discard, until the pool
-  hands it one (it gives it back unused) or its 5 s connection timeout ends the wait; the next tick
-  then runs. A keyed batch stores a record even when it sends
-  nothing, so the email allowance does not bound how many records expire; a tick that stops on its
-  budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
-  next tick continues. A failed tick is retried by its queue, which the migrator provisions with
-  the others.
+  before its statement. When the deadline or the abort wins, the call answers at once and
+  **destroys the connection on the client side**: the purge's system transactions run on a
+  connection of the pool it can discard (`DiscardableSystemTransactions`, with the same row-level
+  security settings as the kit's system runner, which gives no handle on its connection, and the
+  same `cadenway.postgres.pool.acquire.duration` and `cadenway.postgres.transaction.duration`
+  histograms, `kind: system`, recorded under the kit's meter since the kit does not export its
+  instruments), and the discard releases it to the pool with an error, once, so the pool never
+  reuses it, and destroys its socket itself, since `pg` does so on release only while a statement
+  is its active query: after an `ErrorResponse` it has none until `ReadyForQuery`, the rollback
+  only waits in its queue, and a graceful close never completes while the peer keeps the socket
+  open. So the pending statement, a stalled commit or a queued rollback included, rejects at
+  once, even on a connection stuck at the socket level that would never answer. The server rolls
+  the transaction back once it notices the disconnection, and its two timeouts, a little later than
+  the client's deadline so that the deadline always comes first, bound the locks it may hold until
+  then.
+- A tick ends in one of three ways. A delete that removes fewer than 500 rows drains the backlog. A
+  deadline reached before another delete starts (fewer than 250 ms left, or a call that answers
+  `null` because the deadline or the abort came before it started) ends the tick on its budget:
+  it logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the next
+  tick continues. A call cut short once started made no progress: it rejects with
+  `InvitationBatchReplayPurgeCutShortError`, whose `phase` is `checkout`, `setup` (the opening
+  statements and the timeouts), `delete`, `commit` or `rollback` (after a failed statement) and
+  `trigger` is `deadline` or `abort`; the tick logs them at `error`, with the rows it deleted before
+  and the backlog (read within the reserve, once the discarded call settled, else `null`), and fails
+  with that error, so the job fails and its queue retries it with its backoff (the defaults of
+  `@cadenway/nest-jobs` the migrator provisions: five retries, 30 s base delay, exponential with
+  jitter, at most one hour); meanwhile the next minute's tick still runs. Any other failure of a
+  delete fails the tick the same way, without that report.
+- At most one purge call per process is in flight: the store keeps the call it gave up on until
+  it settles, which the discard makes immediate, and a later call waits for it, up to its own
+  deadline, without checking out a connection, while a tick (or its retry) that finds it still
+  running skips at once and logs `skippedTicks` at `warn`, so a stalled connection is never joined
+  by another one. That skip is a fallback: only a call still waiting for a pooled connection
+  outlives its discard, until the pool hands it one (it gives it back unused) or its 5 s
+  connection timeout ends the wait; the next tick then runs. A keyed batch stores a record even
+  when it sends nothing, so the email allowance does not bound how many records expire.
 
 The migration is additive: the previous release never reads the table, and a rollback keeps it
 (see "Rollout and rollback of idempotent batches").
@@ -728,6 +738,16 @@ Any failure rolls back the business rows and the outbox rows together
   the call, and the skip that kept a second connection from joining it then held every later
   tick of the replica forever while expired records, which hold invited addresses, stayed. A
   second connection to terminate the first would also break the one-connection bound of the purge.
+- A purge call cut short once started fails its tick rather than ending it as a budget stop: an
+  earlier revision answered `null` for a stall in the checkout or the setup, which the tick read
+  as its budget spent, so a replica whose every connection stalled completed its jobs while
+  expired records stayed. The phase (`checkout`, `setup`, `delete`, `commit`, `rollback`) goes to the
+  `error` log and the queue's retry and dead letter apply. The server's timeouts run 1 s past the
+  client's deadline so the client always classifies the stall; a delete starts only with 250 ms
+  left, so a healthy tick never fails on a deadline it reached between two deletes.
+- The discardable runner records the kit's two database histograms itself, under the kit's meter
+  and with the kit's names, units and attributes, because `@cadenway/nest-common` 0.8.1 does not
+  export its instruments; an export from the kit would replace that copy of four declarations.
 - Replay support is signalled by a route, not by a capability flag or a gateway switch: a keyed
   batch goes to `POST /internal/v1/invitation-batches`, which a release without replays does not
   serve, so a rolling deploy or a rollback can never run a keyed retry as a fresh batch (which
