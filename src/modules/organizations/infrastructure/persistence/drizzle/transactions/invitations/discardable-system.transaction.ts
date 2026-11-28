@@ -4,6 +4,8 @@ import {
   SYSTEM_ACCESS_SETTING,
 } from '@cadenway/nest-common/database';
 import type { TransactionDatabase, TransactionOptions } from '@cadenway/nest-common/database';
+import { metrics } from '@opentelemetry/api';
+import type { Histogram, MeterProvider } from '@opentelemetry/api';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import type { Pool, PoolClient } from 'pg';
 
@@ -18,12 +20,55 @@ const BEGIN_STATEMENTS: Readonly<
 };
 
 /**
+ * The instruments of the database metrics, cached for the meter provider they were made with, so
+ * an SDK started after this module was imported gets its own.
+ */
+let instruments:
+  | {
+      readonly provider: MeterProvider;
+      readonly poolAcquireDuration: Histogram;
+      readonly transactionDuration: Histogram;
+    }
+  | undefined;
+
+/**
+ * The two histograms the transaction runners of `@cadenway/nest-common` record, under the same
+ * meter, names, units and descriptions, so the purge's transactions land in the same series of
+ * every dashboard. The kit does not export its instruments (0.8.1); replace this with its export
+ * once it has one.
+ *
+ * @returns The pool acquisition and transaction duration histograms of the current provider.
+ */
+function databaseMetrics(): {
+  readonly poolAcquireDuration: Histogram;
+  readonly transactionDuration: Histogram;
+} {
+  const provider: MeterProvider = metrics.getMeterProvider();
+  if (instruments?.provider !== provider) {
+    const meter = provider.getMeter('@cadenway/nest-common');
+    instruments = {
+      provider,
+      poolAcquireDuration: meter.createHistogram('cadenway.postgres.pool.acquire.duration', {
+        description: 'Elapsed time waiting to acquire a PostgreSQL connection from the pool.',
+        unit: 'ms',
+      }),
+      transactionDuration: meter.createHistogram('cadenway.postgres.transaction.duration', {
+        description: 'Time a PostgreSQL connection is held by the transaction executor.',
+        unit: 'ms',
+      }),
+    };
+  }
+  return instruments;
+}
+
+/**
  * Class DiscardableSystemTransactions
  *
  * @description
  * Runs a system transaction, as the kit's `SystemTransactionRunner` does (the same row-level
- * security settings: no organization, system access on), on a pooled connection that its caller
- * can discard. When the `discard` signal aborts before the transaction ends, the connection is
+ * security settings: no organization, system access on, and the same pool acquisition and
+ * transaction duration metrics, `kind: system`), on a pooled connection that its caller can
+ * discard. When the `discard` signal aborts before the transaction ends, the connection is
  * released to the pool with an error, once, and its socket is destroyed on the client side,
  * whatever pg was doing: a statement in flight, a stalled commit or a rollback queued behind an
  * error whose `ReadyForQuery` never came, rejects at once with the connection terminated, the pool
@@ -54,12 +99,16 @@ export class DiscardableSystemTransactions {
    * Checks a connection out, opens the transaction, runs `work`, then commits, or rolls back when
    * `work` fails. Once `discard` aborts, the connection is destroyed instead of being given back:
    * the call then rejects as soon as its pending statement does, with no rollback attempted. A
-   * signal that aborts during the checkout gives the connection back unused.
+   * signal that aborts during the checkout gives the connection back unused. `onPhase` learns
+   * each step as it starts, after the checkout: `setup` (the opening statements), `work`,
+   * `commit`, `rollback`.
    *
    * @param {(scope: { readonly db: TransactionDatabase }) => Promise<TResult>} work - The
    * statements, which must not keep `db` past their promise.
    * @param {TransactionOptions} options - The isolation level and the read-only flag.
    * @param {AbortSignal} discard - Aborts to destroy the connection.
+   * @param {(phase: 'setup' | 'work' | 'commit' | 'rollback') => void} onPhase - Learns the step
+   * the transaction starts.
    * @returns {Promise<TResult>} What `work` resolved with, once committed.
    * @throws {Error} Inside a live transaction, when discarded, or when a statement fails.
    */
@@ -67,14 +116,17 @@ export class DiscardableSystemTransactions {
     work: (scope: { readonly db: TransactionDatabase }) => Promise<TResult>,
     options: TransactionOptions,
     discard: AbortSignal,
+    onPhase: (phase: 'setup' | 'work' | 'commit' | 'rollback') => void = (): void => undefined,
   ): Promise<TResult> {
     assertNoActiveTransaction();
-    const connection: PoolClient = await this.pool.connect();
-    if (discard.aborted) {
-      connection.release();
-      throw new Error('The system transaction was discarded before it began.');
-    }
-    const state: { discarded: boolean; broken: boolean } = { discarded: false, broken: false };
+    const { poolAcquireDuration, transactionDuration } = databaseMetrics();
+    const connection: PoolClient = await this.checkout(poolAcquireDuration);
+    const started: number = performance.now();
+    const state: { discarded: boolean; broken: boolean; outcome: 'success' | 'error' } = {
+      discarded: false,
+      broken: false,
+      outcome: 'error',
+    };
     // The pool removes its own error listener while a connection is checked out.
     const onConnectionError = (): void => {
       state.broken = true;
@@ -90,40 +142,75 @@ export class DiscardableSystemTransactions {
       // Destroying the transport always closes it, and pg then fails every queued statement.
       connection.connection.stream.destroy();
     };
-    connection.on('error', onConnectionError);
-    discard.addEventListener('abort', destroy, { once: true });
     try {
-      await connection.query(
-        BEGIN_STATEMENTS[options.isolationLevel ?? 'default'] +
-          (options.readOnly === true ? ' read only' : ''),
-      );
-      await connection.query('select set_config($1, $2, true), set_config($3, $4, true)', [
-        ORGANIZATION_SETTING,
-        '',
-        SYSTEM_ACCESS_SETTING,
-        'on',
-      ]);
-      const result: TResult = await work({ db: drizzle({ client: connection }) });
-      const committed = await connection.query('commit');
-      if (committed.command === 'ROLLBACK') {
-        throw new Error('The system transaction was rolled back at commit.');
+      if (discard.aborted) {
+        throw new Error('The system transaction was discarded before it began.');
       }
-      return result;
-    } catch (error: unknown) {
-      if (!state.discarded) {
-        try {
-          await connection.query('rollback');
-        } catch {
-          state.broken = true;
+      connection.on('error', onConnectionError);
+      discard.addEventListener('abort', destroy, { once: true });
+      try {
+        onPhase('setup');
+        await connection.query(
+          BEGIN_STATEMENTS[options.isolationLevel ?? 'default'] +
+            (options.readOnly === true ? ' read only' : ''),
+        );
+        await connection.query('select set_config($1, $2, true), set_config($3, $4, true)', [
+          ORGANIZATION_SETTING,
+          '',
+          SYSTEM_ACCESS_SETTING,
+          'on',
+        ]);
+        onPhase('work');
+        const result: TResult = await work({ db: drizzle({ client: connection }) });
+        onPhase('commit');
+        const committed = await connection.query('commit');
+        if (committed.command === 'ROLLBACK') {
+          throw new Error('The system transaction was rolled back at commit.');
         }
+        state.outcome = 'success';
+        return result;
+      } catch (error: unknown) {
+        if (!state.discarded) {
+          onPhase('rollback');
+          try {
+            await connection.query('rollback');
+          } catch {
+            state.broken = true;
+          }
+        }
+        throw error;
       }
-      throw error;
     } finally {
       discard.removeEventListener('abort', destroy);
+      connection.removeListener('error', onConnectionError);
       if (!state.discarded) {
-        connection.removeListener('error', onConnectionError);
         connection.release(state.broken);
       }
+      transactionDuration.record(performance.now() - started, {
+        kind: 'system',
+        outcome: state.outcome,
+      });
+    }
+  }
+
+  /**
+   * Method checkout
+   *
+   * @description
+   * Checks a connection out of the pool and records how long it took, whether it succeeded or not.
+   *
+   * @param {Histogram} poolAcquireDuration - The histogram of the acquisitions.
+   * @returns {Promise<PoolClient>} The connection, which the caller must release.
+   */
+  private async checkout(poolAcquireDuration: Histogram): Promise<PoolClient> {
+    const started: number = performance.now();
+    let outcome: 'success' | 'error' = 'error';
+    try {
+      const connection: PoolClient = await this.pool.connect();
+      outcome = 'success';
+      return connection;
+    } finally {
+      poolAcquireDuration.record(performance.now() - started, { kind: 'system', outcome });
     }
   }
   // #endregion
