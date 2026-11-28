@@ -86,7 +86,7 @@ const allTables = [...platformTables, ...businessTables].sort();
  * the logo reference and upload reservations, the billing membership index and the seat
  * entitlement projection, the sender budget ledger, and the account deletion reservation and guard.
  */
-const migrationCount = 13;
+const migrationCount = 14;
 
 /**
  * Runs `docker compose` on the throwaway project.

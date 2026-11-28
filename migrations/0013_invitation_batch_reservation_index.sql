@@ -1,0 +1,1 @@
+CREATE INDEX "invitation_batch_replays_reservation_index" ON "invitation_batch_replays" USING btree ("organization_id","expires_at") WHERE "invitation_batch_replays"."state" = 'reserved';
