@@ -3,11 +3,14 @@
  *
  * @description
  * A call of the replay purge that its deadline or the abort of its job cut short after it started,
- * so it made no progress: while it waited for a pooled connection (`checkout`), opened its
- * transaction and set its timeouts (`setup`), ran its delete (`delete`), committed (`commit`) or
- * rolled back after a failed statement (`rollback`). The transaction was discarded with its
- * connection. A tick that meets it fails, so its queue retries it with its normal backoff; a
- * deadline reached before another call starts is the normal end of a tick instead.
+ * so its outcome is not confirmed: while it waited for a pooled connection (`checkout`), opened its
+ * transaction and set its timeouts (`setup`), ran its delete (`delete`) or rolled back after a
+ * failed statement (`rollback`), it made no progress; while it committed (`commit`), the commit
+ * may have taken effect on the server without its answer coming back, so whether it deleted its
+ * rows is unknown. The transaction was discarded with its connection. A tick that meets it fails,
+ * so its queue retries it with its normal backoff, which is safe whatever the commit did: the
+ * retry deletes whatever expired rows are left. A deadline reached before another call starts is
+ * the normal end of a tick instead.
  */
 export class InvitationBatchReplayPurgeCutShortError extends Error {
   // #region Constructor

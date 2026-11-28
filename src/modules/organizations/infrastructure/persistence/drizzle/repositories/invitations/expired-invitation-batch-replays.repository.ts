@@ -94,8 +94,8 @@ export interface PurgeWindow {
  * to the commit, so a purge never outlasts its tick. When the deadline or the abort wins while the
  * call runs, its connection is destroyed on the client side, so the call given up on settles at
  * once, even on a connection stuck at the socket level, and a purge rejects with an
- * `InvitationBatchReplayPurgeCutShortError` naming the phase it stood in: it made no progress, so
- * its tick must fail and be retried. The server caps the statements too, a little later
+ * `InvitationBatchReplayPurgeCutShortError` naming the phase it stood in: its outcome is
+ * unconfirmed, so its tick must fail and be retried. The server caps the statements too, a little later
  * (`SERVER_TIMEOUT_GRACE_MS`), as the backstop of the locks a discarded transaction may hold.
  */
 export class ExpiredInvitationBatchReplays {
@@ -215,9 +215,10 @@ export class ExpiredInvitationBatchReplays {
    * rejects and the transaction settles, however stuck the socket is), and which runs no statement
    * of its own past that point (it checks before each one). Under `cutShort: 'fail'` the call then
    * rejects with an `InvitationBatchReplayPurgeCutShortError` naming the phase it stood in
-   * (`checkout`, `setup`, `delete`, `commit` or `rollback`): it made no progress, the server may
-   * have cancelled its delete, and the job must fail so its queue retries it. Under `skip` (a read)
-   * it answers `null`. The first statement sets `statement_timeout` and
+   * (`checkout`, `setup`, `delete`, `commit` or `rollback`): it is unconfirmed (a commit may have
+   * taken effect, any other phase made no progress), and the job must fail so its queue retries
+   * it, which is safe since a delete of expired rows is idempotent. Under `skip` (a read) it
+   * answers `null`. The first statement sets `statement_timeout` and
    * `idle_in_transaction_session_timeout` to the time left plus `SERVER_TIMEOUT_GRACE_MS`, the
    * server's backstop for the locks a discarded transaction may hold until it notices.
    *

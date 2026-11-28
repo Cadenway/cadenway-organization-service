@@ -216,6 +216,57 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it('keeps the phase and rethrows the original error when the backlog read fails after a cut short', async () => {
+    const { handler, expired } = setup([]);
+    const cutShort = new InvitationBatchReplayPurgeCutShortError('delete', 'deadline');
+    expired.purge.mockRejectedValueOnce(cutShort);
+    expired.oldestExpiredAgeSeconds.mockRejectedValueOnce(new Error('connection refused'));
+    const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+
+    await expect(handler.handle(system)).rejects.toBe(cutShort);
+
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      { phase: 'delete', trigger: 'deadline', deleted: 0, oldestExpiredAgeSeconds: null },
+      expect.any(String),
+    );
+  });
+
+  it('reports a commit cut short as unconfirmed, the tick still failing for a retry', async () => {
+    const { handler, expired } = setup([]);
+    const cutShort = new InvitationBatchReplayPurgeCutShortError('commit', 'abort');
+    expired.purge.mockRejectedValueOnce(cutShort);
+    const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+
+    await expect(handler.handle(system)).rejects.toBe(cutShort);
+
+    expect(error).toHaveBeenCalledWith(
+      {
+        phase: 'commit',
+        trigger: 'abort',
+        committed: 'unknown',
+        deleted: 0,
+        oldestExpiredAgeSeconds: 840,
+      },
+      expect.any(String),
+    );
+  });
+
+  it('ends a tick on its budget with a null backlog when its read fails', async () => {
+    const { handler, expired } = setup(
+      Array.from({ length: 100 }, () => 500),
+      1_200,
+    );
+    expired.oldestExpiredAgeSeconds.mockRejectedValueOnce(new Error('connection refused'));
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await handler.handle(system);
+
+    expect(warn).toHaveBeenCalledWith(
+      { deleted: 2_000, oldestExpiredAgeSeconds: null },
+      expect.any(String),
+    );
+  });
+
   it('fails the tick on any other failure of a delete, without reporting it as cut short', async () => {
     const { handler, expired } = setup([]);
     const refused = new Error('canceling statement due to statement timeout');

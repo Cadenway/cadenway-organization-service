@@ -129,14 +129,18 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   deadline reached before another delete starts (fewer than 250 ms left, or a call that answers
   `null` because the deadline or the abort came before it started) ends the tick on its budget:
   it logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the next
-  tick continues. A call cut short once started made no progress: it rejects with
+  tick continues. A call cut short once started is unconfirmed: it rejects with
   `InvitationBatchReplayPurgeCutShortError`, whose `phase` is `checkout`, `setup` (the opening
   statements and the timeouts), `delete`, `commit` or `rollback` (after a failed statement) and
-  `trigger` is `deadline` or `abort`; the tick logs them at `error`, with the rows it deleted before
-  and the backlog (read within the reserve, once the discarded call settled, else `null`), and fails
-  with that error, so the job fails and its queue retries it with its backoff (the defaults of
-  `@cadenway/nest-jobs` the migrator provisions: five retries, 30 s base delay, exponential with
-  jitter, at most one hour); meanwhile the next minute's tick still runs. Any other failure of a
+  `trigger` is `deadline` or `abort`. In every phase but `commit` it made no progress; in `commit`
+  the server may have committed without its answer coming back, so the log adds
+  `committed: 'unknown'`. The tick logs them at `error`, with `deleted`, the rows of the deletes it
+  confirmed before, and the backlog (read best effort within the reserve, once the discarded call
+  settled; `null` when it could not be read, a failed read included, which never replaces the
+  error), and fails with that error, so the job fails and its queue retries it with its backoff
+  (the defaults of `@cadenway/nest-jobs` the migrator provisions: five retries, 30 s base delay,
+  exponential with jitter, at most one hour), safe whatever an unconfirmed commit did, since the
+  retry deletes the expired rows left; meanwhile the next minute's tick still runs. Any other failure of a
   delete fails the tick the same way, without that report.
 - At most one purge call per process is in flight: the store keeps the call it gave up on until
   it settles, which the discard makes immediate, and a later call waits for it, up to its own
@@ -742,7 +746,9 @@ Any failure rolls back the business rows and the outbox rows together
   earlier revision answered `null` for a stall in the checkout or the setup, which the tick read
   as its budget spent, so a replica whose every connection stalled completed its jobs while
   expired records stayed. The phase (`checkout`, `setup`, `delete`, `commit`, `rollback`) goes to the
-  `error` log and the queue's retry and dead letter apply. The server's timeouts run 1 s past the
+  `error` log and the queue's retry and dead letter apply. A commit cut short is logged as
+  unconfirmed (`committed: 'unknown'`), not as no progress: its reply may be lost after the server
+  committed, and retrying is safe since a delete of expired rows is idempotent. The server's timeouts run 1 s past the
   client's deadline so the client always classifies the stall; a delete starts only with 250 ms
   left, so a healthy tick never fails on a deadline it reached between two deletes.
 - The discardable runner records the kit's two database histograms itself, under the kit's meter

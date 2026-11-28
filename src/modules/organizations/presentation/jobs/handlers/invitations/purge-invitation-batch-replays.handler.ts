@@ -106,10 +106,13 @@ export interface ExpiredInvitationBatchReplayPurge {
  * another delete, ends normally: it logs, at `warn`, how many rows it deleted and how old the
  * oldest expired row still is (`null` when there was no time to read it), then leaves the rest to
  * the next tick. A delete the deadline or the abort cut short once started (in its checkout, its
- * setup, its delete, its commit or its rollback) made no progress: the tick logs, at `error`, the
- * phase, what cut it short, the rows deleted before and the backlog, then fails with the store's
+ * setup, its delete, its commit or its rollback) is not confirmed: it made no progress, except one
+ * cut short in its commit, which may have committed without its answer coming back. The tick logs,
+ * at `error`, the phase, what cut it short, `committed: 'unknown'` for a commit, the rows of the
+ * deletes it confirmed before and the backlog, then fails with the store's
  * `InvitationBatchReplayPurgeCutShortError`, so the queue retries it with its backoff, as any
- * other failed tick. The store destroys the connection of a call it gives up on, so that call
+ * other failed tick: a delete of expired rows is safe to run again. The backlog is read best
+ * effort: a read that fails logs `null` and never replaces the outcome of the tick. The store destroys the connection of a call it gives up on, so that call
  * settles at once and the retry runs. As a fallback, a tick that still finds a call of an earlier
  * tick running (one waiting for a pooled connection) skips at once, logging it at `warn`, so the
  * purge never holds more than one connection.
@@ -209,14 +212,16 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
    *
    * @description
    * Passes the outcome of a delete through, logging, at `error`, a delete cut short once started,
-   * with its phase, what cut it short, the rows the tick deleted before and its backlog, before the
-   * error fails the tick.
+   * with its phase, what cut it short, whether it committed when that is unknown (a commit whose
+   * answer never came), the rows of the deletes the tick confirmed before and its backlog, before
+   * the same error fails the tick.
    *
    * @param {Promise<number | null>} purge - The delete.
    * @param {{ readonly deleted: number; readonly deadline: number; readonly signal: AbortSignal }}
-   * tick - The rows deleted so far, the end of the budget and the abort signal of the job.
+   * tick - The rows of the confirmed deletes, the end of the budget and the abort signal of the
+   * job.
    * @returns {Promise<number | null>} What the delete answered.
-   * @throws {InvitationBatchReplayPurgeCutShortError} Again, once logged.
+   * @throws {InvitationBatchReplayPurgeCutShortError} The original error, once logged.
    */
   private async cutShortReported(
     purge: Promise<number | null>,
@@ -230,10 +235,11 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
           {
             phase: error.phase,
             trigger: error.trigger,
+            ...(error.phase === 'commit' ? { committed: 'unknown' } : {}),
             deleted: tick.deleted,
             oldestExpiredAgeSeconds: await this.backlog(tick.deadline, tick.signal),
           },
-          'invitation batch replay purge cut short with no progress, the tick fails for a retry',
+          'invitation batch replay purge cut short, the tick fails for a retry',
         );
       }
       throw error;
@@ -244,18 +250,24 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
    * Method backlog
    *
    * @description
-   * The age of the oldest expired record left, read only while the budget of the tick still has
-   * time for it and the job runs.
+   * The age of the oldest expired record left, read best effort, only while the budget of the
+   * tick still has time for it and the job runs: it only feeds a log line, so a read that fails
+   * (a connection refused, say) answers `null` and never changes how the tick ends.
    *
    * @param {number} deadline - The end of the budget, on `now`.
    * @param {AbortSignal} signal - The abort signal of the job.
-   * @returns {Promise<number | null>} The age in seconds, or `null` when it was not read or there
-   * is none.
+   * @returns {Promise<number | null>} The age in seconds, or `null` when it was not read, failed or
+   * there is none.
    */
   private async backlog(deadline: number, signal: AbortSignal): Promise<number | null> {
-    return deadline - this.now() > 0 && !signal.aborted
-      ? this.expired.oldestExpiredAgeSeconds({ deadline, signal })
-      : null;
+    if (deadline - this.now() <= 0 || signal.aborted) {
+      return null;
+    }
+    try {
+      return await this.expired.oldestExpiredAgeSeconds({ deadline, signal });
+    } catch {
+      return null;
+    }
   }
   // #endregion
 }
