@@ -8,12 +8,19 @@ import type {
   InvitationBatchResult,
   InvitationState,
 } from '@cadenway/contracts/types/internal/organization-service';
+import { SystemTransactionRunner } from '@cadenway/nest-common/database';
+import { JobScheduler } from '@cadenway/nest-jobs/runtime';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type pg from 'pg';
 import request from 'supertest';
 import type { Response, Test } from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
+import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
+import { InvitationBatchRequest } from '../src/modules/organizations/domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import { ExpiredInvitationBatchReplays } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
+import { PurgeInvitationBatchReplaysHandler } from '../src/modules/organizations/presentation/jobs/handlers/invitations/purge-invitation-batch-replays.handler.js';
 import { DeclaredErrors } from './support/declared-errors.js';
 import type { SeenError } from './support/declared-errors.js';
 import { newId, ServiceStack } from './support/service-stack.js';
@@ -186,21 +193,50 @@ describe('idempotent invitation batches and the invitation state', () => {
   }
 
   /**
-   * The advisory lock name the service takes for a scoped key.
+   * The SHA-256 digest, in hexadecimal, the service stores and locks under.
+   *
+   * @param value - The key or the canonical batch.
+   * @returns The digest.
+   */
+  function digestOf(value: string): string {
+    return createHash('sha256').update(value, 'utf8').digest('hex');
+  }
+
+  /**
+   * The canonical form of a `member` batch, as the domain defines the equivalence.
+   *
+   * @param emails - The addresses, as sent.
+   * @returns The canonical form.
+   */
+  function canonicalOf(emails: readonly string[]): string {
+    return InvitationBatchRequest.of(distinctAddresses(emails), 'member').canonical;
+  }
+
+  /**
+   * The advisory lock name the service takes for a scoped key and a `member` batch.
    *
    * @param organizationId - The organization.
    * @param account - The actor.
    * @param key - The key.
+   * @param emails - The addresses of the batch.
    * @returns The lock name.
    */
-  function lockName(organizationId: string, account: Account, key: string): string {
-    const digest: string = createHash('sha256').update(key, 'utf8').digest('hex');
-    return `invitation-batch:${organizationId}:${account.id}:${digest}`;
+  function lockName(
+    organizationId: string,
+    account: Account,
+    key: string,
+    emails: readonly string[],
+  ): string {
+    return `invitation-batch:${organizationId}:${account.id}:${digestOf(key)}:${digestOf(canonicalOf(emails))}`;
   }
 
   beforeAll(async () => {
     stack = await ServiceStack.start('invitation-idempotency');
     app = await stack.startApplication();
+    // The purge runs when the tests call it, never on its minute schedule in between.
+    await app
+      .get(JobScheduler)
+      .unschedule(PURGE_INVITATION_BATCH_REPLAYS_QUEUE, { key: 'minutely' });
     await stack.system(
       `insert into directory_users (user_id, name, email, email_verified, email_version)
        values ($1, 'Camille Martin', $2, true, 1), ($3, 'Inès Robert', $4, true, 1),
@@ -294,11 +330,11 @@ describe('idempotent invitation batches and the invitation state', () => {
         const [backend] = (
           await holder.query<{ pid: number }>(
             'select pg_backend_pid() as pid, pg_advisory_xact_lock(hashtextextended($1, 0))',
-            [lockName(atelierNordId, ines, busy)],
+            [lockName(atelierNordId, ines, busy, ['nina@ateliernord.fr'])],
           )
         ).rows;
 
-        const running: Response = await invite(ines, atelierNordId, busy, ['nina@ateliernord.fr']);
+        const running: Response = await invite(ines, atelierNordId, busy, ['Nina@AtelierNord.fr']);
         expect(running.status).toBe(409);
         expect(running.body).toMatchObject({ code: 'idempotency.request-in-progress' });
         expect(await effects(atelierNordId)).toMatchObject({ invitations: 2, replays: 1 });
@@ -313,6 +349,99 @@ describe('idempotent invitation batches and the invitation state', () => {
       const freed: Response = await invite(ines, atelierNordId, busy, ['nina@ateliernord.fr']);
       expect(freed.status).toBe(200);
       expect((freed.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
+    });
+
+    it('lets another batch under a key run while an equivalent one is in flight, then refuses the latter', async () => {
+      const holder: pg.PoolClient = await stack.migrator.connect();
+      const shared = 'members-page-batch-shared';
+      try {
+        await holder.query('begin');
+        await holder.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          lockName(atelierNordId, ines, shared, ['pia@ateliernord.fr']),
+        ]);
+
+        const other: Response = await invite(ines, atelierNordId, shared, ['olga@ateliernord.fr']);
+        expect(other.status).toBe(200);
+        expect((other.body as InvitationBatchResult).invitations[0]?.outcome).toBe('invited');
+        await holder.query('rollback');
+      } finally {
+        holder.release();
+      }
+
+      const late: Response = await invite(ines, atelierNordId, shared, ['pia@ateliernord.fr']);
+      expect(late.status).toBe(422);
+      expect(late.body).toMatchObject({ code: 'idempotency.key-reused' });
+    });
+
+    it('replays a committed batch to concurrent retries, never answering 409', async () => {
+      const committed = 'members-page-batch-committed';
+      const emails: readonly string[] = ['ilan@ateliernord.fr', 'jade@ateliernord.fr'];
+      const original: Response = await invite(ines, atelierNordId, committed, emails);
+      expect(original.status).toBe(200);
+      const before: Record<string, number> = await effects(atelierNordId);
+
+      const retries: Response[] = await Promise.all(
+        Array.from({ length: 4 }, () => invite(ines, atelierNordId, committed, emails)),
+      );
+      const different: Response[] = await Promise.all(
+        Array.from({ length: 2 }, () =>
+          invite(ines, atelierNordId, committed, ['kim@ateliernord.fr']),
+        ),
+      );
+
+      expect(retries.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+      for (const response of retries) {
+        expect(response.body).toEqual(original.body);
+      }
+      expect(different.map((response) => response.status)).toEqual([422, 422]);
+      expect(await effects(atelierNordId)).toEqual(before);
+    });
+
+    it('lets one of two concurrent different batches under a key commit, and refuses the other', async () => {
+      const contested = 'members-page-batch-contested';
+      const before: Record<string, number> = await effects(atelierNordId);
+
+      const [left, right] = await Promise.all([
+        invite(ines, atelierNordId, contested, ['leo@ateliernord.fr']),
+        invite(ines, atelierNordId, contested, ['mia@ateliernord.fr']),
+      ]);
+
+      const statuses: number[] = [left.status, right.status].sort();
+      expect(statuses).toEqual([200, 422]);
+      const refused: Response = left.status === 422 ? left : right;
+      expect(refused.body).toMatchObject({ code: 'idempotency.key-reused' });
+      expect(await effects(atelierNordId)).toEqual({
+        invitations: (before.invitations ?? 0) + 1,
+        emails: (before.emails ?? 0) + 1,
+        events: (before.events ?? 0) + 1,
+        replays: (before.replays ?? 0) + 1,
+      });
+    });
+
+    it('keeps a fingerprint of the batch, never its addresses, beside the body to replay', async () => {
+      const rows = await stack.system<{ columns: string[] }>(
+        `select array_agg(column_name::text order by ordinal_position) as columns
+         from information_schema.columns where table_name = 'invitation_batch_replays'`,
+      );
+      const [stored] = await stack.system<{ request_digest: string; outcome: unknown }>(
+        `select request_digest, outcome from invitation_batch_replays
+         where organization_id = $1 and actor_user_id = $2 and key_digest = $3`,
+        [atelierNordId, ines.id, digestOf(key)],
+      );
+
+      expect(rows[0]?.columns).toEqual([
+        'organization_id',
+        'actor_user_id',
+        'key_digest',
+        'request_digest',
+        'outcome',
+        'expires_at',
+        'created_at',
+      ]);
+      expect(stored?.request_digest).toBe(
+        digestOf(canonicalOf(['paul.lefevre@ateliernord.fr', 'sarah.morel@ateliernord.fr'])),
+      );
+      expect(stored?.outcome).toEqual(first.invitations);
     });
 
     it('applies two concurrent requests with the same key once', async () => {
@@ -485,6 +614,81 @@ describe('idempotent invitation batches and the invitation state', () => {
       ]);
       expect(malformed.status).toBe(400);
       expect(malformed.body).toMatchObject({ code: 'request.invalid' });
+    });
+  });
+
+  describe('purge of the expired replay records', () => {
+    const sweeper: string = newId();
+
+    /**
+     * Inserts expired replay records of an organization for an actor of no batch.
+     *
+     * @param organizationId - The organization.
+     * @param count - How many.
+     * @param prefix - What tells their keys from the others.
+     */
+    async function expired(organizationId: string, count: number, prefix: string): Promise<void> {
+      await stack.system(
+        `insert into invitation_batch_replays
+           (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
+         select $1, $2, encode(sha256(convert_to($3 || g, 'UTF8')), 'hex'), repeat('a', 64),
+                '[]'::jsonb, now() - make_interval(hours => 1, mins => g)
+         from generate_series(1, $4::int) as g`,
+        [organizationId, sweeper, prefix, count],
+      );
+    }
+
+    /**
+     * Counts the replay records of the actor of no batch.
+     *
+     * @param organizationId - The organization.
+     * @returns The count.
+     */
+    function swept(organizationId: string): Promise<number> {
+      return count(
+        `select count(*)::int as count from invitation_batch_replays
+         where organization_id = $1 and actor_user_id = '${sweeper}'`,
+        organizationId,
+      );
+    }
+
+    it('deletes a bounded number of expired records of the organization at each keyed batch', async () => {
+      await expired(atelierNordId, 15, 'inline-');
+
+      const batch: Response = await invite(ines, atelierNordId, 'members-page-batch-purge', [
+        'theo@ateliernord.fr',
+      ]);
+
+      expect(batch.status).toBe(200);
+      expect(await swept(atelierNordId)).toBe(5);
+    });
+
+    it('deletes expired records of every organization in bounded batches, independently of their traffic', async () => {
+      await expired(lumenId, 7, 'job-');
+      const live: number = await count(
+        `select count(*)::int as count from invitation_batch_replays
+         where organization_id = $1 and expires_at > now()`,
+        atelierNordId,
+      );
+
+      const deleted: number = await new ExpiredInvitationBatchReplays(
+        app.get(SystemTransactionRunner),
+      ).purge(3);
+      expect(deleted).toBe(3);
+      expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(9);
+
+      await app
+        .get(PurgeInvitationBatchReplaysHandler)
+        .handle({ organizationId: null, signal: new AbortController().signal });
+      expect(await swept(atelierNordId)).toBe(0);
+      expect(await swept(lumenId)).toBe(0);
+      expect(
+        await count(
+          `select count(*)::int as count from invitation_batch_replays
+           where organization_id = $1 and expires_at > now()`,
+          atelierNordId,
+        ),
+      ).toBe(live);
     });
   });
 

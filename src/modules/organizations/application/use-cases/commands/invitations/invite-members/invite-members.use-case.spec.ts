@@ -336,6 +336,23 @@ describe('InviteMembers with an Idempotency-Key', () => {
     expect(replayed.invitations[0]?.outcome).toBe('invited');
   });
 
+  it('replays a committed batch to concurrent retries without making them wait or contend', async () => {
+    const first: InviteMembersOutput = await invite.execute(keyed(['marc.roux@ateliernord.fr']));
+
+    const retries = await Promise.allSettled([
+      invite.execute(keyed(['marc.roux@ateliernord.fr'])),
+      invite.execute(keyed(['MARC.ROUX@ateliernord.fr'])),
+      invite.execute(keyed(['lucie@exemple.fr'])),
+    ]);
+
+    expect(retries).toMatchObject([
+      { status: 'fulfilled', value: first },
+      { status: 'fulfilled', value: first },
+      { status: 'rejected', reason: { refusal: { reason: 'idempotency-key-reused' } } },
+    ]);
+    expect(scenario.store.eventsNamed('invitation.issued.v1')).toHaveLength(1);
+  });
+
   it('commits nothing when the replay record fails, and lets the key run again', async () => {
     const invitations: number = scenario.store.tables.invitations.size;
     scenario.store.failReplayRecords = true;

@@ -107,6 +107,16 @@ describe('GetInvitation', () => {
     ).resolves.toMatchObject({ status: 'revoked', answeredAt: null, revokedAt });
   });
 
+  it('reads the role of the actor and the invitation in one read-only snapshot', async () => {
+    const before: number = scenario.store.requestOptions.length;
+
+    await read.execute({ ...owner, invitationId });
+
+    expect(scenario.store.requestOptions.slice(before)).toEqual([
+      { readOnly: true, isolationLevel: 'repeatable read' },
+    ]);
+  });
+
   it('lets the owner and the admins read it, and no other member', async () => {
     await expect(
       read.execute({ ...owner, actorUserId: INES.id, invitationId }),

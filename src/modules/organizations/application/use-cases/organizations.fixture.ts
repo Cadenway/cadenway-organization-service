@@ -9,8 +9,7 @@ import { FREE_SEAT_ENTITLEMENT } from '../../domain/value-objects/billing/seat-e
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
-import { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
-import type { InvitationBatchRequestState } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import type { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
@@ -24,10 +23,12 @@ import type { InvitationBatchReplayKey } from '../models/invitations/invitation-
 import type { InvitationBatchReplay } from '../models/invitations/invitation-batch-replay.model.js';
 import type { InvitationMail } from '../models/invitations/invitation-mail.model.js';
 import type { InvitationWithInviter } from '../models/invitations/invitation-with-inviter.model.js';
+import type { StoredInvitationBatch } from '../models/invitations/stored-invitation-batch.model.js';
 import type { MemberFilters } from '../models/members/member-filters.model.js';
 import type { Page } from '../models/pagination/page.model.js';
 import type { PagePosition } from '../models/pagination/page-position.model.js';
 import type { OrganizationsStore } from '../models/transactions/organizations-store.model.js';
+import type { UnitOfWorkOptions } from '../models/transactions/unit-of-work-options.model.js';
 import type { Clock } from '../ports/outbound/time/organizations/clock.port.js';
 import type { VerifiedEmailAuthority } from '../ports/outbound/identity/invitations/verified-email-authority.port.js';
 import type { OrganizationsUnitOfWork } from '../ports/outbound/transactions/organizations/organizations-unit-of-work.port.js';
@@ -69,8 +70,8 @@ interface StoredReplay {
   /** The organization of the key. */
   readonly organizationId: string;
 
-  /** The canonical batch. */
-  readonly request: InvitationBatchRequestState;
+  /** The canonical form of the batch, standing for its fingerprint. */
+  readonly request: string;
 
   /** The outcome replayed. */
   readonly invitations: readonly InvitationOutcome[];
@@ -168,6 +169,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
     events: [],
   };
 
+  /** How each tenant transaction of a request was asked to open, in order. */
+  public readonly requestOptions: UnitOfWorkOptions[] = [];
+
   /** Makes every replay record fail, as a database failure after the invitations would. */
   public failReplayRecords: boolean = false;
 
@@ -192,7 +196,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
   /** Runs the work on a copy of the data, committed when it resolves. */
   public runInRequestOrganization<TResult>(
     work: (store: OrganizationsStore) => Promise<TResult>,
+    options: UnitOfWorkOptions = {},
   ): Promise<TResult> {
+    this.requestOptions.push(options);
     return this.run(work);
   }
 
@@ -619,8 +625,11 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
         },
       },
       invitationBatchReplays: {
-        tryClaim: (key: InvitationBatchReplayKey): Promise<boolean> => {
-          const claim: string = replayKeyOf(key);
+        tryClaim: (
+          key: InvitationBatchReplayKey,
+          request: InvitationBatchRequest,
+        ): Promise<boolean> => {
+          const claim: string = JSON.stringify([replayKeyOf(key), request.canonical]);
           if (this.claimedReplayKeys.has(claim)) {
             return Promise.resolve(false);
           }
@@ -630,14 +639,17 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
         },
         findLive: (
           key: InvitationBatchReplayKey,
+          request: InvitationBatchRequest,
           now: Date,
-        ): Promise<InvitationBatchReplay | null> => {
-          const stored: StoredReplay | undefined = tables.replays.get(replayKeyOf(key));
+        ): Promise<StoredInvitationBatch | null> => {
+          // A read of PostgreSQL under READ COMMITTED sees what other runs committed meanwhile.
+          const stored: StoredReplay | undefined =
+            tables.replays.get(replayKeyOf(key)) ?? this.tables.replays.get(replayKeyOf(key));
           return Promise.resolve(
             stored === undefined || stored.expiresAt.getTime() <= now.getTime()
               ? null
               : {
-                  request: InvitationBatchRequest.restore(stored.request),
+                  sameRequest: stored.request === request.canonical,
                   invitations: stored.invitations,
                 },
           );
@@ -650,21 +662,26 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           if (this.failReplayRecords) {
             return Promise.reject(new Error('The replay record could not be written.'));
           }
-          for (const [stored, entry] of tables.replays) {
-            if (
-              entry.organizationId === key.organizationId &&
-              entry.expiresAt.getTime() <= window.now.getTime()
-            ) {
-              tables.replays.delete(stored);
-            }
-          }
           const claim: string = replayKeyOf(key);
-          if (tables.replays.has(claim)) {
+          const expired = (entry: StoredReplay | undefined): boolean =>
+            entry !== undefined && entry.expiresAt.getTime() <= window.now.getTime();
+          if (expired(tables.replays.get(claim))) {
+            tables.replays.delete(claim);
+          }
+          const others: string[] = [...tables.replays]
+            .filter(([, entry]) => entry.organizationId === key.organizationId && expired(entry))
+            .map(([stored]) => stored)
+            .slice(0, 10);
+          for (const stored of others) {
+            tables.replays.delete(stored);
+          }
+          const committed: StoredReplay | undefined = this.tables.replays.get(claim);
+          if (tables.replays.has(claim) || (committed !== undefined && !expired(committed))) {
             return Promise.resolve(false);
           }
           tables.replays.set(claim, {
             organizationId: key.organizationId,
-            request: replay.request.snapshot,
+            request: replay.request.canonical,
             invitations: replay.invitations,
             expiresAt: window.expiresAt,
           });

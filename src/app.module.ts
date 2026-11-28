@@ -39,7 +39,8 @@ import { PlatformModule } from './modules/platform/platform.module.js';
  * - `OutboxModule`: the outbox writer, the PostgreSQL deduplicator and the relay, which polls
  *   `outbox_events` every second in a system transaction and publishes the pending rows. It runs in
  *   every replica; `for update skip locked` keeps two of them from publishing the same row.
- * - `JobsRuntimeModule`: the scheduler and worker for expired logo upload reservations, using
+ * - `JobsRuntimeModule`: the scheduler and worker for expired logo upload reservations and the
+ *   purge of expired invitation batch replay records, using
  *   the application's database role and two connections per replica. The migration entry point
  *   provisions the jobs schema and queues before the service starts.
  * - `HealthModule`: `GET /health/live` answers as soon as the process runs; `GET /health/ready`

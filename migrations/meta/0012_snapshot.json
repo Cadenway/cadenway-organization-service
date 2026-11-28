@@ -1,5 +1,5 @@
 {
-  "id": "878be921-9c60-4416-96f2-6fd80179ed16",
+  "id": "69e18ed6-8495-471d-bbb5-6c08e77d5e64",
   "prevId": "f773857d-fa48-47f9-9479-3af75a11c3a6",
   "version": "7",
   "dialect": "postgresql",
@@ -247,9 +247,9 @@
           "primaryKey": false,
           "notNull": true
         },
-        "request": {
-          "name": "request",
-          "type": "jsonb",
+        "request_digest": {
+          "name": "request_digest",
+          "type": "text",
           "primaryKey": false,
           "notNull": true
         },
@@ -283,6 +283,21 @@
               "asc": true,
               "nulls": "last"
             },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "invitation_batch_replays_expiry_index": {
+          "name": "invitation_batch_replays_expiry_index",
+          "columns": [
             {
               "expression": "expires_at",
               "isExpression": false,
@@ -338,6 +353,10 @@
         "invitation_batch_replays_key_digest_check": {
           "name": "invitation_batch_replays_key_digest_check",
           "value": "\"invitation_batch_replays\".\"key_digest\" ~ '^[0-9a-f]{64}$'"
+        },
+        "invitation_batch_replays_request_digest_check": {
+          "name": "invitation_batch_replays_request_digest_check",
+          "value": "\"invitation_batch_replays\".\"request_digest\" ~ '^[0-9a-f]{64}$'"
         }
       },
       "isRLSEnabled": false

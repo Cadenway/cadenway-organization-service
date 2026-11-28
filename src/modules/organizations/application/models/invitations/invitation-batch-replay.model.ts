@@ -5,8 +5,8 @@ import type { InvitationOutcome } from '../../projections/invitations/invitation
  * Interface InvitationBatchReplay
  *
  * @description
- * A committed invitation batch kept for its `Idempotency-Key`: the batch it answered and its `200`
- * outcome, replayed as is. Only a `200` is ever kept.
+ * A committed invitation batch to keep for its `Idempotency-Key`: the batch it answered, kept as a
+ * fingerprint only, and its `200` outcome, replayed as is. Only a `200` is ever kept.
  */
 export interface InvitationBatchReplay {
   // #region Properties
@@ -14,7 +14,7 @@ export interface InvitationBatchReplay {
    * Property request
    *
    * @description
-   * The canonical batch the key committed.
+   * The batch the key commits.
    *
    * @type {InvitationBatchRequest}
    * @readonly
@@ -25,7 +25,7 @@ export interface InvitationBatchReplay {
    * Property invitations
    *
    * @description
-   * The outcome of each distinct address, as first answered.
+   * The outcome of each distinct address.
    *
    * @type {readonly InvitationOutcome[]}
    * @readonly

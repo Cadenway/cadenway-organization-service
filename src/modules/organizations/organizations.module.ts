@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 
 import { subscriptionChangedHandlerProvider } from './composition/providers/adapters/billing/subscription-changed-handler.provider.js';
+import { purgeInvitationBatchReplaysHandlerProvider } from './composition/providers/adapters/invitations/purge-invitation-batch-replays-handler.provider.js';
 import { expireOrganizationLogoUploadsHandlerProvider } from './composition/providers/adapters/logo/expire-organization-logo-uploads-handler.provider.js';
 import { clockProvider } from './composition/providers/adapters/organizations/clock.provider.js';
 import { verifiedEmailAuthorityProvider } from './composition/providers/adapters/invitations/verified-email-authority.provider.js';
@@ -85,6 +86,7 @@ import { UserTwoStepVerificationChangedHandler } from './presentation/messaging/
     applySeatEntitlementProvider,
     checkAutomationRecipientProvider,
     expireOrganizationLogoUploadsHandlerProvider,
+    purgeInvitationBatchReplaysHandlerProvider,
     createOrganizationProvider,
     updateOrganizationProvider,
     getCurrentOrganizationProvider,

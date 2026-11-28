@@ -1,12 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { InvitationBatchKeyReusedError } from '../../errors/invitations/invitation-batch-key-reused.error.js';
 import { InvitationBatchRequest } from '../../value-objects/invitations/invitation-batch-request.value-object.js';
 import { distinctAddresses } from './invitation-batch.policy.js';
-import {
-  assertSameInvitationBatch,
-  invitationBatchReplayExpiresAt,
-} from './invitation-batch-replay.policy.js';
+import { invitationBatchReplayExpiresAt } from './invitation-batch-replay.policy.js';
 
 /**
  * The request of a batch as the route receives it.
@@ -28,19 +24,16 @@ describe('invitation batch replay', () => {
       ['marc.roux@ateliernord.fr', 'lucie@exemple.fr'],
       'member',
     );
+    const again: InvitationBatchRequest = batch(
+      [' Marc.Roux@AtelierNord.fr', 'lucie@exemple.fr', 'LUCIE@exemple.fr'],
+      'member',
+    );
 
-    expect(() => {
-      assertSameInvitationBatch(
-        sent,
-        batch([' Marc.Roux@AtelierNord.fr', 'lucie@exemple.fr', 'LUCIE@exemple.fr'], 'member'),
-      );
-    }).not.toThrow();
-    expect(() => {
-      assertSameInvitationBatch(InvitationBatchRequest.restore(sent.snapshot), sent);
-    }).not.toThrow();
+    expect(again.equals(sent)).toBe(true);
+    expect(again.canonical).toBe(sent.canonical);
   });
 
-  it('refuses another order, another address or another role under the same key', () => {
+  it('tells another order, another address or another role from the batch', () => {
     const sent: InvitationBatchRequest = batch(
       ['marc.roux@ateliernord.fr', 'lucie@exemple.fr'],
       'member',
@@ -52,10 +45,15 @@ describe('invitation batch replay', () => {
       batch(['marc.roux@ateliernord.fr', 'lucie@exemple.fr', 'hugo@exemple.fr'], 'member'),
       batch(['marc.roux@ateliernord.fr', 'lucie@exemple.fr'], 'guest'),
     ]) {
-      expect(() => {
-        assertSameInvitationBatch(sent, other);
-      }).toThrow(InvitationBatchKeyReusedError);
+      expect(other.equals(sent)).toBe(false);
+      expect(other.canonical).not.toBe(sent.canonical);
     }
+  });
+
+  it('writes the role, then each distinct address, as one JSON array', () => {
+    expect(batch(['A@exemple.fr', 'b@exemple.fr', 'a@exemple.fr'], 'member').canonical).toBe(
+      '["member","a@exemple.fr","b@exemple.fr"]',
+    );
   });
 
   it('replays a committed batch for 24 hours', () => {

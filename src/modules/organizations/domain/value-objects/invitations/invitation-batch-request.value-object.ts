@@ -2,39 +2,6 @@ import type { EmailAddress } from '../email/email-address.value-object.js';
 import type { AssignableRole } from '../members/assignable-role.value-object.js';
 
 /**
- * Interface InvitationBatchRequestState
- *
- * @description
- * The canonical form of an invitation batch: its distinct addresses, trimmed and lowercased, in
- * the order of their first appearance, and its role.
- */
-export interface InvitationBatchRequestState {
-  // #region Properties
-  /**
-   * Property emails
-   *
-   * @description
-   * The distinct addresses, in order.
-   *
-   * @type {readonly string[]}
-   * @readonly
-   */
-  readonly emails: readonly string[];
-
-  /**
-   * Property role
-   *
-   * @description
-   * The role of every address of the batch.
-   *
-   * @type {AssignableRole}
-   * @readonly
-   */
-  readonly role: AssignableRole;
-  // #endregion
-}
-
-/**
  * Class InvitationBatchRequest
  *
  * @description
@@ -47,27 +14,17 @@ export interface InvitationBatchRequestState {
 export class InvitationBatchRequest {
   // #region Properties
   /**
-   * Property state
+   * Property canonical
    *
    * @description
-   * The canonical form.
+   * The canonical form of the batch, one string per equivalence class: the role, then the distinct
+   * addresses, trimmed and lowercased, in order, as a JSON array. Persistence keeps a digest of it,
+   * never the string itself.
    *
-   * @type {InvitationBatchRequestState}
+   * @type {string}
    * @readonly
    */
-  private readonly state: InvitationBatchRequestState;
-
-  /**
-   * Property snapshot
-   *
-   * @description
-   * The canonical form, to store with a replay.
-   *
-   * @type {InvitationBatchRequestState}
-   */
-  public get snapshot(): InvitationBatchRequestState {
-    return this.state;
-  }
+  public readonly canonical: string;
   // #endregion
 
   // #region Constructor
@@ -75,13 +32,13 @@ export class InvitationBatchRequest {
    * Constructor
    *
    * @description
-   * Keeps a copy of a canonical form.
+   * Keeps the canonical form.
    *
-   * @param {InvitationBatchRequestState} state - The canonical form.
+   * @param {string} canonical - The canonical form.
    * @constructor
    */
-  private constructor(state: InvitationBatchRequestState) {
-    this.state = { emails: [...state.emails], role: state.role };
+  private constructor(canonical: string) {
+    this.canonical = canonical;
   }
   // #endregion
 
@@ -100,23 +57,9 @@ export class InvitationBatchRequest {
     addresses: readonly EmailAddress[],
     role: AssignableRole,
   ): InvitationBatchRequest {
-    return new InvitationBatchRequest({
-      emails: addresses.map((address: EmailAddress): string => address.value),
-      role,
-    });
-  }
-
-  /**
-   * Method restore
-   *
-   * @description
-   * The request a stored replay was committed for.
-   *
-   * @param {InvitationBatchRequestState} state - The stored canonical form.
-   * @returns {InvitationBatchRequest} The request.
-   */
-  public static restore(state: InvitationBatchRequestState): InvitationBatchRequest {
-    return new InvitationBatchRequest(state);
+    return new InvitationBatchRequest(
+      JSON.stringify([role, ...addresses.map((address: EmailAddress): string => address.value)]),
+    );
   }
 
   /**
@@ -129,13 +72,7 @@ export class InvitationBatchRequest {
    * @returns {boolean} `true` when equivalent.
    */
   public equals(other: InvitationBatchRequest): boolean {
-    return (
-      this.state.role === other.state.role &&
-      this.state.emails.length === other.state.emails.length &&
-      this.state.emails.every(
-        (email: string, index: number): boolean => email === other.state.emails[index],
-      )
-    );
+    return this.canonical === other.canonical;
   }
   // #endregion
 }

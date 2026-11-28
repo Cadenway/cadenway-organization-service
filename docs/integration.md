@@ -56,6 +56,13 @@ These skills fix the engineering standards this service follows. They are target
 
 The `cadenway-api-contracts` repository owns HTTP and event specifications. Consumers use published `@cadenway/contracts` packages and `@cadenway/nest-messaging`; do not redefine payloads or connect to another service's database. Change contracts first, then the producing service, followed by gateways and listeners, and finally the webapp. Planned event names on this page must be checked against the actual published specification before use.
 
+Idempotent invitation batches (`Idempotency-Key` on `inviteMembers`, `@cadenway/contracts` 0.45.0)
+need one more ordering rule, since a release of this service before it ignores the key and a
+keyed retry would run again: deploy this service first; the gateway forwards keys only after,
+behind its own configuration switch; to roll this service back below that release, turn the
+gateway's switch off first. The service exposes no version or capability signal the gateway could
+check. See "Rollout and rollback of idempotent batches" in `src/modules/organizations/MODULE.md`.
+
 ## References
 
 [Interactive mockup](https://claude.ai/artifact/KYRM7AnsYLiBLBLKy8i4HE), [integration guide](https://claude.ai/artifact/CpJHVCiFfF9j3KbHQ2S1Et), and [repositories and packages](https://claude.ai/artifact/BPinmYxoF3mbK8w9BMB43N). Use [AGENTS.md](../AGENTS.md) as the local source for ownership and hard limits.

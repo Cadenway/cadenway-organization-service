@@ -6,18 +6,16 @@ import {
   assertInvitationBatchAvailable,
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
-import {
-  assertSameInvitationBatch,
-  invitationBatchReplayExpiresAt,
-} from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
+import { InvitationBatchKeyReusedError } from '../../../../../domain/errors/invitations/invitation-batch-key-reused.error.js';
+import { invitationBatchReplayExpiresAt } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationEmailUsage } from '../../../../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import { toOrganizationRefusal } from '../../../../mappers/refusals/organization-refusal.mapper.js';
 import type { InvitationBatchReplayKey } from '../../../../models/invitations/invitation-batch-replay-key.model.js';
-import type { InvitationBatchReplay } from '../../../../models/invitations/invitation-batch-replay.model.js';
 import type { InvitationMail } from '../../../../models/invitations/invitation-mail.model.js';
+import type { StoredInvitationBatch } from '../../../../models/invitations/stored-invitation-batch.model.js';
 import { OrganizationRefusal } from '../../../../models/refusals/organization-refusal.model.js';
 import type { OrganizationsStore } from '../../../../models/transactions/organizations-store.model.js';
 import type { Clock } from '../../../../ports/outbound/time/organizations/clock.port.js';
@@ -80,14 +78,14 @@ interface PlannedAddress {
  * refused.
  *
  * With an `Idempotency-Key` (scoped to the organization, the actor and this operation), the
- * authorization and the organization are checked first, as for a fresh batch, then the key is
- * claimed for the transaction without waiting (`idempotency-request-in-progress` while another
- * transaction holds it). A record still live is replayed for an equivalent batch once the actor's
- * role is checked again under a share lock, without locking the allowances, writing, sending or
- * emitting; another batch is refused (`idempotency-key-reused`). Otherwise the batch runs as without
- * a key and its outcome is recorded last, in the same transaction: the invitations, their ledger
- * entries, their `invitation.issued.v1` and the record commit together, and a refusal (a 429
- * included) or a failure records nothing.
+ * authorization and the organization are checked first, as for a fresh batch. A committed record
+ * still live is then replayed for an equivalent batch once the actor's role is checked again under
+ * a share lock, without locking the allowances, writing, sending or emitting; another batch is
+ * refused (`idempotency-key-reused`). Without a record, the key and the batch are claimed for the
+ * transaction without waiting (`idempotency-request-in-progress` while an equivalent batch runs
+ * with the key), and the batch runs as without a key and records its outcome last, in the same
+ * transaction: the invitations, their ledger entries, their `invitation.issued.v1` and the record
+ * commit together, and a refusal (a 429 included) or a failure records nothing.
  */
 export class InviteMembers {
   // #region Properties
@@ -171,32 +169,9 @@ export class InviteMembers {
           if (organization === null) {
             throw new OrganizationRefusal({ reason: 'organization-not-found' });
           }
-          if (key === null) {
-            return InviteMembers.issue(store, input, { organization, addresses, now });
-          }
-          const replayed: InviteMembersOutput | null = await InviteMembers.replay(
-            store,
-            key,
-            request,
-            now,
-          );
-          if (replayed !== null) {
-            return replayed;
-          }
-          const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
-            organization,
-            addresses,
-            now,
-          });
-          const recorded: boolean = await store.invitationBatchReplays.record(
-            key,
-            { request, invitations: output.invitations },
-            { now, expiresAt: invitationBatchReplayExpiresAt(now) },
-          );
-          if (!recorded) {
-            throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
-          }
-          return output;
+          return key === null
+            ? InviteMembers.issue(store, input, { organization, addresses, now })
+            : InviteMembers.keyed(store, input, { key, request, organization, addresses, now });
         },
       );
     } catch (error) {
@@ -205,36 +180,99 @@ export class InviteMembers {
   }
 
   /**
+   * Method keyed
+   *
+   * @description
+   * Runs a keyed batch. A committed live record is resolved first, without any lock, so retries of
+   * a committed batch all replay (or answer `idempotency-key-reused`) and never contend. Otherwise
+   * the key and the batch are claimed without waiting, the record is read again (a batch with the
+   * same key may have committed in between), and the batch runs and records its outcome last. A
+   * record that another transaction committed first for the key can only be of another batch, since
+   * an equivalent one holds the same claim: that answers `idempotency-key-reused` and rolls back.
+   *
+   * @param {OrganizationsStore} store - The store of the transaction.
+   * @param {InviteMembersInput} input - The batch.
+   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest;
+   * readonly organization: Organization; readonly addresses: readonly EmailAddress[];
+   * readonly now: Date }} batch - The scoped key, the canonical batch, the organization, the
+   * distinct addresses and the instant.
+   * @returns {Promise<InviteMembersOutput>} The outcome, replayed or fresh.
+   * @throws {OrganizationRefusal} `idempotency-request-in-progress`, `role-forbidden`,
+   * `organization-not-found` or `invitation-daily-limit-reached`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not equivalent to the recorded one.
+   */
+  private static async keyed(
+    store: OrganizationsStore,
+    input: InviteMembersInput,
+    batch: {
+      readonly key: InvitationBatchReplayKey;
+      readonly request: InvitationBatchRequest;
+      readonly organization: Organization;
+      readonly addresses: readonly EmailAddress[];
+      readonly now: Date;
+    },
+  ): Promise<InviteMembersOutput> {
+    const { key, request, organization, addresses, now } = batch;
+    const committed: InviteMembersOutput | null = await InviteMembers.replay(store, batch);
+    if (committed !== null) {
+      return committed;
+    }
+    if (!(await store.invitationBatchReplays.tryClaim(key, request))) {
+      throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
+    }
+    const meanwhile: InviteMembersOutput | null = await InviteMembers.replay(store, batch);
+    if (meanwhile !== null) {
+      return meanwhile;
+    }
+    const output: InviteMembersOutput = await InviteMembers.issue(store, input, {
+      organization,
+      addresses,
+      now,
+    });
+    const recorded: boolean = await store.invitationBatchReplays.record(
+      key,
+      { request, invitations: output.invitations },
+      { now, expiresAt: invitationBatchReplayExpiresAt(now) },
+    );
+    if (!recorded) {
+      throw new InvitationBatchKeyReusedError();
+    }
+    return output;
+  }
+
+  /**
    * Method replay
    *
    * @description
-   * Claims the key for the transaction, then answers its live record, if any, for an equivalent
-   * batch once the actor still manages the organization under a share lock.
+   * Answers the live record of the key, if any: its outcome for an equivalent batch once the actor
+   * still manages the organization under a share lock, `idempotency-key-reused` for another batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
-   * @param {InvitationBatchReplayKey} key - The scoped key.
-   * @param {InvitationBatchRequest} request - The batch of the request.
-   * @param {Date} now - The instant of the request.
-   * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` to run the batch.
-   * @throws {OrganizationRefusal} `idempotency-request-in-progress`, `organization-not-found` or
-   * `role-forbidden`.
+   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest;
+   * readonly now: Date }} batch - The scoped key, the canonical batch and the instant.
+   * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` without a record.
+   * @throws {OrganizationRefusal} `organization-not-found` or `role-forbidden`.
    * @throws {InvitationBatchKeyReusedError} For a batch that is not equivalent.
    */
   private static async replay(
     store: OrganizationsStore,
-    key: InvitationBatchReplayKey,
-    request: InvitationBatchRequest,
-    now: Date,
+    batch: {
+      readonly key: InvitationBatchReplayKey;
+      readonly request: InvitationBatchRequest;
+      readonly now: Date;
+    },
   ): Promise<InviteMembersOutput | null> {
-    if (!(await store.invitationBatchReplays.tryClaim(key))) {
-      throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
-    }
-    const stored: InvitationBatchReplay | null = await store.invitationBatchReplays.findLive(
+    const { key, request, now } = batch;
+    const stored: StoredInvitationBatch | null = await store.invitationBatchReplays.findLive(
       key,
+      request,
       now,
     );
     if (stored === null) {
       return null;
+    }
+    if (!stored.sameRequest) {
+      throw new InvitationBatchKeyReusedError();
     }
     const actor: Member = await requireActorMembership(
       store,
@@ -243,7 +281,6 @@ export class InviteMembers {
       'share',
     );
     assertManagesOrganization(actor.role);
-    assertSameInvitationBatch(stored.request, request);
     return { invitations: stored.invitations };
   }
 

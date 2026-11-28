@@ -21,7 +21,9 @@ import type { GetInvitationInput } from './get-invitation.input.js';
  * invitation from an accepted or refused one. The owner and the admins read it, as they see the
  * pending list (`role-forbidden` otherwise); an actor outside the organization answers
  * `organization-not-found`, and an invitation of another organization `invitation-not-found`
- * (decision 9 of P2b). One read-only tenant transaction.
+ * (decision 9 of P2b). One read-only tenant transaction at `REPEATABLE READ`: the actor's role and
+ * the invitation come from the same snapshot, so a demotion or an answer that commits between the
+ * two reads can never mix a former role with a later state, or the reverse.
  */
 export class GetInvitation {
   // #region Properties
@@ -110,7 +112,7 @@ export class GetInvitation {
             version: state.version,
           };
         },
-        { readOnly: true },
+        { readOnly: true, isolationLevel: 'repeatable read' },
       );
     } catch (error) {
       throw toOrganizationRefusal(error);
