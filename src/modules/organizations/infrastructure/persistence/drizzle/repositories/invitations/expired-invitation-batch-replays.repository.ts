@@ -2,6 +2,7 @@ import type { SystemTransactionRunner } from '@cadenway/nest-common/database';
 import { sql } from 'drizzle-orm';
 
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
+import { DATABASE_NOW } from './drizzle-invitation-batch-replay.repository.js';
 
 /**
  * Class ExpiredInvitationBatchReplays
@@ -43,7 +44,7 @@ export class ExpiredInvitationBatchReplays {
         sql`delete from ${replays}
             where (organization_id, actor_user_id, key_digest) in (
               select organization_id, actor_user_id, key_digest from ${replays}
-              where expires_at <= statement_timestamp()
+              where expires_at <= ${DATABASE_NOW}
               order by expires_at
               limit ${limit}
               for update skip locked)`,

@@ -9,6 +9,7 @@ import { FREE_SEAT_ENTITLEMENT } from '../../domain/value-objects/billing/seat-e
 import { EmailAddress } from '../../domain/value-objects/email/email-address.value-object.js';
 import type { DirectoryUserState } from '../../domain/value-objects/directory/directory-user-state.value-object.js';
 import { FORMER_MEMBER_NAME } from '../../domain/value-objects/directory/former-member-name.value-object.js';
+import { invitationBatchReplayExpiresAt } from '../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
@@ -169,6 +170,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
     events: [],
   };
 
+  /** The clock of the fake database, which the replay records are written and read on. */
+  public databaseClock: Clock | null = null;
+
   /** How each tenant transaction of a request was asked to open, in order. */
   public readonly requestOptions: UnitOfWorkOptions[] = [];
 
@@ -250,6 +254,14 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
   /** The events of a name appended so far. */
   public eventsNamed(name: string): RecordedEvent[] {
     return this.tables.events.filter((event: RecordedEvent) => event.name === name);
+  }
+
+  /** The instant on the clock of the fake database. */
+  private databaseNow(): Date {
+    if (this.databaseClock === null) {
+      throw new Error('The fake database has no clock.');
+    }
+    return this.databaseClock.now();
   }
 
   /** The next id, as PostgreSQL would assign one. */
@@ -640,13 +652,12 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
         findLive: (
           key: InvitationBatchReplayKey,
           request: InvitationBatchRequest,
-          now: Date,
         ): Promise<StoredInvitationBatch | null> => {
           // A read of PostgreSQL under READ COMMITTED sees what other runs committed meanwhile.
           const stored: StoredReplay | undefined =
             tables.replays.get(replayKeyOf(key)) ?? this.tables.replays.get(replayKeyOf(key));
           return Promise.resolve(
-            stored === undefined || stored.expiresAt.getTime() <= now.getTime()
+            stored === undefined || stored.expiresAt.getTime() <= this.databaseNow().getTime()
               ? null
               : {
                   sameRequest: stored.request === request.canonical,
@@ -657,14 +668,14 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
         record: (
           key: InvitationBatchReplayKey,
           replay: InvitationBatchReplay,
-          window: { readonly now: Date; readonly expiresAt: Date },
         ): Promise<boolean> => {
           if (this.failReplayRecords) {
             return Promise.reject(new Error('The replay record could not be written.'));
           }
+          const now: Date = this.databaseNow();
           const claim: string = replayKeyOf(key);
           const expired = (entry: StoredReplay | undefined): boolean =>
-            entry !== undefined && entry.expiresAt.getTime() <= window.now.getTime();
+            entry !== undefined && entry.expiresAt.getTime() <= now.getTime();
           if (expired(tables.replays.get(claim))) {
             tables.replays.delete(claim);
           }
@@ -683,7 +694,7 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
             organizationId: key.organizationId,
             request: replay.request.canonical,
             invitations: replay.invitations,
-            expiresAt: window.expiresAt,
+            expiresAt: invitationBatchReplayExpiresAt(now),
           });
           return Promise.resolve(true);
         },

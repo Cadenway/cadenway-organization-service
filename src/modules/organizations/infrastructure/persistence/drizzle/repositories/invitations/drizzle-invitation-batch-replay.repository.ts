@@ -2,11 +2,13 @@ import { createHash } from 'node:crypto';
 
 import type { TransactionDatabase } from '@cadenway/nest-common/database';
 import { and, eq, gt, lte, sql } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
 
 import type { InvitationBatchReplayKey } from '../../../../../application/models/invitations/invitation-batch-replay-key.model.js';
 import type { InvitationBatchReplay } from '../../../../../application/models/invitations/invitation-batch-replay.model.js';
 import type { StoredInvitationBatch } from '../../../../../application/models/invitations/stored-invitation-batch.model.js';
 import type { InvitationBatchReplayRepository } from '../../../../../application/ports/outbound/persistence/invitations/invitation-batch-replay-repository.port.js';
+import { INVITATION_BATCH_REPLAY_MS } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 
@@ -21,6 +23,28 @@ import { invitationBatchReplays } from '../../schemas/invitations/invitation-bat
  * @type {number}
  */
 const INLINE_PURGE_LIMIT: number = 10;
+
+/**
+ * Constant DATABASE_NOW
+ *
+ * @description
+ * The clock every replay instant is written, read and purged on: the database's, at the statement
+ * that uses it (`clock_timestamp()`, not the start of the transaction), so neither the clock of a
+ * replica nor the time a batch waited on its locks moves the 24 hours.
+ *
+ * @type {SQL<Date>}
+ */
+export const DATABASE_NOW: SQL<Date> = sql<Date>`clock_timestamp()`;
+
+/**
+ * Constant REPLAY_WINDOW
+ *
+ * @description
+ * `INVITATION_BATCH_REPLAY_MS` as a PostgreSQL interval.
+ *
+ * @type {SQL}
+ */
+const REPLAY_WINDOW: SQL = sql`make_interval(secs => ${INVITATION_BATCH_REPLAY_MS / 1000})`;
 
 /**
  * Function digestOf
@@ -83,18 +107,16 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    * Method findLive
    *
    * @description
-   * Loads the committed record of the scoped key that expires after `now`, and whether its
-   * fingerprint is the one of the batch of the request.
+   * Loads the committed record of the scoped key that expires after `clock_timestamp()`, and
+   * whether its fingerprint is the one of the batch of the request.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @param {Date} now - The instant of the request.
    * @returns {Promise<StoredInvitationBatch | null>} The record, or `null`.
    */
   public async findLive(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
-    now: Date,
   ): Promise<StoredInvitationBatch | null> {
     const rows = await this.db
       .select({
@@ -107,7 +129,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           eq(invitationBatchReplays.organizationId, key.organizationId),
           eq(invitationBatchReplays.actorUserId, key.actorUserId),
           eq(invitationBatchReplays.keyDigest, digestOf(key.key)),
-          gt(invitationBatchReplays.expiresAt, now),
+          gt(invitationBatchReplays.expiresAt, DATABASE_NOW),
         ),
       )
       .limit(1);
@@ -148,18 +170,16 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    * Deletes the expired record of the key, and at most `INLINE_PURGE_LIMIT` other expired records
    * of the organization that no other transaction holds, then inserts the record unless one of the
    * key exists. The insert waits for a transaction that inserted the same key first, and stores
-   * nothing once it commits.
+   * nothing once it commits. `expires_at` is `REPLAY_WINDOW` after `clock_timestamp()` at the
+   * insert, the last statement of the batch, so the time it waited on its locks does not count.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchReplay} replay - The batch and its outcome.
-   * @param {{ readonly now: Date; readonly expiresAt: Date }} window - The instant of the batch and
-   * the end of its replay.
    * @returns {Promise<boolean>} `false` when a record of the key already exists.
    */
   public async record(
     key: InvitationBatchReplayKey,
     replay: InvitationBatchReplay,
-    window: { readonly now: Date; readonly expiresAt: Date },
   ): Promise<boolean> {
     const keyDigest: string = digestOf(key.key);
     await this.db
@@ -169,7 +189,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           eq(invitationBatchReplays.organizationId, key.organizationId),
           eq(invitationBatchReplays.actorUserId, key.actorUserId),
           eq(invitationBatchReplays.keyDigest, keyDigest),
-          lte(invitationBatchReplays.expiresAt, window.now),
+          lte(invitationBatchReplays.expiresAt, DATABASE_NOW),
         ),
       );
     await this.db.execute(
@@ -177,7 +197,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
           where (organization_id, actor_user_id, key_digest) in (
             select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
             where organization_id = ${key.organizationId}::uuid
-              and expires_at <= ${window.now.toISOString()}::timestamptz
+              and expires_at <= ${DATABASE_NOW}
             order by expires_at
             limit ${INLINE_PURGE_LIMIT}
             for update skip locked)`,
@@ -190,7 +210,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
         keyDigest,
         requestDigest: digestOf(replay.request.canonical),
         outcome: replay.invitations,
-        expiresAt: window.expiresAt,
+        expiresAt: sql`${DATABASE_NOW} + ${REPLAY_WINDOW}`,
       })
       .onConflictDoNothing()
       .returning({ organizationId: invitationBatchReplays.organizationId });

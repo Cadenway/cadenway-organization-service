@@ -83,7 +83,8 @@ version that writes it, since earlier entries do not identify the sender of each
 sent with an `Idempotency-Key`: the SHA-256 digest of the key, never the key, the SHA-256
 fingerprint of the canonical batch (`request_digest`: the role and the distinct addresses in
 order), never the batch, the `200` outcome to replay (`outcome`) and `expires_at`, 24 hours after
-the batch. **`outcome` holds the invited addresses**, the body the contract replays, until the
+the insert of the record on the database clock (`clock_timestamp()`), which every read and purge
+of the table uses too. **`outcome` holds the invited addresses**, the body the contract replays, until the
 record is purged: 24 hours, plus the delay of the purge. A record is written once, in the
 transaction of its batch, and never changed. Two purges delete expired records, both bounded:
 
@@ -220,9 +221,38 @@ which behavior it gets, so the order is operational:
    `POST /v1/invitations`, and expose `GET /v1/invitations/{invitationId}`.
 3. To roll this service back below this release, first turn the gateway's switch off and wait
    until no forwarded request is in flight, then roll the service back. Keep
-   `invitation_batch_replays`: the previous release never reads it, and the records expire. Rolling
-   forward again restores the replays of the records still live; a batch the previous release ran
-   in between was not recorded and is not replayed.
+   `invitation_batch_replays`: the previous release never reads it. Rolling forward again restores
+   the replays of the records still live; a batch the previous release ran in between was not
+   recorded and is not replayed.
+4. Once no replica of this release runs (a replica that starts registers the schedule again),
+   clean up what the previous release leaves behind, since it has no purge worker:
+   - remove the persisted schedule of `organization.purge-invitation-batch-replays`, which would
+     otherwise create a job every minute that nobody consumes. The kit offers it as
+     `JobScheduler.unschedule('organization.purge-invitation-batch-replays', { key: 'minutely' })`
+     only, with no command line, and the previous release does not call it; run its exact
+     statement as `organization_migrator`, which owns the `pgboss` schema:
+
+     ```sql
+     DELETE FROM pgboss.schedule
+     WHERE name = 'organization.purge-invitation-batch-replays' AND COALESCE(key, '') = 'minutely';
+     ```
+
+   - delete the expired replay records, which hold invited addresses, as `organization_migrator`
+     under the system access of the row-level security policy. The statement never touches a live
+     record; run it once right after the rollback and again 24 hours later, when every record
+     written before the rollback has expired (the table then stays empty, since the previous
+     release writes none):
+
+     ```sql
+     BEGIN;
+     SELECT set_config('app.system_access', 'on', true);
+     DELETE FROM invitation_batch_replays WHERE expires_at < clock_timestamp();
+     COMMIT;
+     ```
+
+   Both statements are idempotent. The provisioned queue may stay: without its schedule it gets no
+   new job. Rolling forward again needs neither undone: the new replicas register the schedule at
+   start-up.
 
 The gateway must not forward the key, nor call `getInvitation`, in an environment where this
 release is not running: the previous release answers that route `404`.
@@ -559,8 +589,12 @@ Any failure rolls back the business rows and the outbox rows together
   `organization_app`. The lock covers the key and the fingerprint of the batch, so `409` means an
   equivalent request in flight only; a different batch runs, and the primary key of the table
   refuses it with `422` if the other commits the key first. A committed record is read before the
-  lock, so retries of a committed batch never contend. The 24 hours are counted on the clock of the
-  service, as the allowances are.
+  lock, so retries of a committed batch never contend. A batch that waited on the allowance locks
+  reads the record once more under them, before it plans or counts anything, so losing to another
+  batch of its key that took the last send answers `422`, never `429`. The 24 hours start at the
+  insert of the record and are read on the database's `clock_timestamp()`, not on the clock of a
+  replica nor at the start of the request, so the time a batch waited on its locks never shortens
+  them; the allowances keep the clock of the service.
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists. The service exposes no version or capability signal (its only
   unauthenticated routes are `/health/live` and `/health/ready`, from the kit), so the gateway

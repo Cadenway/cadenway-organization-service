@@ -418,6 +418,114 @@ describe('idempotent invitation batches and the invitation state', () => {
       });
     });
 
+    /**
+     * Holds the sender allowance lock of Inès in a transaction of its own, as a batch of hers
+     * would, until `release` commits it.
+     *
+     * @returns The holder and a wait for a number of transactions blocked behind an advisory lock.
+     */
+    async function holdSenderLock(): Promise<{
+      readonly waiting: (count: number) => Promise<void>;
+      readonly release: () => Promise<void>;
+    }> {
+      const holder: pg.PoolClient = await stack.migrator.connect();
+      await holder.query('begin');
+      await holder.query(
+        `select pg_advisory_xact_lock(hashtextextended('invitation-sender:' || $1::uuid::text, 0))`,
+        [ines.id],
+      );
+      return {
+        waiting: async (count: number): Promise<void> => {
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            const rows = await stack.migrator.query<{ blocked: number }>(
+              `select count(*)::int as blocked from pg_locks
+               where locktype = 'advisory' and not granted`,
+            );
+            if ((rows.rows[0]?.blocked ?? 0) >= count) return;
+            await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          }
+          throw new Error('The batches never reached the sender allowance lock.');
+        },
+        release: async (): Promise<void> => {
+          try {
+            await holder.query('commit');
+          } finally {
+            holder.release();
+          }
+        },
+      };
+    }
+
+    it('answers key-reused, not 429, to a batch that waited while another one of its key took the last send', async () => {
+      const lyonId: string = newId();
+      const key = 'lyon-batch-last-send';
+      await stack.system(
+        `insert into organizations
+         (id, name, name_key, slug, default_language, team_size, primary_use, owner_user_id)
+         values ($1, 'Atelier Nord Lyon', 'atelier nord lyon', 'atelier-nord-lyon', 'fr', '1-5',
+                 'other', $2)`,
+        [lyonId, ines.id],
+      );
+      await stack.system(
+        `insert into members (organization_id, user_id, role, joined_at) values ($1, $2, 'owner', now())`,
+        [lyonId, ines.id],
+      );
+      const [anchor] = await stack.system<{ id: string }>(
+        `insert into invitations (organization_id, email, role, invited_by_user_id, sent_at, expires_at)
+         values ($1, 'ancien@ateliernord.fr', 'member', $2, now(), now() + interval '7 days')
+         returning id`,
+        [lyonId, ines.id],
+      );
+      await stack.system(
+        `insert into invitation_emails (organization_id, invitation_id, sent_at)
+         select $1, $2, now() from generate_series(1, 99)`,
+        [lyonId, anchor?.id],
+      );
+      const lock = await holdSenderLock();
+      const pending: Promise<Response>[] = [
+        invite(ines, lyonId, key, ['noe@ateliernord.fr']),
+        invite(ines, lyonId, key, ['oscar@ateliernord.fr']),
+      ];
+      try {
+        await lock.waiting(2);
+      } finally {
+        await lock.release();
+      }
+      const responses: Response[] = await Promise.all(pending);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 422]);
+      expect(responses.find((response) => response.status === 422)?.body).toMatchObject({
+        code: 'idempotency.key-reused',
+      });
+      expect(await effects(lyonId)).toMatchObject({ invitations: 2, emails: 100, replays: 1 });
+    });
+
+    it('starts the 24 hours of a replay on the database clock when the record is written', async () => {
+      const key = 'members-page-batch-delayed';
+      const lock = await holdSenderLock();
+      const pending: Promise<Response> = invite(ines, atelierNordId, key, ['paz@ateliernord.fr']);
+      let released: Date | undefined;
+      try {
+        await lock.waiting(1);
+        await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+        const [clock] = await stack.system<{ now: Date }>('select clock_timestamp() as now');
+        released = clock?.now;
+      } finally {
+        await lock.release();
+      }
+      const response: Response = await pending;
+      const [stored] = await stack.system<{ expires_at: Date }>(
+        `select expires_at from invitation_batch_replays
+         where organization_id = $1 and actor_user_id = $2 and key_digest = $3`,
+        [atelierNordId, ines.id, digestOf(key)],
+      );
+
+      expect(response.status).toBe(200);
+      expect(stored?.expires_at.getTime()).toBeGreaterThanOrEqual(
+        (released?.getTime() ?? Number.POSITIVE_INFINITY) + 24 * 60 * 60_000,
+      );
+    });
+
     it('keeps a fingerprint of the batch, never its addresses, beside the body to replay', async () => {
       const rows = await stack.system<{ columns: string[] }>(
         `select array_agg(column_name::text order by ordinal_position) as columns
@@ -689,6 +797,64 @@ describe('idempotent invitation batches and the invitation state', () => {
           atelierNordId,
         ),
       ).toBe(live);
+    });
+  });
+
+  describe('rollback cleanup of MODULE.md', () => {
+    it('removes the purge schedule and the expired records only, as the migrator', async () => {
+      // The schedule as a replica registers it, with a yearly expression so it never fires here.
+      await app.get(JobScheduler).schedule(PURGE_INVITATION_BATCH_REPLAYS_QUEUE, '0 0 1 1 *', {
+        key: 'minutely',
+        timeZone: 'UTC',
+      });
+      await stack.system(
+        `insert into invitation_batch_replays
+           (organization_id, actor_user_id, key_digest, request_digest, outcome, expires_at)
+         values ($1, $2, repeat('b', 64), repeat('a', 64), '[]'::jsonb, now() - interval '1 minute')`,
+        [lumenId, newId()],
+      );
+      const live: number = await count(
+        `select count(*)::int as count from invitation_batch_replays
+         where organization_id = $1 and expires_at > now()`,
+        lumenId,
+      );
+
+      await stack.migrator.query(
+        `DELETE FROM pgboss.schedule
+         WHERE name = 'organization.purge-invitation-batch-replays' AND COALESCE(key, '') = 'minutely'`,
+      );
+      const client: pg.PoolClient = await stack.migrator.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`SELECT set_config('app.system_access', 'on', true)`);
+        await client.query(
+          'DELETE FROM invitation_batch_replays WHERE expires_at < clock_timestamp()',
+        );
+        await client.query('COMMIT');
+      } finally {
+        client.release();
+      }
+
+      const schedules = await stack.migrator.query<{ name: string }>(
+        `select name from pgboss.schedule where name = $1`,
+        [PURGE_INVITATION_BATCH_REPLAYS_QUEUE],
+      );
+      expect(schedules.rows).toEqual([]);
+      expect(
+        await count(
+          `select count(*)::int as count from invitation_batch_replays
+           where organization_id = $1 and expires_at <= now()`,
+          lumenId,
+        ),
+      ).toBe(0);
+      expect(
+        await count(
+          `select count(*)::int as count from invitation_batch_replays
+           where organization_id = $1 and expires_at > now()`,
+          lumenId,
+        ),
+      ).toBe(live);
+      expect(live).toBeGreaterThan(0);
     });
   });
 

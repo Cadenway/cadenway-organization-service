@@ -10,7 +10,9 @@ import type { StoredInvitationBatch } from '../../../../models/invitations/store
  * The replay records of the invitation batches sent with an `Idempotency-Key`, bound to the tenant
  * transaction of the batch: the record commits with the invitations and their outbox rows, or not
  * at all. A record keeps a fingerprint of its batch, never its addresses, and the `200` body to
- * replay, which lists them, until it expires.
+ * replay, which lists them, until it expires. Its replay window (`INVITATION_BATCH_REPLAY_MS`)
+ * starts when the record is written and is read and purged on the same clock, the store's own, so
+ * the time a batch waited on its locks never shortens it.
  */
 export interface InvitationBatchReplayRepository {
   // #region Methods
@@ -18,18 +20,16 @@ export interface InvitationBatchReplayRepository {
    * Method findLive
    *
    * @description
-   * The committed record of a key still replayed at `now`, compared with the batch of the
-   * request, or `null`.
+   * The committed record of a key still replayed at the instant of the read, compared with the
+   * batch of the request, or `null`.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @param {Date} now - The instant of the request.
    * @returns {Promise<StoredInvitationBatch | null>} The record.
    */
   findLive(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
-    now: Date,
   ): Promise<StoredInvitationBatch | null>;
 
   /**
@@ -53,19 +53,14 @@ export interface InvitationBatchReplayRepository {
    * @description
    * Drops the expired record of the key and a few other expired records of the organization (a
    * bounded number, so the batch never holds its locks for a long delete), then stores the record
-   * of the key, replayed until `expiresAt`. The unique key of the table decides between two
-   * transactions that both reached this point with the same key: the second stores nothing.
+   * of the key, replayed for `INVITATION_BATCH_REPLAY_MS` from the instant it is written. The unique
+   * key of the table decides between two transactions that both reached this point with the same
+   * key: the second stores nothing.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchReplay} replay - The batch and its outcome.
-   * @param {{ readonly now: Date; readonly expiresAt: Date }} window - The instant of the batch and
-   * the end of its replay.
    * @returns {Promise<boolean>} `false` when a record of the key already exists.
    */
-  record(
-    key: InvitationBatchReplayKey,
-    replay: InvitationBatchReplay,
-    window: { readonly now: Date; readonly expiresAt: Date },
-  ): Promise<boolean>;
+  record(key: InvitationBatchReplayKey, replay: InvitationBatchReplay): Promise<boolean>;
   // #endregion
 }

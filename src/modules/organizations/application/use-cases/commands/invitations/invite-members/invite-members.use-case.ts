@@ -7,7 +7,6 @@ import {
   invitationEmailWindowStart,
 } from '../../../../../domain/policies/invitations/invitation-email-allowance.policy.js';
 import { InvitationBatchKeyReusedError } from '../../../../../domain/errors/invitations/invitation-batch-key-reused.error.js';
-import { invitationBatchReplayExpiresAt } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import { assertManagesOrganization } from '../../../../../domain/policies/members/member-permissions.policy.js';
 import type { EmailAddress } from '../../../../../domain/value-objects/email/email-address.value-object.js';
 import { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
@@ -228,12 +227,14 @@ export class InviteMembers {
       organization,
       addresses,
       now,
+      // Another batch of the key may have committed while this one waited on the allowance
+      // locks: it answers `idempotency-key-reused` before the allowance is evaluated, never 429.
+      afterLocks: (): Promise<InviteMembersOutput | null> => InviteMembers.replay(store, batch),
     });
-    const recorded: boolean = await store.invitationBatchReplays.record(
-      key,
-      { request, invitations: output.invitations },
-      { now, expiresAt: invitationBatchReplayExpiresAt(now) },
-    );
+    const recorded: boolean = await store.invitationBatchReplays.record(key, {
+      request,
+      invitations: output.invitations,
+    });
     if (!recorded) {
       throw new InvitationBatchKeyReusedError();
     }
@@ -248,8 +249,8 @@ export class InviteMembers {
    * still manages the organization under a share lock, `idempotency-key-reused` for another batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
-   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest;
-   * readonly now: Date }} batch - The scoped key, the canonical batch and the instant.
+   * @param {{ readonly key: InvitationBatchReplayKey; readonly request: InvitationBatchRequest }}
+   * batch - The scoped key and the canonical batch.
    * @returns {Promise<InviteMembersOutput | null>} The stored outcome, or `null` without a record.
    * @throws {OrganizationRefusal} `organization-not-found` or `role-forbidden`.
    * @throws {InvitationBatchKeyReusedError} For a batch that is not equivalent.
@@ -259,14 +260,12 @@ export class InviteMembers {
     batch: {
       readonly key: InvitationBatchReplayKey;
       readonly request: InvitationBatchRequest;
-      readonly now: Date;
     },
   ): Promise<InviteMembersOutput | null> {
-    const { key, request, now } = batch;
+    const { key, request } = batch;
     const stored: StoredInvitationBatch | null = await store.invitationBatchReplays.findLive(
       key,
       request,
-      now,
     );
     if (stored === null) {
       return null;
@@ -289,14 +288,17 @@ export class InviteMembers {
    *
    * @description
    * Runs the batch once the actor and the organization are found: locks the allowances of the
-   * sender and of the organization, checks the actor's role again under a share lock, decides each
-   * address, refuses a batch that needs more emails than remain, then stores the new invitations
-   * with their ledger entries and events.
+   * sender and of the organization, checks the actor's role again under a share lock, gives
+   * `afterLocks` the last word before anything is decided (a keyed batch reads its replay record
+   * again there), decides each address, refuses a batch that needs more emails than remain, then
+   * stores the new invitations with their ledger entries and events.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
    * @param {{ readonly organization: Organization; readonly addresses: readonly EmailAddress[];
-   * readonly now: Date }} batch - The organization, the distinct addresses and the instant.
+   * readonly now: Date; readonly afterLocks?: () => Promise<InviteMembersOutput | null> }} batch -
+   * The organization, the distinct addresses, the instant and the check run under the locks, whose
+   * outcome, when not `null`, is answered instead.
    * @returns {Promise<InviteMembersOutput>} The outcome of each distinct address.
    */
   private static async issue(
@@ -306,9 +308,10 @@ export class InviteMembers {
       readonly organization: Organization;
       readonly addresses: readonly EmailAddress[];
       readonly now: Date;
+      readonly afterLocks?: () => Promise<InviteMembersOutput | null>;
     },
   ): Promise<InviteMembersOutput> {
-    const { organization, addresses, now } = batch;
+    const { organization, addresses, now, afterLocks } = batch;
     const windowStart = invitationEmailWindowStart(now);
     const senderUsage = await store.invitationEmails.lockSenderUsage(
       input.actorUserId,
@@ -325,6 +328,11 @@ export class InviteMembers {
       'share',
     );
     assertManagesOrganization(currentActor.role);
+    const settled: InviteMembersOutput | null =
+      afterLocks === undefined ? null : await afterLocks();
+    if (settled !== null) {
+      return settled;
+    }
     const planned: PlannedAddress[] = [];
     for (const address of addresses) {
       planned.push(await InviteMembers.plan(store, input.organizationId, address));
