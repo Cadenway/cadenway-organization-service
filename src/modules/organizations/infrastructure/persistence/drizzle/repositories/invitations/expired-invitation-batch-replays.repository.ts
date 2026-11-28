@@ -2,6 +2,7 @@ import type { TransactionDatabase, TransactionOptions } from '@cadenway/nest-com
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
+import type { InvitationBatchReplayPurgeCutShortError } from '../../../../../application/models/invitations/invitation-batch-replay-purge-cut-short.model.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 import type { DiscardableSystemTransactions } from '../../transactions/invitations/discardable-system.transaction.js';
 import { boundedPurgeOf, PURGE_CUTOFF } from './drizzle-invitation-batch-replay.repository.js';
@@ -22,17 +23,31 @@ export function expiredPurgeOf(limit: number): SQL {
 }
 
 /**
+ * Constant SERVER_TIMEOUT_GRACE_MS
+ *
+ * @description
+ * How much longer than the time left the server's own timeouts of a purge transaction run. The
+ * call gives up, and discards its connection, at its deadline on the client: the server's timeouts
+ * are the backstop for the locks a discarded transaction may still hold, and the grace lets the
+ * client's deadline always come first, so a stall is always reported with its phase rather than as
+ * the server's cancellation.
+ *
+ * @type {number}
+ */
+const SERVER_TIMEOUT_GRACE_MS: number = 1_000;
+
+/**
  * Function timeoutOf
  *
  * @description
- * The `statement_timeout` a transaction of the purge sets for itself: the time left to its tick,
- * in whole milliseconds and 1 at least (0 would disable the timeout).
+ * The `statement_timeout` a transaction of the purge sets for itself: the time left to its tick
+ * plus `SERVER_TIMEOUT_GRACE_MS`, in whole milliseconds and 1 at least (0 would disable it).
  *
  * @param {number} timeoutMs - The time left, in milliseconds.
  * @returns {string} The setting.
  */
 function timeoutOf(timeoutMs: number): string {
-  return `${String(Math.max(1, Math.floor(timeoutMs)))}ms`;
+  return `${String(Math.max(1, Math.floor(timeoutMs + SERVER_TIMEOUT_GRACE_MS)))}ms`;
 }
 
 /**
@@ -75,12 +90,13 @@ export interface PurgeWindow {
  * Deletes expired replay records of every organization, a bounded batch at a time, independently
  * of the tenants' traffic. Each batch is a system transaction of its own, a bounded exception of
  * `MODULE.md`: it names only rows whose replay is over. A call takes an absolute deadline and the
- * job's abort signal: the wait for a pooled connection races them (`within`), and once the
- * transaction holds one in time its statements are capped at the time left (`statement_timeout`,
- * which counts lock waits too), so a purge never outlasts its tick: a statement cut short fails,
- * rolls its batch back and leaves the rows to the next tick. When the deadline or the abort wins
- * while the transaction still runs, its connection is destroyed on the client side, so the call
- * given up on settles at once, even on a connection stuck at the socket level.
+ * job's abort signal: the whole call races them (`within`), from the wait for a pooled connection
+ * to the commit, so a purge never outlasts its tick. When the deadline or the abort wins while the
+ * call runs, its connection is destroyed on the client side, so the call given up on settles at
+ * once, even on a connection stuck at the socket level, and a purge rejects with an
+ * `InvitationBatchReplayPurgeCutShortError` naming the phase it stood in: its outcome is
+ * unconfirmed, so its tick must fail and be retried. The server caps the statements too, a little later
+ * (`SERVER_TIMEOUT_GRACE_MS`), as the backstop of the locks a discarded transaction may hold.
  */
 export class ExpiredInvitationBatchReplays {
   // #region Properties
@@ -118,14 +134,21 @@ export class ExpiredInvitationBatchReplays {
    *
    * @description
    * Binds the purge to system transactions because it spans organizations, on connections it can
-   * discard at its deadline.
+   * discard at its deadline. The application model of the error a cut-short call rejects with is
+   * given by the composition, since an adapter may only name it as a type.
    *
    * @param {DiscardableSystemTransactions} system - The discardable system transactions.
+   * @param {(phase: InvitationBatchReplayPurgeCutShortError['phase'], trigger: InvitationBatchReplayPurgeCutShortError['trigger']) => InvitationBatchReplayPurgeCutShortError} cutShort -
+   * Builds the error of a call cut short once started.
    * @param {() => number} now - The monotonic clock of the deadlines, in milliseconds.
    * @constructor
    */
   public constructor(
     private readonly system: DiscardableSystemTransactions,
+    private readonly cutShort: (
+      phase: InvitationBatchReplayPurgeCutShortError['phase'],
+      trigger: InvitationBatchReplayPurgeCutShortError['trigger'],
+    ) => InvitationBatchReplayPurgeCutShortError,
     private readonly now: () => number = (): number => performance.now(),
   ) {}
   // #endregion
@@ -140,8 +163,10 @@ export class ExpiredInvitationBatchReplays {
    *
    * @param {number} limit - The most rows one call deletes.
    * @param {PurgeWindow} window - The deadline and the abort signal.
-   * @returns {Promise<number | null>} How many rows it deleted, or `null` when no time was left
-   * once the transaction began.
+   * @returns {Promise<number | null>} How many rows it deleted, or `null` when the deadline or the
+   * abort had come before the call started (or a call given up on earlier had not settled by then).
+   * @throws {InvitationBatchReplayPurgeCutShortError} When the deadline or the abort came once the
+   * call had started, with the phase it stood in.
    */
   public purge(limit: number, window: PurgeWindow): Promise<number | null> {
     return this.within(window, {}, 'fail', async (db: TransactionDatabase): Promise<number> => {
@@ -158,8 +183,9 @@ export class ExpiredInvitationBatchReplays {
    * start of `invitation_batch_replays_expiry_index`; the backlog of the purge.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
-   * @returns {Promise<number | null>} The age, or `null` when no expired record remains or no time
-   * was left once the transaction began.
+   * @returns {Promise<number | null>} The age, or `null` when no expired record remains or the
+   * deadline or the abort came first. A call given up on earlier is waited for, up to the deadline,
+   * so a tick that was just cut short still reads its backlog.
    */
   public oldestExpiredAgeSeconds(window: PurgeWindow): Promise<number | null> {
     return this.within(
@@ -181,49 +207,56 @@ export class ExpiredInvitationBatchReplays {
    *
    * @description
    * Runs `work` in a system transaction bounded by `window`, from the wait for a pooled connection
-   * to the commit. The whole transaction races the deadline and the abort signal: if either comes
-   * first, the call never waits for the transaction. It answers `null` when no statement of `work`
-   * had started (no time left, the normal end of a tick), and, under `cutShort: 'fail'`, rejects
-   * when one was in flight or committing, since the server may have cancelled it: the job then
-   * fails and its queue's bounded retry applies, instead of a tick acknowledged as done. Left
-   * behind, the transaction runs no statement of its own past that point (it checks before each
-   * one), and its connection is discarded at once: destroyed on the client side, so its pending
-   * statement rejects and the call settles, however stuck the socket is. The server side has its
-   * own bound, for the locks the rolled-back transaction may still hold until the server notices
-   * the disconnection: the first statement sets both `statement_timeout` and
-   * `idle_in_transaction_session_timeout` to the time left, so the server cancels a statement that
-   * runs too long and terminates a session left idle in its transaction.
+   * to the commit. A call given up on earlier is first waited for, up to the deadline or the abort,
+   * so that at most one database call of the purge is in flight. The call answers `null` when the
+   * deadline or the abort came before it started: the normal end of a tick. Once started, the
+   * whole transaction races them: if either comes first, the call never waits for the transaction,
+   * whose connection is discarded at once (destroyed on the client side, so its pending statement
+   * rejects and the transaction settles, however stuck the socket is), and which runs no statement
+   * of its own past that point (it checks before each one). Under `cutShort: 'fail'` the call then
+   * rejects with an `InvitationBatchReplayPurgeCutShortError` naming the phase it stood in
+   * (`checkout`, `setup`, `delete`, `commit` or `rollback`): it is unconfirmed (a commit may have
+   * taken effect, any other phase made no progress), and the job must fail so its queue retries
+   * it, which is safe since a delete of expired rows is idempotent. Under `skip` (a read) it
+   * answers `null`. The first statement sets `statement_timeout` and
+   * `idle_in_transaction_session_timeout` to the time left plus `SERVER_TIMEOUT_GRACE_MS`, the
+   * server's backstop for the locks a discarded transaction may hold until it notices.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
    * @param {TransactionOptions} options - How the transaction is opened.
-   * @param {'fail' | 'skip'} cutShort - What a deadline or an abort that comes while `work` runs
-   * does: `fail` rejects the call (a delete the server may have cancelled must fail its job, so its
-   * queue retries it), `skip` answers `null` (a read).
+   * @param {'fail' | 'skip'} cutShort - What a deadline or an abort that comes once the call
+   * started does: `fail` rejects with the phase (a delete), `skip` answers `null` (a read).
    * @param {(db: TransactionDatabase) => Promise<TResult>} work - The statements of the call.
-   * @returns {Promise<TResult | null>} What `work` resolved with, or `null` without time left.
+   * @returns {Promise<TResult | null>} What `work` resolved with, or `null` as described.
+   * @throws {InvitationBatchReplayPurgeCutShortError} Under `fail`, when cut short once started.
    */
-  private within<TResult>(
+  private async within<TResult>(
     window: PurgeWindow,
     options: TransactionOptions,
     cutShort: 'fail' | 'skip',
     work: (db: TransactionDatabase) => Promise<TResult>,
   ): Promise<TResult | null> {
+    if (this.abandonedCall !== null) {
+      await this.settledWithin(this.abandonedCall, window);
+    }
     if (this.stalled || this.isOver(window)) {
-      return Promise.resolve(null);
+      return null;
     }
     return new Promise<TResult | null>((resolve, reject) => {
       const attempt: { call?: Promise<TResult | null> } = {};
       const race: {
         abandoned: boolean;
-        inFlight: boolean;
+        phase: InvitationBatchReplayPurgeCutShortError['phase'];
         timer?: ReturnType<typeof setTimeout>;
-      } = { abandoned: false, inFlight: false };
+      } = { abandoned: false, phase: 'checkout' };
       const discard: AbortController = new AbortController();
       const listeners: { abandon: () => void } = { abandon: (): void => undefined };
       const stopRace = (): void => {
         clearTimeout(race.timer);
         window.signal.removeEventListener('abort', listeners.abandon);
       };
+      const cutShortError = (): InvitationBatchReplayPurgeCutShortError =>
+        this.cutShort(race.phase, window.signal.aborted ? 'abort' : 'deadline');
       listeners.abandon = (): void => {
         if (!race.abandoned) {
           race.abandoned = true;
@@ -233,8 +266,8 @@ export class ExpiredInvitationBatchReplays {
           }
           // Destroys the connection of a transaction still running, so the call settles at once.
           discard.abort();
-          if (race.inFlight && cutShort === 'fail') {
-            reject(new Error('The deadline of the purge came while a delete was in flight.'));
+          if (cutShort === 'fail') {
+            reject(cutShortError());
           } else {
             resolve(null);
           }
@@ -243,11 +276,18 @@ export class ExpiredInvitationBatchReplays {
       const abandon = listeners.abandon;
       race.timer = setTimeout(abandon, Math.max(0, window.deadline - this.now()));
       window.signal.addEventListener('abort', abandon, { once: true });
+      // The deadline may pass between the checks of the clock and the timer that enforces it.
+      const stop = (): null => {
+        if (cutShort === 'fail') {
+          throw cutShortError();
+        }
+        return null;
+      };
       const stopped = (): boolean => race.abandoned || this.isOver(window);
       attempt.call = this.system.run(
         async ({ db }): Promise<TResult | null> => {
           if (stopped()) {
-            return null;
+            return stop();
           }
           const timeout: string = timeoutOf(window.deadline - this.now());
           await db.execute(
@@ -256,13 +296,19 @@ export class ExpiredInvitationBatchReplays {
           );
           // The settings took a round trip: the deadline or the abort may have come meanwhile.
           if (stopped()) {
-            return null;
+            return stop();
           }
-          race.inFlight = true;
+          race.phase = 'delete';
           return work(db);
         },
         options,
         discard.signal,
+        (phase: 'setup' | 'work' | 'commit' | 'rollback'): void => {
+          // `work` begins with the settings of the timeouts, still part of the setup.
+          if (phase !== 'work') {
+            race.phase = phase;
+          }
+        },
       );
       attempt.call.then(
         (value: TResult | null): void => {
@@ -280,6 +326,40 @@ export class ExpiredInvitationBatchReplays {
         },
       );
     });
+  }
+
+  /**
+   * Method settledWithin
+   *
+   * @description
+   * Waits for a call given up on to settle, but never past the deadline or the abort of `window`.
+   *
+   * @param {Promise<void>} call - The call given up on, which never rejects.
+   * @param {PurgeWindow} window - The deadline and the abort signal.
+   * @returns {Promise<void>} Resolves once the call settled or the wait is over.
+   */
+  private async settledWithin(call: Promise<void>, window: PurgeWindow): Promise<void> {
+    if (this.isOver(window)) {
+      return;
+    }
+    const wait: { timer?: ReturnType<typeof setTimeout>; abort?: () => void } = {};
+    try {
+      await Promise.race([
+        call,
+        new Promise<void>((resolve) => {
+          wait.abort = (): void => {
+            resolve();
+          };
+          wait.timer = setTimeout(wait.abort, Math.max(0, window.deadline - this.now()));
+          window.signal.addEventListener('abort', wait.abort, { once: true });
+        }),
+      ]);
+    } finally {
+      clearTimeout(wait.timer);
+      if (wait.abort !== undefined) {
+        window.signal.removeEventListener('abort', wait.abort);
+      }
+    }
   }
 
   /**
