@@ -153,24 +153,52 @@ const RESERVATION_LOCK_TIMEOUT: string = '100ms';
 const LEASE_WINDOW: SQL = sql`make_interval(secs => ${INVITATION_BATCH_LEASE_MS / 1000})`;
 
 /**
+ * Function reclaimedReservationsOf
+ *
+ * @description
+ * The delete an admission runs before it counts: at most `budget` reservations of the
+ * organization whose lease ran out and that no transaction holds, by
+ * `invitation_batch_replays_reservation_index`, locked with `for update skip locked`, so it never
+ * waits. A reservation that a batch still runs holds its row lock from the batch's first
+ * statement (`renew`, an `update`, then `complete`, both in the batch's transaction) until that
+ * transaction ends, so it is skipped and keeps counting, its renewal possibly invisible to this
+ * snapshot. A row it can lock belongs to a holder that crashed, gave up or has not started its
+ * batch yet: deleting it in the admission's transaction makes that holder's later `renew` find no
+ * lease and roll its batch back, so the place it frees can never be filled twice. A row whose
+ * holder committed or rolled back meanwhile is read again by the lock: a record is no longer a
+ * reservation and stays, an aborted reservation goes.
+ *
+ * @param {string} organizationId - The organization.
+ * @param {number} budget - The replay record budget, which bounds the delete.
+ * @returns {SQL} The statement.
+ */
+export function reclaimedReservationsOf(organizationId: string, budget: number): SQL {
+  return boundedPurgeOf(
+    sql`organization_id = ${organizationId}::uuid and state = 'reserved'
+      and expires_at <= ${PURGE_CUTOFF}`,
+    budget,
+  );
+}
+
+/**
  * Function keyedBatchUsageOf
  *
  * @description
- * The read of the replay record budget of an organization, one statement and so one snapshot,
- * both parts range-scanning `invitation_batch_replays_organization_expiry_index`:
+ * The read of the replay record budget of an organization once `reclaimedReservationsOf` ran in
+ * the same transaction, one statement and so one snapshot:
  *
- * - its reservations under a live lease, counted up to `budget`, among the rows expiring within
- *   the next lease window (and a second of margin) only: a lease ends at the clock of the
- *   statement that wrote it plus `INVITATION_BATCH_LEASE_MS`, and every reservation this statement
- *   sees was committed before it, since `lockReservations` serializes the reservations of the
- *   organization and a renewal stays uncommitted until its batch turns it into a record;
- * - the expiries of its newest live records, backward from the newest, no more than the places the
+ * - its reservations, whatever their lease, counted up to `budget` by
+ *   `invitation_batch_replays_reservation_index`, which holds no record: those under a live lease,
+ *   and those past it that the reclaim had to skip because a running batch still holds them (or,
+ *   for a moment, a purge deleting them, which counts them once more than needed);
+ * - the expiries of its newest live records, backward from the newest by
+ *   `invitation_batch_replays_organization_expiry_index`, no more than the places the
  *   reservations leave.
  *
- * Neither part reads more than `budget` index entries plus the reservations among them, whatever
- * the organization holds. A row counts while its time runs at `statement_timestamp()`, the instant
- * of the read; expiries come back in whole milliseconds, rounded up, so a place is never announced
- * before it frees up.
+ * Neither part reads more than `budget` index entries plus the reservations among the records,
+ * whatever the organization holds. A record counts while its time runs at `statement_timestamp()`,
+ * the instant of the read; expiries come back in whole milliseconds, rounded up, so a place is
+ * never announced before it frees up.
  *
  * @param {string} organizationId - The organization.
  * @param {number} budget - The replay record budget.
@@ -180,11 +208,8 @@ export function keyedBatchUsageOf(organizationId: string, budget: number): SQL {
   return sql`with running as materialized (
       select count(*)::int as count from (
         select 1 from ${invitationBatchReplays}
-        where organization_id = ${organizationId}::uuid
-          and expires_at > ${PURGE_CUTOFF}
-          and expires_at <= ${PURGE_CUTOFF} + ${LEASE_WINDOW} + interval '1 second'
-          and state = 'reserved'
-        limit ${budget}::int) as live),
+        where organization_id = ${organizationId}::uuid and state = 'reserved'
+        limit ${budget}::int) as held),
     stored as materialized (
       select expires_at from ${invitationBatchReplays}
       where organization_id = ${organizationId}::uuid
@@ -336,17 +361,19 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
    * Method usage
    *
    * @description
-   * Counts, in one statement and so one snapshot, the reservations of the organization under a
-   * live lease, up to `budget`, then reads the expiries of its newest live records, no more than
-   * the places the reservations leave. Both range-scan
-   * `invitation_batch_replays_organization_expiry_index`: the reservations within the next lease
-   * window only, the records backward from the newest (`keyedBatchUsageOf`).
+   * First deletes the reservations of the organization whose lease ran out and that no
+   * transaction holds (`reclaimedReservationsOf`), without waiting; then counts, in one statement
+   * and so one snapshot, its remaining reservations up to `budget`, which a running batch keeps
+   * holding until it can no longer commit, and reads the expiries of its newest live records, no
+   * more than the places the reservations leave (`keyedBatchUsageOf`). The delete commits only
+   * with the reservation the admission then takes; a refusal rolls it back with the rest.
    *
    * @param {string} organizationId - The organization of the transaction.
    * @param {number} budget - The replay record budget.
    * @returns {Promise<KeyedInvitationBatchUsage>} The usage.
    */
   public async usage(organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage> {
+    await this.db.execute(reclaimedReservationsOf(organizationId, budget));
     const result = await this.db.execute<{
       running: number;
       read_at: number;
@@ -358,6 +385,26 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
       newestStoredExpiries: (row?.stored ?? []).map((epochMs: number) => new Date(epochMs)),
       readAt: new Date(row?.read_at ?? 0),
     };
+  }
+
+  /**
+   * Method isReserved
+   *
+   * @description
+   * Whether the key still has a reservation, whatever its lease, by its primary key and without a
+   * lock. After `usage` in the same transaction, a reservation whose lease ran out is still there
+   * only because a running batch holds it.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @returns {Promise<boolean>} `true` while a batch of the key may still commit.
+   */
+  public async isReserved(key: InvitationBatchReplayKey): Promise<boolean> {
+    const rows: { readonly keyDigest: string }[] = await this.db
+      .select({ keyDigest: invitationBatchReplays.keyDigest })
+      .from(invitationBatchReplays)
+      .where(and(keyOf(key), eq(invitationBatchReplays.state, 'reserved')))
+      .limit(1);
+    return rows.length > 0;
   }
 
   /**

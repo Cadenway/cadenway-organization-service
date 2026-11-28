@@ -154,6 +154,14 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
 The migration is additive: the previous release never reads the table, and a rollback keeps it
 (see "Rollout and rollback of idempotent batches").
 
+`migrations/0013_invitation_batch_reservation_index.sql` adds the partial index
+`invitation_batch_replays_reservation_index` on (`organization_id`, `expires_at`) of the
+`reserved` rows only, which the replay record budget counts and reclaims. It is a plain
+`create index`, as `0006` is: the migrator applies every migration in one transaction, where
+`concurrently` is refused, and the table holds at most the budget of rows per organization, so the
+short lock on its writes is accepted. Additive: the previous release ignores it, and a rollback
+keeps it.
+
 `0005_organization_logo` adds the nullable opaque `organizations.logo_id`, an independent
 `logo_generation` and tenant-owned upload reservations. A reservation binds the uploader,
 declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
@@ -550,12 +558,16 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   succeed.
 - Replay record budget (`inviteMembersKeyedInternal`, "Replay record budget"): an organization
   holds at most `KEYED_INVITATION_BATCH_BUDGET` (1,000) keyed batches at once, across its users
-  and both invitation routes: its records still inside their 24 hours plus its reservations under
-  a live lease. A reservation counts from the moment it is taken until its batch stores its record
-  (it then counts as that record) or deletes it; once its lease runs out it no longer counts. The
-  budget is checked only for a key without a live row, after the authorization, the organization
-  and the replay lookup, and before the daily allowances, so replays, `409` and `422` answer as
-  before. A key that would take the organization past the budget answers
+  and both invitation routes: its records still inside their 24 hours plus its reservations that
+  may still commit. A reservation counts from the moment it is taken until its batch stores its
+  record (it then counts as that record) or can no longer commit: deleted by its batch, or past
+  its lease with no transaction holding its row, when the admission of another key deletes it so
+  its batch can no longer renew it. The budget is checked only for a key without a live row,
+  after the authorization, the organization and the replay lookup, and before the daily
+  allowances, so replays, `409` and `422` answer as before; when the budget is full, a key whose
+  batch still runs past its lease answers the retryable `409 idempotency.request-in-progress`,
+  whatever the body, rather than the `429`. A key that would take the organization past the
+  budget answers
   `429 invitation.keyed-batch-limit-reached`: nothing is created, sent, emitted or stored, and the
   key is not reserved. `details.nextAvailableAt` is the expiry of the (count - budget + 1)-th
   oldest record, read as the (budget - running)-th newest, in whole milliseconds rounded up; when
@@ -666,13 +678,19 @@ The Search readers open their snapshots directly with the kit's transaction runn
 - The replay record budget is checked in the first transaction of a keyed batch, as one step with
   the reservation. Once the replay lookup found no live row, the transaction takes the
   `for key share` lock on the organization, then a transaction advisory lock on the reservations
-  of the organization (`pg_advisory_xact_lock`, under the normal lock timeout of the role), then
-  counts in one statement, read up to the budget, its reservations under a live lease (rows
-  expiring within the next lease window) and the expiries of its newest records, both by
+  of the organization (`pg_advisory_xact_lock`, under the normal lock timeout of the role). It
+  deletes at most a budget of the organization's reservations past their lease that it can lock
+  with `for update skip locked` (`invitation_batch_replays_reservation_index`), never waiting: a
+  batch holds its reservation's row from its first statement (`renew` and `complete` are updates of
+  that row in the batch's transaction), so the rows it locks belong to holders that crashed, gave
+  up or have not renewed yet, whose `renew` then finds no lease once the admission commits. Then
+  it counts in one statement, read up to the budget, the remaining reservations, live or held, by
+  the same partial index, and the expiries of its newest records, backward by
   `invitation_batch_replays_organization_expiry_index`; only then, within the budget, the 100 ms
   `lock_timeout` and the per-key lock of the reservation follow. A full budget reads the key's row
   once more, under the lock, so a key reserved by a request that went first still answers as
-  before, then answers the `429` and rolls back. The organization lock is held only by these
+  before, and a reservation of the key still there answers the retryable `409`; otherwise the
+  `429`, and the transaction rolls back, its deletes included. The organization lock is held only by these
   short reservation transactions, never by a batch, the renewal, the record or the release, so
   concurrent new keys of one organization queue for milliseconds; a wait beyond the 5 s lock
   timeout of the role fails with a 500.
@@ -776,13 +794,22 @@ Any failure rolls back the business rows and the outbox rows together
   100 ms timeout of the key give a false `409` to requests that only queue for the organization.
   It waits under the normal lock timeout, as the `for key share` lock does, since its holders are
   short reservations.
-- An expired lease no longer counts, as the contract says of a request that ends without storing
-  its outcome. Other readers see a reservation's lease as its reservation committed it until its
-  batch commits, so a batch that runs longer than its lease (beyond the statement and
-  idle-in-transaction timeouts its lease covers, see `INVITATION_BATCH_LEASE_MS`) stops counting
-  and can still store its record: the organization may then hold one more than the budget per
-  such batch until a record expires. Refusing such a record would roll back a batch that ran. Running batches alone filling the budget answer
-  `nextAvailableAt` a lease (30 s) away, the longest a running batch counts without renewing.
+- A running batch counts until it can no longer commit, not until its visible lease runs out:
+  other readers see a reservation's lease as its reservation committed it until its batch
+  commits, so a batch slower than its lease would otherwise stop counting while it can still
+  store its record, and two keys could fill one place (an earlier revision of this change). The
+  row lock tells the two apart without waiting: a reservation past its lease that `for update skip
+locked` cannot lock is held by its batch and counts; one it can lock has no running batch, and
+  the admission deletes it, so its holder, whose first statement is `renew`, finds no lease and
+  rolls back rather than commit later. Running batches alone filling the budget answer
+  `nextAvailableAt` a lease (30 s) away, a short delay within the life of a running batch. A
+  purge deleting an expired reservation also holds its row, which then counts until the purge
+  commits: a moment of a false `429`, never an overshoot.
+- The reservations have their own partial index, `invitation_batch_replays_reservation_index`
+  (`organization_id`, `expires_at`, `where state = 'reserved'`, `0013`), so the admission, under
+  the organization lock, reads only reservations: on the `(organization_id, expires_at)` index,
+  a burst of records expiring within the lease window was scanned and filtered out
+  (`tests/keyed-invitation-batch-budget.int-spec.ts` checks the plans on such a mix).
 - The budget is enforced only by releases that know it: during a rollout or a rollback, a previous
   release admits new keys without counting them; their records count from then on, and an
   organization may hold more than the budget until they expire, as the contract allows. The

@@ -539,6 +539,33 @@ describe('InviteMembers within the replay record budget', () => {
     expect(admitted.invitations[0]?.outcome).toBe('already-member');
   });
 
+  it('keeps counting a batch past its lease while it holds its key, and answers its key 409', async () => {
+    await invite.execute(keyed('members-page-1'));
+    scenario.store.failReplayRecords = true;
+    const running: InviteMembers = new InviteMembers(scenario.store, scenario.clock, BUDGET);
+    vi.spyOn(running as unknown as { release: () => Promise<void> }, 'release').mockResolvedValue();
+    await expect(running.execute(keyed('members-page-2'))).rejects.toThrow();
+    scenario.store.failReplayRecords = false;
+    for (const entry of scenario.store.tables.replays.values()) {
+      if (entry.state === 'reserved' && entry.leaseId !== null) {
+        scenario.store.heldLeases.add(entry.leaseId);
+      }
+    }
+    scenario.clock.advance(31_000);
+
+    await expect(invite.execute(keyed('members-page-3'))).rejects.toMatchObject({
+      refusal: { reason: 'invitation-keyed-batch-limit-reached' },
+    });
+    await expect(invite.execute(keyed('members-page-2'))).rejects.toMatchObject({
+      refusal: { reason: 'idempotency-request-in-progress' },
+    });
+
+    // The batch ended without storing its record: its reservation is reclaimed and frees a place.
+    scenario.store.heldLeases.clear();
+    const admitted: InviteMembersOutput = await invite.execute(keyed('members-page-3'));
+    expect(admitted.invitations[0]?.outcome).toBe('already-member');
+  });
+
   it('frees the place of a stored outcome once its 24 hours are over', async () => {
     await invite.execute(keyed('members-page-1'));
     await invite.execute(keyed('members-page-2'));

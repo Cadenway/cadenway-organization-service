@@ -196,6 +196,9 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
   /** How many times a reservation step locked the reservations of its organization. */
   public reservationLocks: number = 0;
 
+  /** The leases whose batch still holds its row, as a batch running past its lease does. */
+  public readonly heldLeases: Set<string> = new Set<string>();
+
   /** Leases handed out so far. */
   private leases: number = 0;
 
@@ -690,26 +693,42 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
           return Promise.resolve();
         },
         usage: (organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage> => {
-          // Reservations are visible as soon as they are written, records once committed.
+          // Reservations are visible as soon as they are written, records once committed. A
+          // reservation past its lease that no batch holds is reclaimed; a held one keeps counting.
           const now: Date = this.databaseNow();
-          const live: StoredReplay[] = [...this.tables.replays.values()].filter(
-            (entry: StoredReplay) =>
-              entry.organizationId === organizationId && entry.expiresAt.getTime() > now.getTime(),
+          for (const [claim, entry] of [...this.tables.replays]) {
+            if (
+              entry.organizationId === organizationId &&
+              entry.state === 'reserved' &&
+              entry.expiresAt.getTime() <= now.getTime() &&
+              !this.heldLeases.has(entry.leaseId ?? '')
+            ) {
+              this.tables.replays.delete(claim);
+              tables.replays.delete(claim);
+            }
+          }
+          const rows: StoredReplay[] = [...this.tables.replays.values()].filter(
+            (entry: StoredReplay) => entry.organizationId === organizationId,
           );
           const running: number = Math.min(
             budget,
-            live.filter((entry: StoredReplay) => entry.state === 'reserved').length,
+            rows.filter((entry: StoredReplay) => entry.state === 'reserved').length,
           );
           return Promise.resolve({
             running,
-            newestStoredExpiries: live
-              .filter((entry: StoredReplay) => entry.state === 'committed')
+            newestStoredExpiries: rows
+              .filter(
+                (entry: StoredReplay) =>
+                  entry.state === 'committed' && entry.expiresAt.getTime() > now.getTime(),
+              )
               .map((entry: StoredReplay) => entry.expiresAt)
               .sort((left: Date, right: Date) => right.getTime() - left.getTime())
               .slice(0, keyedInvitationBatchStoredToRead(budget, running)),
             readAt: now,
           });
         },
+        isReserved: (key: InvitationBatchReplayKey): Promise<boolean> =>
+          Promise.resolve(this.tables.replays.get(replayKeyOf(key))?.state === 'reserved'),
         reserve: (
           key: InvitationBatchReplayKey,
           request: InvitationBatchRequest,

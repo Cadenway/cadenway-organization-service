@@ -5,12 +5,18 @@ import { JobScheduler } from '@cadenway/nest-jobs/runtime';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
+import type pg from 'pg';
 import request from 'supertest';
 import type { Response, Test } from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
-import { keyedBatchUsageOf } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-batch-replay.repository.js';
+import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
+import { InvitationBatchRequest } from '../src/modules/organizations/domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import {
+  keyedBatchUsageOf,
+  reclaimedReservationsOf,
+} from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/drizzle-invitation-batch-replay.repository.js';
 import { DeclaredErrors } from './support/declared-errors.js';
 import type { SeenError } from './support/declared-errors.js';
 import { newId, ServiceStack } from './support/service-stack.js';
@@ -223,6 +229,78 @@ describe('replay record budget of keyed invitation batches', () => {
     return next;
   }
 
+  /**
+   * Leaves a batch of Inès (her address-of-a-member batch) running past its lease: its reservation
+   * was committed with a lease that ran out, and its transaction renewed it, which nobody else sees,
+   * and still holds the row, as `renew` does from the first statement of a batch.
+   *
+   * @param organizationId - The organization.
+   * @param key - The key of the batch.
+   * @returns The connection of the batch, in its open transaction: commit or roll it back.
+   */
+  async function runningPastItsLease(organizationId: string, key: string): Promise<pg.PoolClient> {
+    const canonical: string = InvitationBatchRequest.of(
+      distinctAddresses([hugo.email]),
+      'member',
+    ).canonical;
+    await stack.system(
+      `insert into invitation_batch_replays
+         (organization_id, actor_user_id, key_digest, request_digest, state, lease_id, expires_at)
+       values ($1, $2, $3, $4, 'reserved', uuidv7(), clock_timestamp() - interval '1 second')`,
+      [organizationId, ines.id, digestOf(key), digestOf(canonical)],
+    );
+    const holder: pg.PoolClient = await stack.migrator.connect();
+    await holder.query('begin');
+    await holder.query(`select set_config('app.system_access', 'on', true)`);
+    await holder.query(
+      `update invitation_batch_replays set expires_at = clock_timestamp() + interval '30 seconds'
+       where organization_id = $1 and key_digest = $2 and state = 'reserved'`,
+      [organizationId, digestOf(key)],
+    );
+    return holder;
+  }
+
+  /**
+   * The index scans of the plan of a statement, sequential scans disabled.
+   *
+   * @param statement - The statement.
+   * @returns Each index scan with its index, condition and direction.
+   */
+  async function indexScansOf(
+    statement: SQL,
+  ): Promise<{ readonly index: string; readonly condition: string; readonly direction: string }[]> {
+    const plan: unknown = await app.get(SystemTransactionRunner).run(async ({ db }) => {
+      await db.execute(sql`set local enable_seqscan = off`);
+      const result = await db.execute<{ 'QUERY PLAN': unknown }>(
+        sql`explain (format json) ${statement}`,
+      );
+      return result.rows[0]?.['QUERY PLAN'];
+    });
+    const scans: {
+      readonly index: string;
+      readonly condition: string;
+      readonly direction: string;
+    }[] = [];
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) {
+        node.forEach(visit);
+        return;
+      }
+      if (typeof node !== 'object' || node === null) return;
+      const fields = node as Record<string, unknown>;
+      if (typeof fields['Index Name'] === 'string') {
+        scans.push({
+          index: fields['Index Name'],
+          condition: typeof fields['Index Cond'] === 'string' ? fields['Index Cond'] : '',
+          direction: typeof fields['Scan Direction'] === 'string' ? fields['Scan Direction'] : '',
+        });
+      }
+      Object.values(fields).forEach(visit);
+    };
+    visit(plan);
+    return scans;
+  }
+
   beforeAll(async () => {
     stack = await ServiceStack.start('keyed-batch-budget');
     app = await stack.startApplication();
@@ -381,48 +459,124 @@ describe('replay record budget of keyed invitation batches', () => {
     expect(limited(refused).toISOString()).toBe(await storedExpiry(organizationId, 4));
   });
 
-  it('reads the budget by index ranges on the organization and the expiry', async () => {
+  it('keeps counting a batch running past its lease until it commits its record', async () => {
     const organizationId: string = await organization();
-    const statement: SQL = keyedBatchUsageOf(organizationId, BUDGET);
-    const plan: unknown = await app.get(SystemTransactionRunner).run(
-      async ({ db }) => {
-        await db.execute(sql`set local enable_seqscan = off`);
-        const result = await db.execute<{ 'QUERY PLAN': unknown }>(
-          sql`explain (format json) ${statement}`,
-        );
-        return result.rows[0]?.['QUERY PLAN'];
-      },
-      { readOnly: true },
-    );
-    const scans: {
-      readonly index: string;
-      readonly condition: string;
-      readonly direction: string;
-    }[] = [];
-    const visit = (node: unknown): void => {
-      if (Array.isArray(node)) {
-        node.forEach(visit);
-        return;
-      }
-      if (typeof node !== 'object' || node === null) return;
-      const fields = node as Record<string, unknown>;
-      if (typeof fields['Index Name'] === 'string') {
-        scans.push({
-          index: fields['Index Name'],
-          condition: typeof fields['Index Cond'] === 'string' ? fields['Index Cond'] : '',
-          direction: typeof fields['Scan Direction'] === 'string' ? fields['Scan Direction'] : '',
-        });
-      }
-      Object.values(fields).forEach(visit);
-    };
-    visit(plan);
+    await held(organizationId, 'committed', [600, 1_200]);
+    const holder: pg.PoolClient = await runningPastItsLease(organizationId, 'members-page-running');
+    try {
+      const refused: Response = await invite(organizationId, { key: 'members-page-new' });
+      // One running and two stored fill the three places: the older stored one frees one.
+      expect(limited(refused).toISOString()).toBe(await storedExpiry(organizationId, 1));
 
-    expect(scans).toHaveLength(2);
-    for (const scan of scans) {
-      expect(scan.index).toBe('invitation_batch_replays_organization_expiry_index');
-      expect(scan.condition).toMatch(/organization_id = .*expires_at > statement_timestamp\(\)/u);
+      // Its own key, the same batch or another, answers the retryable 409, never the 429.
+      const same: Response = await invite(organizationId, { key: 'members-page-running' });
+      const other: Response = await invite(organizationId, {
+        key: 'members-page-running',
+        emails: ['lucie.bernard@exemple.fr'],
+      });
+      for (const response of [same, other]) {
+        expect(response.status).toBe(409);
+        expect(response.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      }
+
+      // The batch stores its record and commits: it now counts as that record.
+      await holder.query(
+        `update invitation_batch_replays
+         set state = 'committed', lease_id = null, outcome = '[]'::jsonb,
+             expires_at = clock_timestamp() + interval '24 hours'
+         where organization_id = $1 and key_digest = $2`,
+        [organizationId, digestOf('members-page-running')],
+      );
+      await holder.query('commit');
+    } finally {
+      holder.release();
     }
-    expect(scans.map((scan) => scan.direction)).toContain('Backward');
+    const stillFull: Response = await invite(organizationId, { key: 'members-page-new' });
+    expect(limited(stillFull).toISOString()).toBe(await storedExpiry(organizationId, 1));
+    expect(await effects(organizationId)).toMatchObject({ replays: BUDGET });
+  });
+
+  it('frees the place of a batch running past its lease once it ends without its record', async () => {
+    const organizationId: string = await organization();
+    await held(organizationId, 'committed', [600, 1_200]);
+    const holder: pg.PoolClient = await runningPastItsLease(organizationId, 'members-page-running');
+    try {
+      limited(await invite(organizationId, { key: 'members-page-new' }));
+      await holder.query('rollback');
+    } finally {
+      holder.release();
+    }
+
+    const admitted: Response = await invite(organizationId, { key: 'members-page-new' });
+
+    expect(admitted.status).toBe(200);
+    // The reservation that ended is deleted with the admission, the new one took its place.
+    const reservations = await stack.system<{ key_digest: string }>(
+      `select key_digest from invitation_batch_replays where organization_id = $1
+       and key_digest in ($2, $3)`,
+      [organizationId, digestOf('members-page-running'), digestOf('members-page-new')],
+    );
+    expect(reservations).toEqual([{ key_digest: digestOf('members-page-new') }]);
+    expect(await effects(organizationId)).toMatchObject({ replays: BUDGET });
+  });
+
+  it('counts the reservations by their own index, whatever records expire meanwhile', async () => {
+    const organizationId: string = await organization();
+    // A burst of records expiring within the lease window, older records and two reservations,
+    // among the records of other organizations, as in a shared table.
+    const others: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      others.push(await organization());
+    }
+    for (const [index, owner] of [organizationId, ...others].entries()) {
+      await stack.system(
+        `insert into invitation_batch_replays
+           (organization_id, actor_user_id, key_digest, request_digest, state, outcome, expires_at)
+         select $1, $2, encode(sha256(convert_to($3 || '-key-' || n, 'UTF8')), 'hex'),
+                encode(sha256(convert_to($3 || '-batch-' || n, 'UTF8')), 'hex'), 'committed',
+                '[]'::jsonb,
+                clock_timestamp() + make_interval(secs => case when n <= 400 then 20 else 40000 end)
+         from generate_series(1, 800) as n`,
+        [owner, ines.id, String(index)],
+      );
+    }
+    await held(organizationId, 'reserved', [30, -5]);
+    await stack.system('analyze invitation_batch_replays');
+
+    const reclaim = await indexScansOf(reclaimedReservationsOf(organizationId, BUDGET));
+    const usage = await indexScansOf(keyedBatchUsageOf(organizationId, BUDGET));
+
+    expect(reclaim).toContainEqual(
+      expect.objectContaining({
+        index: 'invitation_batch_replays_reservation_index',
+        condition: expect.stringMatching(
+          /organization_id = .*expires_at <= statement_timestamp\(\)/u,
+        ) as string,
+      }),
+    );
+    expect(usage).toContainEqual(
+      expect.objectContaining({
+        index: 'invitation_batch_replays_reservation_index',
+        condition: expect.stringMatching(/organization_id = /u) as string,
+      }),
+    );
+    expect(usage).toContainEqual(
+      expect.objectContaining({
+        index: 'invitation_batch_replays_organization_expiry_index',
+        condition: expect.stringMatching(
+          /organization_id = .*expires_at > statement_timestamp\(\)/u,
+        ) as string,
+        direction: 'Backward',
+      }),
+    );
+    // No part reads the records of the organization forward through the lease window.
+    expect(
+      usage.filter(
+        (scan) =>
+          scan.index === 'invitation_batch_replays_organization_expiry_index' &&
+          scan.direction !== 'Backward',
+      ),
+    ).toEqual([]);
   });
 
   it('answers only error codes the contract declares', () => {

@@ -391,8 +391,11 @@ export class InviteMembers {
    * with its reservation: the reservations of the organization are serialized from here to the
    * commit of the reservation, so concurrent new keys never take it past the budget. When no place
    * is left, a row of the key committed by a request that reserved it before this one took the
-   * lock still answers as before (a replay, `409` or `422`); otherwise the batch answers
-   * `invitation-keyed-batch-limit-reached` and the key is not reserved.
+   * lock still answers as before (a replay, `409` or `422`), and a batch of the key still running
+   * past its lease answers the retryable `idempotency-request-in-progress`, whatever the body, as
+   * when the budget is not full (an expired reservation never decides a terminal answer);
+   * otherwise the batch answers `invitation-keyed-batch-limit-reached` and the key is not reserved.
+   * Nothing here waits on a batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {KeyedBatch} batch - The scoped key and the canonical batch.
@@ -401,6 +404,7 @@ export class InviteMembers {
    * place is left for it.
    * @throws {InvitationKeyedBatchLimitReachedError} When the organization holds `budget` keyed
    * batches.
+   * @throws {OrganizationRefusal} `idempotency-request-in-progress` while a batch of the key runs.
    */
   private static async admit(
     store: OrganizationsStore,
@@ -419,6 +423,10 @@ export class InviteMembers {
       const meanwhile: InviteMembersOutput | null = await InviteMembers.settle(store, batch);
       if (meanwhile !== null) {
         return meanwhile;
+      }
+      if (await store.invitationBatchReplays.isReserved(batch.key)) {
+        // Past its lease, its batch still holds the key and may still commit: retry later.
+        throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
       }
       throw error;
     }
