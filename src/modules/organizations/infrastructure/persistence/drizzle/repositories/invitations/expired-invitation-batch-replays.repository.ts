@@ -1,4 +1,8 @@
-import type { SystemTransactionRunner } from '@cadenway/nest-common/database';
+import type {
+  SystemTransactionRunner,
+  TransactionDatabase,
+  TransactionOptions,
+} from '@cadenway/nest-common/database';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
@@ -72,11 +76,11 @@ export interface PurgeWindow {
  * @description
  * Deletes expired replay records of every organization, a bounded batch at a time, independently
  * of the tenants' traffic. Each batch is a system transaction of its own, a bounded exception of
- * `MODULE.md`: it names only rows whose replay is over. A call takes an absolute deadline: once its
- * transaction holds a connection (the wait for one counts), it runs nothing when the deadline or
- * the job's abort has come, and otherwise caps its statements at the time left
- * (`statement_timeout`, which counts lock waits too), so a purge never outlasts its tick: a
- * statement cut short fails, rolls its batch back and leaves the rows to the next tick.
+ * `MODULE.md`: it names only rows whose replay is over. A call takes an absolute deadline and the
+ * job's abort signal: the wait for a pooled connection races them (`within`), and once the
+ * transaction holds one in time its statements are capped at the time left (`statement_timeout`,
+ * which counts lock waits too), so a purge never outlasts its tick: a statement cut short fails,
+ * rolls its batch back and leaves the rows to the next tick.
  */
 export class ExpiredInvitationBatchReplays {
   // #region Constructor
@@ -110,12 +114,7 @@ export class ExpiredInvitationBatchReplays {
    * once the transaction began.
    */
   public purge(limit: number, window: PurgeWindow): Promise<number | null> {
-    return this.system.run(async ({ db }) => {
-      const timeout: string | null = this.timeoutWithin(window);
-      if (timeout === null) {
-        return null;
-      }
-      await db.execute(sql`select set_config('statement_timeout', ${timeout}, true)`);
+    return this.within(window, {}, async (db: TransactionDatabase): Promise<number> => {
       const result = await db.execute(expiredPurgeOf(limit));
       return result.rowCount ?? 0;
     });
@@ -133,36 +132,89 @@ export class ExpiredInvitationBatchReplays {
    * was left once the transaction began.
    */
   public oldestExpiredAgeSeconds(window: PurgeWindow): Promise<number | null> {
-    return this.system.run(
-      async ({ db }) => {
-        const timeout: string | null = this.timeoutWithin(window);
-        if (timeout === null) {
-          return null;
-        }
-        await db.execute(sql`select set_config('statement_timeout', ${timeout}, true)`);
+    return this.within(
+      window,
+      { readOnly: true },
+      async (db: TransactionDatabase): Promise<number | null> => {
         const result = await db.execute<{ age: number | null }>(
           sql`select floor(extract(epoch from ${PURGE_CUTOFF} - min(expires_at)))::int as age
               from ${invitationBatchReplays} where expires_at <= ${PURGE_CUTOFF}`,
         );
         return result.rows[0]?.age ?? null;
       },
-      { readOnly: true },
     );
   }
 
   /**
-   * Method timeoutWithin
+   * Method within
    *
    * @description
-   * The `statement_timeout` left to a call once its transaction holds a connection, or `null` when
-   * its deadline or its abort has come.
+   * Runs `work` in a system transaction bounded by `window`, the wait for a pooled connection
+   * included. The checkout races the deadline and the abort signal: if either comes first, the call
+   * answers `null` at once, and the transaction, whenever it gets its connection, runs no statement
+   * of its own and ends, which gives the connection back to the pool. Once the transaction holds its
+   * connection in time, the race is over and `statement_timeout` bounds the rest at the time left.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
-   * @returns {string | null} The setting, or `null` to run nothing.
+   * @param {TransactionOptions} options - How the transaction is opened.
+   * @param {(db: TransactionDatabase) => Promise<TResult>} work - The statements of the call.
+   * @returns {Promise<TResult | null>} What `work` resolved with, or `null` without time left.
    */
-  private timeoutWithin(window: PurgeWindow): string | null {
-    const remaining: number = window.deadline - this.now();
-    return remaining <= 0 || window.signal.aborted ? null : timeoutOf(remaining);
+  private within<TResult>(
+    window: PurgeWindow,
+    options: TransactionOptions,
+    work: (db: TransactionDatabase) => Promise<TResult>,
+  ): Promise<TResult | null> {
+    const left: number = window.deadline - this.now();
+    if (left <= 0 || window.signal.aborted) {
+      return Promise.resolve(null);
+    }
+    return new Promise<TResult | null>((resolve, reject) => {
+      let state: 'checking-out' | 'running' | 'abandoned' = 'checking-out';
+      const race: { timer?: ReturnType<typeof setTimeout> } = {};
+      const listeners: { abandon: () => void } = { abandon: (): void => undefined };
+      const stopRace = (): void => {
+        clearTimeout(race.timer);
+        window.signal.removeEventListener('abort', listeners.abandon);
+      };
+      listeners.abandon = (): void => {
+        if (state === 'checking-out') {
+          state = 'abandoned';
+          stopRace();
+          resolve(null);
+        }
+      };
+      const abandon = listeners.abandon;
+      race.timer = setTimeout(abandon, left);
+      window.signal.addEventListener('abort', abandon, { once: true });
+      this.system
+        .run(async ({ db }): Promise<TResult | null> => {
+          const remaining: number = window.deadline - this.now();
+          if (state === 'abandoned' || remaining <= 0 || window.signal.aborted) {
+            abandon();
+            return null;
+          }
+          state = 'running';
+          stopRace();
+          await db.execute(
+            sql`select set_config('statement_timeout', ${timeoutOf(remaining)}, true)`,
+          );
+          return work(db);
+        }, options)
+        .then(
+          (value: TResult | null): void => {
+            stopRace();
+            resolve(value);
+          },
+          (error: unknown): void => {
+            stopRace();
+            // A transaction the call gave up on can only fail on its own; nobody waits for it.
+            if (state !== 'abandoned') {
+              reject(error instanceof Error ? error : new Error(String(error)));
+            }
+          },
+        );
+    });
   }
   // #endregion
 }

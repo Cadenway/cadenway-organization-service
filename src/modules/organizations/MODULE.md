@@ -99,10 +99,11 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   (`invitation_batch_replays_expiry_index`, oldest first, `skip locked`), each in its own system
   transaction, one after the other until one deletes fewer than 500 or 5 seconds have passed (under
   the 8 s shutdown timeout of the job runtime). Each call gets the absolute deadline of the tick
-  (less the last 500 ms, kept for the read of the backlog) and the job's abort signal; once its
-  transaction holds a pooled connection, the wait for one included, it runs nothing if either has
-  passed, and otherwise sets the time left as its `statement_timeout`. A delete cut short rolls
-  back and fails the tick, which its queue retries.
+  (less the last 500 ms, kept for the read of the backlog) and the job's abort signal. The wait
+  for a pooled connection races both: if either comes first, the call answers at once, and the
+  transaction, whenever it gets its connection, runs no statement and ends, giving it back. A
+  transaction that gets its connection in time sets the time left as its `statement_timeout`. A
+  delete cut short rolls back and fails the tick, which its queue retries.
   A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
@@ -196,7 +197,7 @@ members keep their access if the organization is over the reduced limit.
 | `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`, 409 `idempotency.request-in-progress`, 422 `idempotency.key-reused`, 429 `invitation.daily-limit-reached`         |
 | `POST /internal/v1/invitation-batches`                     | Required     | 200                     | As above; 400 also without `Idempotency-Key`, which it requires                                                                                           |
 | `GET /internal/v1/invitations`                             | Required     | 200                     | 400, 403, 404                                                                                                                                             |
-| `GET /internal/v1/invitations/{invitationId}`              | Required     | 200, `no-store`         | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
+| `GET /internal/v1/invitations/{invitationId}`              | Required     | 200, `no-store`, no tag | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
 | `DELETE /internal/v1/invitations/{invitationId}`           | Required     | 204                     | 400, 403, 404 `invitation.not-found`, 409 `invitation.answered`                                                                                           |
 | `POST /internal/v1/invitations/{invitationId}/resend`      | Required     | 200, `ETag`             | 400, 403, 404, 409 `invitation.revoked`, `invitation.answered`, 429 `invitation.resend-throttled`, `invitation.daily-limit-reached`                       |
 | `GET /internal/v1/users/{userId}/invitations`              | None         | 200                     | 400, 404 `user.not-found`                                                                                                                                 |
@@ -505,9 +506,10 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `revokedAt` for a revocation, from `answered_at`, which holds the instant that closed it; a
   revocation keeps the row with its status, so the three are stored, never inferred. The actor's
   role and the invitation are read from one snapshot. The answer is `Cache-Control: private,
-no-store` and never conditional (`If-None-Match` and `If-Modified-Since` are ignored): an
-  invitation becomes `expired` without a new `version`, so the `ETag` the kit derives from the
-  version cannot validate a copy and a `304` could show a stale state.
+no-store`, carries no `ETag` and is never conditional: an invitation becomes `expired` without
+  a new `version`, so a tag derived from the version could validate a stale copy. The handler
+  writes the body itself, so neither the kit's `EtagInterceptor` nor Express adds a tag or
+  answers `304`.
 - Received invitations use the current verified address from Identity. The local directory
   still tracks account existence and deletion. Acceptance and refusal check that the invitation
   still matches the address from Identity under the invitation lock. These routes require
@@ -641,6 +643,13 @@ Any failure rolls back the business rows and the outbox rows together
   (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists.
+- No admission limit bounds the replay records. A keyed batch whose addresses are all members or
+  already invited sends no email, so the email allowance does not bound its record. Accepted
+  because each record is bounded (at most 50 addresses per batch, the limit of the contract's
+  `InvitationBatch`), the gateway throttles each session, and the purge drains more than 500 rows
+  per tick on demand. A hard cap would need a new public error code, a contract change. Revisit
+  with production figures: the `oldestExpiredAgeSeconds` the purge logs when it stops on its
+  budget, and the size of `invitation_batch_replays`.
 - Replay support is signalled by a route, not by a capability flag or a gateway switch: a keyed
   batch goes to `POST /internal/v1/invitation-batches`, which a release without replays does not
   serve, so a rolling deploy or a rollback can never run a keyed retry as a fresh batch (which

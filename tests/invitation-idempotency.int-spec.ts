@@ -1206,13 +1206,13 @@ describe('idempotent invitation batches and the invitation state', () => {
       });
     });
 
-    it('never answers 304 to a copy validated by the tag of an earlier state', async () => {
+    it('answers without ETag and never 304, even to a copy tagged by the version', async () => {
       const invitationId: string = await invited('xena@ateliernord.fr');
       const path = `${INVITATIONS}/${invitationId}`;
       const pending: Response = await request(app.getHttpServer())
         .get(path)
         .set('Authorization', await stack.bearer(camille.id, atelierNordId));
-      const tag: unknown = pending.headers.etag;
+      const tag = '"1"';
       await stack.system(
         `update invitations set sent_at = now() - interval '8 days',
          expires_at = now() - interval '1 day' where id = $1`,
@@ -1222,13 +1222,17 @@ describe('idempotent invitation batches and the invitation state', () => {
       const revalidated: Response = await request(app.getHttpServer())
         .get(path)
         .set('Authorization', await stack.bearer(camille.id, atelierNordId))
-        .set('If-None-Match', typeof tag === 'string' ? tag : '"1"')
+        .set('If-None-Match', tag)
         .set('If-Modified-Since', new Date().toUTCString());
 
       expect(pending.status).toBe(200);
       expect(pending.headers['cache-control']).toBe('private, no-store');
+      expect(pending.headers.etag).toBeUndefined();
+      expect(pending.headers['content-type']).toMatch(/^application\/json/u);
+      expect(GetInvitationInternalResponse.parse(pending.body)).toEqual(pending.body);
       expect(revalidated.status).toBe(200);
       expect(revalidated.headers['cache-control']).toBe('private, no-store');
+      expect(revalidated.headers.etag).toBeUndefined();
       expect(revalidated.body).toMatchObject({ id: invitationId, status: 'expired', version: 1 });
     });
 

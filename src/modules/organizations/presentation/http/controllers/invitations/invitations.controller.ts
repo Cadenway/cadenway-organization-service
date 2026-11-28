@@ -15,10 +15,9 @@ import {
   Param,
   Post,
   Query,
-  Req,
   Res,
 } from '@nestjs/common';
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
 
 import type { PagePosition } from '../../../../application/models/pagination/page-position.model.js';
 import type { InvitationStateView } from '../../../../application/projections/invitations/invitation-state-view.projection.js';
@@ -197,25 +196,18 @@ export class InvitationsController {
    * @description
    * `GET /internal/v1/invitations/{invitationId}`: `200` with the invitation in any state; `400`,
    * `403 organization.role-forbidden`, `404 invitation.not-found` or `organization.not-found`.
-   * Uncacheable and never conditional (`private, no-store`, `If-None-Match` and
-   * `If-Modified-Since` ignored): its `status` moves from `pending` to `expired` with time, without
-   * a new `version`, so the `ETag` the kit derives from the version cannot validate a copy.
+   * Uncacheable, without `ETag` and never conditional (`private, no-store`): its `status` moves
+   * from `pending` to `expired` with time, without a new `version`, so no tag derived from the
+   * version can validate a copy. The handler writes the body itself with `end`, which neither the
+   * kit's `EtagInterceptor` (it sees no returned body) nor the `ETag` and freshness check of
+   * Express `send` reach; a refusal still goes through the problem filter of the kit.
    *
    * @param {GetInvitationPath} path - The id of the invitation.
-   * @param {Request} request - The request, whose conditional headers are dropped.
-   * @param {Response} response - The response, for `Cache-Control`.
-   * @returns {Promise<InvitationState>} The invitation and its state.
+   * @param {Response} response - The response the handler writes.
+   * @returns {Promise<void>} Resolves once the body is written.
    */
   @Get(':invitationId')
-  public async get(
-    @Param() path: GetInvitationPath,
-    @Req() request: Request,
-    @Res({ passthrough: true }) response: Response,
-  ): Promise<InvitationState> {
-    // Express freshness checks would otherwise answer a 304 from the version alone.
-    delete request.headers['if-none-match'];
-    delete request.headers['if-modified-since'];
-    response.setHeader('Cache-Control', 'private, no-store');
+  public async get(@Param() path: GetInvitationPath, @Res() response: Response): Promise<void> {
     const view: InvitationStateView = await answerRefusals(() =>
       this.getInvitation.execute({
         actorUserId: toActorUserId(),
@@ -223,7 +215,12 @@ export class InvitationsController {
         invitationId: path.invitationId,
       }),
     );
-    return toInvitationStateResponse(view);
+    const body: InvitationState = toInvitationStateResponse(view);
+    response
+      .status(200)
+      .setHeader('Cache-Control', 'private, no-store')
+      .setHeader('Content-Type', 'application/json; charset=utf-8')
+      .end(JSON.stringify(body));
   }
 
   /**
