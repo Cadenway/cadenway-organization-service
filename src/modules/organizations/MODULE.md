@@ -102,26 +102,33 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   tenants' traffic: bounded deletes of at most 500 expired records of any organization
   (`invitation_batch_replays_expiry_index`, oldest first, `skip locked`), each in its own system
   transaction, one after the other until one deletes fewer than 500 or 5 seconds have passed (under
-  the 8 s shutdown timeout of the job runtime). Each call gets the absolute deadline of the tick
+  the 8 s shutdown timeout of the job runtime), measured on the monotonic clock of the process
+  (`performance.now()`), so a step of the wall clock never stretches nor cuts a tick; the records
+  keep the database clock for their expiry. Each call gets the absolute deadline of the tick
   (less the last 500 ms, kept for the read of the backlog) and the job's abort signal. The wait
   for a pooled connection races both: if either comes first, the call answers at once, and the
-  transaction, whenever it gets its connection, runs no statement and ends, giving it back. A
-  transaction that gets its connection in time sets the time left as both its
-  `statement_timeout` and its `idle_in_transaction_session_timeout`, then checks the deadline and
-  the abort once more right before its statement, which it skips if either came meanwhile. The
-  race lasts until the transaction ends, its commit included: when the deadline or the abort wins,
-  the call answers at once and never waits for the transaction, which runs no further statement;
-  the server cancels a statement past its timeout and terminates a session left idle in its
-  transaction (a stalled commit included), so the pool discards that connection instead of
-  reusing it. The kit's runner gives no handle on the connection, so these two timeouts are the
-  bound: the time left when the transaction began, past its first statement. A call that had no
-  time left before its delete started answers `null`, the normal end of a tick; a deadline or an
-  abort that comes while a delete is in flight or committing fails the call, and with it the tick,
-  since the server may cancel that delete: the queue's bounded retry then applies.
-  At most one purge call per process is in flight: the store keeps the call it gave up on until
-  it settles, and meanwhile every new call answers `null` without checking out a connection, while
-  a tick (or its retry) skips at once and logs `skippedTicks` at `warn`, so a stalled connection is
-  never joined by another one. A keyed batch stores a record even when it sends
+  transaction, whenever it gets its connection, gives it back unused. A transaction that gets its
+  connection in time sets the time left as both its `statement_timeout` and its
+  `idle_in_transaction_session_timeout`, then checks the deadline and the abort once more right
+  before its statement, which it skips if either came meanwhile. The race lasts until the
+  transaction ends, its commit included: when the deadline or the abort wins, the call answers at
+  once and **destroys the connection on the client side**: the purge's system transactions run on
+  a connection of the pool it can discard (`DiscardableSystemTransactions`, the same row-level
+  security settings as the kit's system runner, which gives no handle on its connection), and
+  releasing it with an error makes `pg` destroy its socket, so the pending statement, a stalled
+  commit included, rejects at once, even on a connection stuck at the socket level that would
+  never answer; the pool never reuses it. The server rolls the transaction back once it notices the
+  disconnection, and the two timeouts still bound, on its side, the locks it may hold until then. A
+  call that had no time left before its delete started answers `null`, the normal end of a tick; a
+  deadline or an abort that comes while a delete is in flight or committing fails the call, and
+  with it the tick, since the server may cancel that delete: the queue's bounded retry then
+  applies. At most one purge call per process is in flight: the store keeps the call it gave up on
+  until it settles, which the discard makes immediate, and meanwhile every new call answers `null`
+  without checking out a connection, while a tick (or its retry) skips at once and logs
+  `skippedTicks` at `warn`, so a stalled connection is never joined by another one. That skip is a
+  fallback: only a call still waiting for a pooled connection outlives its discard, until the pool
+  hands it one (it gives it back unused) or its 5 s connection timeout ends the wait; the next tick
+  then runs. A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
   next tick continues. A failed tick is retried by its queue, which the migrator provisions with
@@ -622,7 +629,10 @@ The Search readers open their snapshots directly with the kit's transaction runn
   and its reservation is then free once the lease runs out). No step waits on a lock held by a
   batch in flight.
 - The purge job runs in system transactions, a bounded exception: each one `delete` of at most 500
-  expired replay records, chosen by expiry and skipping the rows a batch is deleting.
+  expired replay records, chosen by expiry and skipping the rows a batch is deleting. They are
+  opened by `DiscardableSystemTransactions` on the service's pool rather than by the kit's runner,
+  so that a transaction given up on at its deadline has its connection destroyed; they never join
+  an ambient transaction and are not retried by the runner.
 - System transaction, the **bounded exceptions** of decision 9, each with explicit filters:
   - the creation of an organization: the organization does not exist before it and PostgreSQL
     assigns its id on insert, so no tenant transaction can hold it; it writes the rows of the new
@@ -708,6 +718,13 @@ Any failure rolls back the business rows and the outbox rows together
   per tick on demand. A hard cap would need a new public error code, a contract change. Revisit
   with production figures: the `oldestExpiredAgeSeconds` the purge logs when it stops on its
   budget, and the size of `invitation_batch_replays`.
+- A purge call given up on at its deadline destroys its own connection on the client side rather
+  than waiting for the server's timeouts (an earlier revision, on the kit's runner, which gives no
+  handle on its connection) or terminating its backend from another connection: a connection stuck
+  at the socket level never delivers the server's answer, so only a client-side destroy settles
+  the call, and the skip that kept a second connection from joining it then held every later
+  tick of the replica forever while expired records, which hold invited addresses, stayed. A
+  second connection to terminate the first would also break the one-connection bound of the purge.
 - Replay support is signalled by a route, not by a capability flag or a gateway switch: a keyed
   batch goes to `POST /internal/v1/invitation-batches`, which a release without replays does not
   serve, so a rolling deploy or a rollback can never run a keyed retry as a fresh batch (which

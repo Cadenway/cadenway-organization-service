@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import net from 'node:net';
 
 import {
   GetInvitationInternalResponse,
@@ -8,15 +9,15 @@ import type {
   InvitationBatchResult,
   InvitationState,
 } from '@cadenway/contracts/types/internal/organization-service';
-import { SystemTransactionRunner } from '@cadenway/nest-common/database';
-import { JobScheduler } from '@cadenway/nest-jobs/runtime';
+import { DATABASE_POOL, SystemTransactionRunner } from '@cadenway/nest-common/database';
+import { JobScheduler, JobWorkerRegistry } from '@cadenway/nest-jobs/runtime';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import type pg from 'pg';
+import pg from 'pg';
 import request from 'supertest';
 import type { Response, Test } from 'supertest';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
 import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
@@ -26,6 +27,7 @@ import {
   ExpiredInvitationBatchReplays,
   expiredPurgeOf,
 } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
+import { DiscardableSystemTransactions } from '../src/modules/organizations/infrastructure/persistence/drizzle/transactions/invitations/discardable-system.transaction.js';
 import { PurgeInvitationBatchReplaysHandler } from '../src/modules/organizations/presentation/jobs/handlers/invitations/purge-invitation-batch-replays.handler.js';
 import { DeclaredErrors } from './support/declared-errors.js';
 import type { SeenError } from './support/declared-errors.js';
@@ -160,6 +162,18 @@ describe('idempotent invitation batches and the invitation state', () => {
   async function count(text: string, organizationId: string): Promise<number> {
     const rows = await stack.system<{ count: number }>(text, [organizationId]);
     return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * A store of the expired replay records on the pool of the application, as the purge job has.
+   *
+   * @param pool - The pool its transactions check connections out of.
+   * @returns The store.
+   */
+  function purgeStore(
+    pool: pg.Pool = app.get<pg.Pool>(DATABASE_POOL),
+  ): ExpiredInvitationBatchReplays {
+    return new ExpiredInvitationBatchReplays(new DiscardableSystemTransactions(pool));
   }
 
   /** What a batch writes in an organization, to compare before and after a request. */
@@ -547,10 +561,10 @@ describe('idempotent invitation batches and the invitation state', () => {
         ]);
         try {
           await lock.waiting(1);
-          purged = await new ExpiredInvitationBatchReplays(app.get(SystemTransactionRunner)).purge(
-            500,
-            { deadline: Date.now() + 5_000, signal: new AbortController().signal },
-          );
+          purged = await purgeStore().purge(500, {
+            deadline: performance.now() + 5_000,
+            signal: new AbortController().signal,
+          });
           competitor = await invite(ines, atelierNordId, slow, ['tess@ateliernord.fr']);
           retry = await invite(ines, atelierNordId, slow, ['Sven@AtelierNord.fr']);
         } finally {
@@ -1224,9 +1238,10 @@ describe('idempotent invitation batches and the invitation state', () => {
         atelierNordId,
       );
 
-      const deleted: number | null = await new ExpiredInvitationBatchReplays(
-        app.get(SystemTransactionRunner),
-      ).purge(3, { deadline: Date.now() + 5_000, signal: new AbortController().signal });
+      const deleted: number | null = await purgeStore().purge(3, {
+        deadline: performance.now() + 5_000,
+        signal: new AbortController().signal,
+      });
       expect(deleted).toBe(3);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(9);
 
@@ -1280,12 +1295,12 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(inline).toBe(10);
       expect(await swept(atelierNordId)).toBe(30);
 
-      const purge = new ExpiredInvitationBatchReplays(system);
+      const purge = purgeStore();
       const batches: (number | null)[] = [];
       for (let round = 0; round < 3; round += 1) {
         batches.push(
           await purge.purge(500, {
-            deadline: Date.now() + 5_000,
+            deadline: performance.now() + 5_000,
             signal: new AbortController().signal,
           }),
         );
@@ -1293,6 +1308,141 @@ describe('idempotent invitation batches and the invitation state', () => {
 
       expect(batches).toEqual([500, 500, 230]);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(0);
+    });
+
+    /**
+     * A TCP proxy to PostgreSQL that can stop forwarding in both directions while keeping its
+     * sockets open, as a network path that stalls without closing.
+     *
+     * @param host - The host of PostgreSQL.
+     * @param port - The port of PostgreSQL.
+     * @returns The port of the proxy, the switch of the stall and its closing.
+     */
+    async function stallingProxy(
+      host: string,
+      port: number,
+    ): Promise<{
+      readonly port: number;
+      readonly stall: (stalled: boolean) => void;
+      readonly close: () => Promise<void>;
+    }> {
+      const state = { stalled: false };
+      const sockets = new Set<net.Socket>();
+      const server: net.Server = net.createServer((client: net.Socket) => {
+        const upstream: net.Socket = net.connect(port, host);
+        sockets.add(client);
+        sockets.add(upstream);
+        const close = (): void => {
+          client.destroy();
+          upstream.destroy();
+        };
+        client.on('data', (chunk: Buffer) => {
+          if (!state.stalled) upstream.write(chunk);
+        });
+        upstream.on('data', (chunk: Buffer) => {
+          if (!state.stalled) client.write(chunk);
+        });
+        for (const socket of [client, upstream]) {
+          socket.on('close', close);
+          socket.on('error', close);
+        }
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      return {
+        port: (server.address() as net.AddressInfo).port,
+        stall: (stalled: boolean): void => {
+          state.stalled = stalled;
+        },
+        close: (): Promise<void> => {
+          for (const socket of sockets) socket.destroy();
+          return new Promise<void>((resolve) => {
+            server.close(() => {
+              resolve();
+            });
+          });
+        },
+      };
+    }
+
+    /**
+     * A purge tick of the job, on a store of its own.
+     *
+     * @param store - The store of the expired records.
+     */
+    async function tick(store: ExpiredInvitationBatchReplays): Promise<void> {
+      await new PurgeInvitationBatchReplaysHandler(
+        app.get(JobWorkerRegistry),
+        app.get(JobScheduler),
+        store,
+        PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
+      ).handle({ organizationId: null, signal: new AbortController().signal });
+    }
+
+    it('discards a connection stuck at the socket level by its deadline, so a later tick deletes', async () => {
+      await expired(lumenId, 4, 'stuck-socket-');
+      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
+      const proxy = await stallingProxy(target.hostname, Number(target.port));
+      target.host = `127.0.0.1:${String(proxy.port)}`;
+      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
+      pool.on('error', () => undefined);
+      try {
+        // The purge reuses this idle connection, whose path then stalls: its statements are sent
+        // and never answered, and the socket stays open.
+        await pool.query('select 1');
+        const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+        proxy.stall(true);
+        const started: number = performance.now();
+
+        await expect(
+          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+        ).resolves.toBeNull();
+        // Without the discard, nothing would ever end that call: no answer comes back.
+        await vi.waitFor(
+          () => {
+            expect(store.stalled).toBe(false);
+          },
+          { timeout: 2_000, interval: 10 },
+        );
+        expect(performance.now() - started).toBeLessThan(2_000);
+        expect(pool.totalCount).toBe(0);
+
+        proxy.stall(false);
+        await tick(store);
+        expect(await swept(lumenId)).toBe(0);
+      } finally {
+        await pool.end();
+        await proxy.close();
+      }
+    });
+
+    it('drains with a later tick after a delete stalled on a held lock past its deadline', async () => {
+      await expired(lumenId, 4, 'stuck-lock-');
+      const store: ExpiredInvitationBatchReplays = purgeStore();
+      const holder: pg.PoolClient = await stack.migrator.connect();
+      try {
+        await holder.query('begin');
+        await holder.query('lock table invitation_batch_replays in access exclusive mode');
+        const started: number = performance.now();
+
+        // Whichever comes first, the deadline of the call or the server's statement timeout set
+        // to the same time left, fails the delete.
+        await expect(
+          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+        ).rejects.toThrow();
+        await vi.waitFor(
+          () => {
+            expect(store.stalled).toBe(false);
+          },
+          { timeout: 2_000, interval: 10 },
+        );
+      } finally {
+        await holder.query('rollback');
+        holder.release();
+      }
+      expect(await swept(lumenId)).toBe(4);
+
+      await tick(store);
+      expect(await swept(lumenId)).toBe(0);
     });
 
     it('finds the expired records of both purges by an index range on their expiry', async () => {

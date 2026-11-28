@@ -31,7 +31,8 @@ export interface ExpiredInvitationBatchReplayPurge {
    * Property stalled
    *
    * @description
-   * Whether a call given up on by an earlier tick still runs, possibly holding a pooled connection.
+   * Whether a call given up on by an earlier tick has not settled yet, possibly holding or waiting
+   * for a pooled connection.
    *
    * @type {boolean}
    * @readonly
@@ -89,9 +90,10 @@ export interface ExpiredInvitationBatchReplayPurge {
  * its budget, and the backlog is read only with time left. A tick that stops on its budget logs, at `warn`, how many
  * rows it deleted and how old the oldest expired row still is (`null` when there was no time to
  * read it), then leaves the rest to the next tick; a failed tick, a delete cut short included, is
- * retried by the queue. A tick that finds a call of an earlier tick still running (given up on
- * by its deadline, possibly holding a pooled connection) skips at once, logging it at `warn`, so
- * the purge never holds more than one connection.
+ * retried by the queue. The store destroys the connection of a call it gives up on, so that call
+ * settles at once and the next tick runs. As a fallback, a tick that still finds a call of an
+ * earlier tick running (one waiting for a pooled connection) skips at once, logging it at `warn`,
+ * so the purge never holds more than one connection.
  */
 export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstrap {
   // #region Properties
@@ -110,7 +112,8 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
    * @param {JobScheduler} scheduler - The recurring schedules.
    * @param {ExpiredInvitationBatchReplayPurge} expired - The store of the expired records.
    * @param {string} queue - The queue of the job.
-   * @param {() => number} now - The clock of the budget, in milliseconds.
+   * @param {() => number} now - The monotonic clock of the budget, in milliseconds, the store's
+   * own: a wall-clock step never stretches nor cuts a tick.
    * @constructor
    */
   public constructor(
@@ -118,7 +121,7 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
     private readonly scheduler: JobScheduler,
     private readonly expired: ExpiredInvitationBatchReplayPurge,
     private readonly queue: string,
-    private readonly now: () => number = Date.now,
+    private readonly now: () => number = (): number => performance.now(),
   ) {}
   // #endregion
 
@@ -151,7 +154,7 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
       throw new Error('The invitation batch replay purge requires a system job.');
     }
     if (this.expired.stalled) {
-      // A call an earlier tick gave up on may still hold a pooled connection: never a second one.
+      // A call an earlier tick gave up on has not settled: never a second connection meanwhile.
       this.logger.warn(
         { skippedTicks: 1 },
         'invitation batch replay purge skipped while an abandoned call still runs',
