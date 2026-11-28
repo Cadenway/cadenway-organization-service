@@ -13,6 +13,7 @@ import {
   INVITATION_BATCH_REPLAY_MS,
 } from '../../../../../domain/policies/invitations/invitation-batch-replay.policy.js';
 import type { InvitationBatchRequest } from '../../../../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
+import { isLockTimeout } from '../../mappers/postgres/lock-timeout.mapper.js';
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
 import { members } from '../../schemas/members/member.schema.js';
 
@@ -126,6 +127,18 @@ const REPLAY_WINDOW: SQL = sql`make_interval(secs => ${INVITATION_BATCH_REPLAY_M
 function digestOf(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
+
+/**
+ * Constant RESERVATION_LOCK_TIMEOUT
+ *
+ * @description
+ * The `lock_timeout` of a reservation's statements: a backstop, far below the 5 s of the
+ * application role, so a reservation that would wait on a transaction holding the key's row gives
+ * up at once instead of holding a pooled connection.
+ *
+ * @type {string}
+ */
+const RESERVATION_LOCK_TIMEOUT: string = '100ms';
 
 /**
  * Constant LEASE_WINDOW
@@ -243,32 +256,104 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
   }
 
   /**
-   * Method reserve
+   * Method findHeld
    *
    * @description
-   * Takes over the row of the key if its time ran out and no transaction holds it (a batch in
-   * flight holds its reservation from the start of its transaction, `renew`, so `for update skip
-   * locked` never takes a live holder's key, nor waits for it); otherwise inserts the reservation
-   * when the key has no row at all. A plain read decides between the two, since an insert against a
-   * row that a batch is updating would wait for that batch; the insert itself waits only for
-   * another request's short reservation of the same key, then finds its row.
+   * Loads the reservation of the scoped key whatever its lease, with the actor's active membership,
+   * in one statement and without a lock: the reservation of a batch still running past its lease,
+   * whose row its transaction holds, is still the key's.
    *
    * @param {InvitationBatchReplayKey} key - The scoped key.
    * @param {InvitationBatchRequest} request - The batch of the request.
-   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is live or held.
+   * @returns {Promise<StoredInvitationBatch | null>} The reservation, or `null`.
+   */
+  public async findHeld(
+    key: InvitationBatchReplayKey,
+    request: InvitationBatchRequest,
+  ): Promise<StoredInvitationBatch | null> {
+    const rows = await this.db
+      .select({ requestDigest: invitationBatchReplays.requestDigest, actorRole: members.role })
+      .from(invitationBatchReplays)
+      .leftJoin(
+        members,
+        and(
+          eq(members.organizationId, invitationBatchReplays.organizationId),
+          eq(members.userId, invitationBatchReplays.actorUserId),
+          isNull(members.removedAt),
+        ),
+      )
+      .where(and(keyOf(key), eq(invitationBatchReplays.state, 'reserved')))
+      .limit(1);
+    const row = rows[0];
+    return row === undefined
+      ? null
+      : {
+          state: 'reserved',
+          sameRequest: row.requestDigest === digestOf(request.canonical),
+          invitations: [],
+          actorRole: row.actorRole,
+        };
+  }
+
+  /**
+   * Method reserve
+   *
+   * @description
+   * Reserves the key without ever waiting on a batch in flight. Everything runs in a savepoint under
+   * a `lock_timeout` of `RESERVATION_LOCK_TIMEOUT`: a wait that reaches it rolls the savepoint back
+   * and answers `null`. A transaction advisory lock on the key, held only by the short reservation
+   * transactions, serializes the requests that reserve one key: the second waits for the first to
+   * commit its reservation (milliseconds, within the timeout), then sees it. Under it, a row of the
+   * key whose time ran out and that no transaction holds is taken over (`for update skip locked`);
+   * a plain read then keeps a live or held row; only a key without any row gets an insert, which
+   * can conflict only with a row no reservation could see, and then times out rather than wait.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {InvitationBatchRequest} request - The batch of the request.
+   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is not free.
    */
   public async reserve(
     key: InvitationBatchReplayKey,
     request: InvitationBatchRequest,
   ): Promise<string | null> {
-    const lease = {
-      requestDigest: digestOf(request.canonical),
-      state: 'reserved' as const,
-      leaseId: sql`uuidv7()`,
-      outcome: null,
-      expiresAt: sql`${REPLAY_CLOCK} + ${LEASE_WINDOW}`,
-      createdAt: sql`now()`,
-    };
+    await this.db.execute(
+      sql`select set_config('lock_timeout', ${RESERVATION_LOCK_TIMEOUT}, true)`,
+    );
+    await this.db.execute(sql`savepoint invitation_batch_reservation`);
+    try {
+      // Waits only for another request that reserves the key, a short transaction, and no longer
+      // than the lock timeout.
+      await this.db.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`invitation-batch-reservation:${key.organizationId.toLowerCase()}:${key.actorUserId.toLowerCase()}:${digestOf(key.key)}`}, 0))`,
+      );
+      const leaseId: string | null = await this.reserveFree(key, request);
+      await this.db.execute(sql`release savepoint invitation_batch_reservation`);
+      return leaseId;
+    } catch (error) {
+      if (!isLockTimeout(error)) {
+        throw error;
+      }
+      await this.db.execute(sql`rollback to savepoint invitation_batch_reservation`);
+      return null;
+    }
+  }
+
+  /**
+   * Method reserveFree
+   *
+   * @description
+   * Under the reservation lock of the key: takes over its expired row that no transaction holds,
+   * keeps a live or held row, or inserts the reservation of a key without any row.
+   *
+   * @param {InvitationBatchReplayKey} key - The scoped key.
+   * @param {InvitationBatchRequest} request - The batch of the request.
+   * @returns {Promise<string | null>} The id of the lease, or `null` when the key is not free.
+   */
+  private async reserveFree(
+    key: InvitationBatchReplayKey,
+    request: InvitationBatchRequest,
+  ): Promise<string | null> {
+    const requestDigest: string = digestOf(request.canonical);
     const taken = await this.db.execute<{ lease_id: string }>(
       sql`with expired as materialized (
           select organization_id, actor_user_id, key_digest from ${invitationBatchReplays}
@@ -278,7 +363,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
             and expires_at <= ${REPLAY_CLOCK}
           for update skip locked)
         update ${invitationBatchReplays} as replay
-        set request_digest = ${lease.requestDigest}, state = 'reserved', lease_id = uuidv7(),
+        set request_digest = ${requestDigest}, state = 'reserved', lease_id = uuidv7(),
             outcome = null, expires_at = ${REPLAY_CLOCK} + ${LEASE_WINDOW}, created_at = now()
         from expired
         where replay.organization_id = expired.organization_id
@@ -289,8 +374,7 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
     if (taken.rows[0]?.lease_id !== undefined) {
       return taken.rows[0].lease_id;
     }
-    // A row of the key that is live, or held by the transaction of its batch, keeps the key; an
-    // insert against it would wait for that transaction, so a plain read decides first.
+    // A row of the key that is live, or held by the transaction of its batch, keeps the key.
     const existing: { readonly keyDigest: string }[] = await this.db
       .select({ keyDigest: invitationBatchReplays.keyDigest })
       .from(invitationBatchReplays)
@@ -305,7 +389,11 @@ export class DrizzleInvitationBatchReplayRepository implements InvitationBatchRe
         organizationId: key.organizationId,
         actorUserId: key.actorUserId,
         keyDigest: digestOf(key.key),
-        ...lease,
+        requestDigest,
+        state: 'reserved',
+        leaseId: sql`uuidv7()`,
+        outcome: null,
+        expiresAt: sql`${REPLAY_CLOCK} + ${LEASE_WINDOW}`,
       })
       .onConflictDoNothing()
       .returning({ leaseId: invitationBatchReplays.leaseId });

@@ -307,8 +307,12 @@ export class InviteMembers {
    *
    * @description
    * The first transaction of a keyed batch: once the actor and the organization are found, settles
-   * the key from its live reservation or record, or reserves it. A reservation that another
-   * request takes between the read and the insert is settled from what that request wrote.
+   * the key from its live reservation or record, or reserves it. When the key is not free for the
+   * reservation (another request reserves it at that moment, or a batch holds it), the request is
+   * settled from what is committed: a live row, or the reservation of a batch running past its
+   * lease, whose fingerprint still tells `idempotency-request-in-progress` from
+   * `idempotency-key-reused`; with nothing committed yet, the retryable
+   * `idempotency-request-in-progress`. Nothing waits on another request or batch.
    *
    * @param {OrganizationsStore} store - The store of the transaction.
    * @param {InviteMembersInput} input - The batch.
@@ -336,7 +340,16 @@ export class InviteMembers {
     if (meanwhile !== null) {
       return meanwhile;
     }
-    // The row that refused the reservation is gone already: the client may try again.
+    // A batch running past its lease still holds its reservation, which the live read leaves out.
+    const held: StoredInvitationBatch | null = await store.invitationBatchReplays.findHeld(
+      batch.key,
+      batch.request,
+    );
+    if (held !== null) {
+      return InviteMembers.answer(held);
+    }
+    // The key is being reserved by another request, or its row is gone already: the client may
+    // try again.
     throw new OrganizationRefusal({ reason: 'idempotency-request-in-progress' });
   }
 
@@ -366,9 +379,24 @@ export class InviteMembers {
       batch.key,
       batch.request,
     );
-    if (stored === null) {
-      return null;
-    }
+    return stored === null ? null : InviteMembers.answer(stored);
+  }
+
+  /**
+   * Method answer
+   *
+   * @description
+   * What a row of the key answers once the actor still manages the organization in the snapshot of
+   * the row: a record its outcome to an equivalent batch, a reservation
+   * `idempotency-request-in-progress` to the same batch, either `idempotency-key-reused` to another.
+   *
+   * @param {StoredInvitationBatch} stored - The row of the key.
+   * @returns {InviteMembersOutput} The stored outcome of an equivalent batch.
+   * @throws {OrganizationRefusal} `organization-not-found`, `role-forbidden` or
+   * `idempotency-request-in-progress`.
+   * @throws {InvitationBatchKeyReusedError} For a batch that is not the one that holds the key.
+   */
+  private static answer(stored: StoredInvitationBatch): InviteMembersOutput {
     if (stored.actorRole === null) {
       throw new OrganizationRefusal({ reason: 'organization-not-found' });
     }

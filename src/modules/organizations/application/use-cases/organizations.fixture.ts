@@ -678,6 +678,26 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                 },
           );
         },
+        findHeld: (
+          key: InvitationBatchReplayKey,
+          request: InvitationBatchRequest,
+        ): Promise<StoredInvitationBatch | null> => {
+          const stored: StoredReplay | undefined =
+            this.tables.replays.get(replayKeyOf(key)) ?? tables.replays.get(replayKeyOf(key));
+          return Promise.resolve(
+            stored?.state !== 'reserved'
+              ? null
+              : {
+                  state: 'reserved',
+                  sameRequest: stored.request === request.canonical,
+                  invitations: [],
+                  actorRole:
+                    activeMembers(key.organizationId).find(
+                      (member: MemberState) => member.userId === key.actorUserId.toLowerCase(),
+                    )?.role ?? null,
+                },
+          );
+        },
         reserve: (
           key: InvitationBatchReplayKey,
           request: InvitationBatchRequest,

@@ -510,6 +510,7 @@ describe('idempotent invitation batches and the invitation state', () => {
       );
       let original: Response;
       let competitor: Response;
+      let retry: Response;
       let purged: number | null;
       try {
         const lock = await holdSenderLock();
@@ -523,6 +524,7 @@ describe('idempotent invitation batches and the invitation state', () => {
             { deadline: Date.now() + 5_000, signal: new AbortController().signal },
           );
           competitor = await invite(ines, atelierNordId, slow, ['tess@ateliernord.fr']);
+          retry = await invite(ines, atelierNordId, slow, ['Sven@AtelierNord.fr']);
         } finally {
           await lock.release();
         }
@@ -535,8 +537,12 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
 
       expect(purged).toBe(0);
-      expect(competitor.status).toBe(409);
-      expect(competitor.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      // Past its visible lease, the reservation is still the running batch's: its fingerprint
+      // tells the same batch from another one.
+      expect(competitor.status).toBe(422);
+      expect(competitor.body).toMatchObject({ code: 'idempotency.key-reused' });
+      expect(retry.status).toBe(409);
+      expect(retry.body).toMatchObject({ code: 'idempotency.request-in-progress' });
       expect(original.status).toBe(200);
       expect((original.body as InvitationBatchResult).invitations[0]).toMatchObject({
         email: 'sven@ateliernord.fr',
@@ -545,6 +551,73 @@ describe('idempotent invitation batches and the invitation state', () => {
       const replayed: Response = await invite(ines, atelierNordId, slow, ['sven@ateliernord.fr']);
       expect(replayed.status).toBe(200);
       expect(replayed.body).toEqual(original.body);
+    });
+
+    it('never waits to reserve a key that another transaction is writing, answering 409 at once', async () => {
+      const contested = 'members-page-batch-reserving';
+      const emails: readonly string[] = ['wanda@ateliernord.fr'];
+      // A row of the key that the read of a reservation cannot see yet and an insert would wait
+      // on: another transaction has written it and not committed.
+      const writer: pg.PoolClient = await stack.migrator.connect();
+      const timed: { status: number; code: unknown; durationMs: number }[] = [];
+      try {
+        await writer.query('begin');
+        await writer.query(`select set_config('app.system_access', 'on', true)`);
+        await writer.query(
+          `insert into invitation_batch_replays
+             (organization_id, actor_user_id, key_digest, request_digest, state, lease_id,
+              outcome, expires_at)
+           values ($1, $2, $3, $4, 'reserved', uuidv7(), null,
+                   clock_timestamp() + interval '30 seconds')`,
+          [atelierNordId, ines.id, digestOf(contested), digestOf(canonicalOf(emails))],
+        );
+        for (const body of [emails, ['xena.b@ateliernord.fr']]) {
+          const started: number = Date.now();
+          const response: Response = await invite(ines, atelierNordId, contested, body);
+          timed.push({
+            status: response.status,
+            code: (response.body as { code?: unknown }).code,
+            durationMs: Date.now() - started,
+          });
+        }
+      } finally {
+        await writer.query('rollback');
+        writer.release();
+      }
+
+      for (const answer of timed) {
+        expect(answer).toMatchObject({ status: 409, code: 'idempotency.request-in-progress' });
+        expect(answer.durationMs).toBeLessThan(1_000);
+      }
+      const free: Response = await invite(ines, atelierNordId, contested, emails);
+      expect(free.status).toBe(200);
+    });
+
+    it('answers 409 at once while another request reserves the same key', async () => {
+      const contested = 'members-page-batch-serialized';
+      const holder: pg.PoolClient = await stack.migrator.connect();
+      let answer: Response;
+      let durationMs: number;
+      try {
+        await holder.query('begin');
+        // The reservation lock of the key, which a request holds while it reserves it.
+        await holder.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          `invitation-batch-reservation:${atelierNordId}:${ines.id}:${digestOf(contested)}`,
+        ]);
+        const started: number = Date.now();
+        answer = await invite(ines, atelierNordId, contested, ['yann.b@ateliernord.fr']);
+        durationMs = Date.now() - started;
+      } finally {
+        await holder.query('rollback');
+        holder.release();
+      }
+
+      expect(answer.status).toBe(409);
+      expect(answer.body).toMatchObject({ code: 'idempotency.request-in-progress' });
+      expect(durationMs).toBeLessThan(1_000);
+      expect((await invite(ines, atelierNordId, contested, ['yann.b@ateliernord.fr'])).status).toBe(
+        200,
+      );
     });
 
     it('starts the 24 hours of a replay on the database clock when the record is written', async () => {

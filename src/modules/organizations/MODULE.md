@@ -593,13 +593,18 @@ The Search readers open their snapshots directly with the kit's transaction runn
   actor's active membership, in one statement and without any lock, and checks the actor's role
   from that snapshot. A record answers its stored body to an equivalent batch, taking neither
   allowance lock; a reservation answers `409` to the same batch, still running; either answers
-  `422` to another batch, and a member who lost the role answers `403`. A free key is reserved:
-  a row whose time ran out and that no transaction holds is taken over atomically
-  (`for update skip locked`); a key without any row gets an `insert … on conflict do nothing`, the
-  primary key deciding between two requests that reserve one key at once (the second waits only
-  for the first's short reservation to commit, then settles as above); a row that is live, or held
-  by its batch's transaction, keeps the key (`409`). The first batch that reserves a key is the
-  only one that runs. The reservation commits. The second transaction first renews the lease and
+  `422` to another batch, and a member who lost the role answers `403`. A free key is reserved
+  under a `lock_timeout` of 100 ms, in a savepoint: a transaction advisory lock on the key, held
+  only by reservations, serializes the requests that reserve one key (the second waits for the
+  first's short reservation to commit, then settles as above); a row whose time ran out and that no
+  transaction holds is taken over atomically (`for update skip locked`); a plain read keeps a row
+  that is live or held by its batch's transaction; only a key without any row gets an
+  `insert … on conflict do nothing`. A wait that reaches the timeout rolls the savepoint back.
+  When the key is not free, the request settles from what is committed: a live row as above, the
+  reservation of a batch running past its lease by its fingerprint (`409` for the same batch, `422`
+  for another), and with nothing committed yet a retryable `409`. The reservation step never waits
+  on a batch, only on another reservation and never beyond 100 ms. The first batch that reserves a
+  key is the only one that runs. The reservation commits. The second transaction first renews the lease and
   locks the reservation for its whole duration, so that past its lease neither a takeover nor a
   purge (both `skip locked`) can take it, then runs the batch as without a key and turns the
   reservation into its record by its `lease_id`, then deletes at most 10 other expired rows of the
