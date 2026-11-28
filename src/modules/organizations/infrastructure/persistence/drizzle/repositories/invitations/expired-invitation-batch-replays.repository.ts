@@ -83,6 +83,32 @@ export interface PurgeWindow {
  * rolls its batch back and leaves the rows to the next tick.
  */
 export class ExpiredInvitationBatchReplays {
+  // #region Properties
+  /**
+   * Property abandonedCall
+   *
+   * @description
+   * A call the purge gave up on (its deadline or its abort won) whose transaction has not ended
+   * yet, and may still hold a pooled connection; `null` otherwise. While it is there, no other call
+   * checks a connection out: at most one database call of the purge is in flight in the process.
+   *
+   * @type {Promise<void> | null}
+   */
+  private abandonedCall: Promise<void> | null = null;
+
+  /**
+   * Property stalled
+   *
+   * @description
+   * Whether a call the purge gave up on still runs, so that the purge must not start another.
+   *
+   * @type {boolean}
+   */
+  public get stalled(): boolean {
+    return this.abandonedCall !== null;
+  }
+  // #endregion
+
   // #region Constructor
   /**
    * Constructor
@@ -178,10 +204,11 @@ export class ExpiredInvitationBatchReplays {
     cutShort: 'fail' | 'skip',
     work: (db: TransactionDatabase) => Promise<TResult>,
   ): Promise<TResult | null> {
-    if (this.isOver(window)) {
+    if (this.stalled || this.isOver(window)) {
       return Promise.resolve(null);
     }
     return new Promise<TResult | null>((resolve, reject) => {
+      const attempt: { call?: Promise<TResult | null> } = {};
       const race: {
         abandoned: boolean;
         inFlight: boolean;
@@ -196,6 +223,9 @@ export class ExpiredInvitationBatchReplays {
         if (!race.abandoned) {
           race.abandoned = true;
           stopRace();
+          if (attempt.call !== undefined) {
+            this.holdAbandoned(attempt.call);
+          }
           if (race.inFlight && cutShort === 'fail') {
             reject(new Error('The deadline of the purge came while a delete was in flight.'));
           } else {
@@ -207,38 +237,60 @@ export class ExpiredInvitationBatchReplays {
       race.timer = setTimeout(abandon, Math.max(0, window.deadline - this.now()));
       window.signal.addEventListener('abort', abandon, { once: true });
       const stopped = (): boolean => race.abandoned || this.isOver(window);
-      this.system
-        .run(async ({ db }): Promise<TResult | null> => {
-          if (stopped()) {
-            return null;
-          }
-          const timeout: string = timeoutOf(window.deadline - this.now());
-          await db.execute(
-            sql`select set_config('statement_timeout', ${timeout}, true),
+      attempt.call = this.system.run(async ({ db }): Promise<TResult | null> => {
+        if (stopped()) {
+          return null;
+        }
+        const timeout: string = timeoutOf(window.deadline - this.now());
+        await db.execute(
+          sql`select set_config('statement_timeout', ${timeout}, true),
                        set_config('idle_in_transaction_session_timeout', ${timeout}, true)`,
-          );
-          // The settings took a round trip: the deadline or the abort may have come meanwhile.
-          if (stopped()) {
-            return null;
-          }
-          race.inFlight = true;
-          return work(db);
-        }, options)
-        .then(
-          (value: TResult | null): void => {
-            stopRace();
-            if (!race.abandoned) {
-              resolve(value);
-            }
-          },
-          (error: unknown): void => {
-            stopRace();
-            // A transaction the call gave up on can only fail on its own; nobody waits for it.
-            if (!race.abandoned) {
-              reject(error instanceof Error ? error : new Error(String(error)));
-            }
-          },
         );
+        // The settings took a round trip: the deadline or the abort may have come meanwhile.
+        if (stopped()) {
+          return null;
+        }
+        race.inFlight = true;
+        return work(db);
+      }, options);
+      attempt.call.then(
+        (value: TResult | null): void => {
+          stopRace();
+          if (!race.abandoned) {
+            resolve(value);
+          }
+        },
+        (error: unknown): void => {
+          stopRace();
+          // A transaction the call gave up on can only fail on its own; nobody waits for it.
+          if (!race.abandoned) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+      );
+    });
+  }
+
+  /**
+   * Method holdAbandoned
+   *
+   * @description
+   * Keeps a call the purge gave up on until its transaction ends, whatever its outcome, then lets the
+   * purge check connections out again.
+   *
+   * @param {Promise<unknown>} call - The call given up on.
+   * @returns {void}
+   */
+  private holdAbandoned(call: Promise<unknown>): void {
+    const settled: Promise<void> = call.then(
+      (): void => undefined,
+      (): void => undefined,
+    );
+    this.abandonedCall = settled;
+    void settled.then((): void => {
+      if (this.abandonedCall === settled) {
+        this.abandonedCall = null;
+      }
     });
   }
 

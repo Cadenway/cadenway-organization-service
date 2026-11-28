@@ -31,6 +31,7 @@ function setup(deletions: readonly (number | null)[], elapsedPerPurgeMs: number 
   let clock = 0;
   const remaining = [...deletions];
   const expired = {
+    stalled: false,
     purge: vi.fn<(limit: number, window: Window) => Promise<number | null>>(() => {
       clock += elapsedPerPurgeMs;
       const next = remaining.shift();
@@ -137,6 +138,18 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
       { deleted: 500, oldestExpiredAgeSeconds: 840 },
       expect.any(String),
     );
+  });
+
+  it('skips a tick while a call an earlier tick gave up on still runs', async () => {
+    const { handler, expired } = setup([500]);
+    expired.stalled = true;
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await handler.handle(system);
+
+    expect(expired.purge).not.toHaveBeenCalled();
+    expect(expired.oldestExpiredAgeSeconds).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith({ skippedTicks: 1 }, expect.any(String));
   });
 
   it('opens no system purge for a tenant job or an aborted one', async () => {

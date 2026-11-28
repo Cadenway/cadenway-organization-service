@@ -118,7 +118,10 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
   time left before its delete started answers `null`, the normal end of a tick; a deadline or an
   abort that comes while a delete is in flight or committing fails the call, and with it the tick,
   since the server may cancel that delete: the queue's bounded retry then applies.
-  A keyed batch stores a record even when it sends
+  At most one purge call per process is in flight: the store keeps the call it gave up on until
+  it settles, and meanwhile every new call answers `null` without checking out a connection, while
+  a tick (or its retry) skips at once and logs `skippedTicks` at `warn`, so a stalled connection is
+  never joined by another one. A keyed batch stores a record even when it sends
   nothing, so the email allowance does not bound how many records expire; a tick that stops on its
   budget logs, at `warn`, the rows it deleted and `oldestExpiredAgeSeconds`, the backlog, and the
   next tick continues. A failed tick is retried by its queue, which the migrator provisions with
@@ -677,6 +680,12 @@ Any failure rolls back the business rows and the outbox rows together
   (`tests/invitation-idempotency.int-spec.ts` checks both plans).
 - The replay record keeps a fingerprint of the batch rather than its addresses, which only the
   replayed body still lists.
+- A keyed reservation waits on the organization row like every other write of the service: its
+  `for key share` lock is taken under the normal lock timeout of the role, before the 100 ms
+  `lock_timeout` of the key, since an organization profile update (which holds the row) is short
+  and a request that gave up on it would answer a false `409` while nothing runs under its key. A
+  distinct retryable code for contention on the parent row would need a contract change. Revisit
+  with production lock-wait metrics.
 - An expired reservation never decides a terminal answer: once its lease has run out, whoever holds
   its row (the batch running late, a takeover not committed yet for this very batch, a purge) and
   with which batch is unknown, so a request answers the retryable

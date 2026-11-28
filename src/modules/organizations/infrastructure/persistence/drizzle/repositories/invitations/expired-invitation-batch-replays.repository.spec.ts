@@ -108,6 +108,45 @@ describe('ExpiredInvitationBatchReplays', () => {
     vi.useRealTimers();
   });
 
+  it('checks out no connection while a call it gave up on still runs, and again once it ends', async () => {
+    vi.useFakeTimers();
+    const execute = vi.fn(() => Promise.resolve({ rowCount: 3, rows: [{ age: 7 }] }));
+    const stuck = { release: (): void => undefined };
+    const run = vi.fn(
+      async <TResult>(
+        work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
+      ): Promise<TResult> => {
+        if (run.mock.calls.length === 1) {
+          // A stalled connection: the first call never ends until the test lets it.
+          await new Promise<void>((resolve) => {
+            stuck.release = resolve;
+          });
+        }
+        return work({ db: { execute } });
+      },
+    );
+    const replays = new ExpiredInvitationBatchReplays({
+      run,
+    } as unknown as SystemTransactionRunner);
+
+    const abandoned = replays.purge(500, { deadline: Date.now() + 200, signal });
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(abandoned).resolves.toBeNull();
+    expect(replays.stalled).toBe(true);
+
+    await expect(replays.purge(500, { deadline: Date.now() + 5_000, signal })).resolves.toBeNull();
+    await expect(
+      replays.oldestExpiredAgeSeconds({ deadline: Date.now() + 5_000, signal }),
+    ).resolves.toBeNull();
+    expect(run).toHaveBeenCalledTimes(1);
+
+    stuck.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(replays.stalled).toBe(false);
+    await expect(replays.purge(500, { deadline: Date.now() + 5_000, signal })).resolves.toBe(3);
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
   it('answers by its deadline while the pool has no connection, and gives a late one back unused', async () => {
     vi.useFakeTimers();
     const { replays, execute, pool } = saturatedPool();

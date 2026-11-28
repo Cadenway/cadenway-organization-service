@@ -26,6 +26,19 @@ const BACKLOG_READ_RESERVE_MS: number = 500;
  * What a tick needs of the store of the expired replay records.
  */
 export interface ExpiredInvitationBatchReplayPurge {
+  // #region Properties
+  /**
+   * Property stalled
+   *
+   * @description
+   * Whether a call given up on by an earlier tick still runs, possibly holding a pooled connection.
+   *
+   * @type {boolean}
+   * @readonly
+   */
+  readonly stalled: boolean;
+  // #endregion
+
   // #region Methods
   /**
    * Method purge
@@ -76,7 +89,9 @@ export interface ExpiredInvitationBatchReplayPurge {
  * its budget, and the backlog is read only with time left. A tick that stops on its budget logs, at `warn`, how many
  * rows it deleted and how old the oldest expired row still is (`null` when there was no time to
  * read it), then leaves the rest to the next tick; a failed tick, a delete cut short included, is
- * retried by the queue.
+ * retried by the queue. A tick that finds a call of an earlier tick still running (given up on
+ * by its deadline, possibly holding a pooled connection) skips at once, logging it at `warn`, so
+ * the purge never holds more than one connection.
  */
 export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstrap {
   // #region Properties
@@ -134,6 +149,14 @@ export class PurgeInvitationBatchReplaysHandler implements OnApplicationBootstra
   public async handle(job: Pick<Job, 'organizationId' | 'signal'>): Promise<void> {
     if (job.organizationId !== null) {
       throw new Error('The invitation batch replay purge requires a system job.');
+    }
+    if (this.expired.stalled) {
+      // A call an earlier tick gave up on may still hold a pooled connection: never a second one.
+      this.logger.warn(
+        { skippedTicks: 1 },
+        'invitation batch replay purge skipped while an abandoned call still runs',
+      );
+      return;
     }
     const deadline: number = this.now() + INVITATION_BATCH_REPLAY_PURGE_BUDGET_MS;
     const deletes = { deadline: deadline - BACKLOG_READ_RESERVE_MS, signal: job.signal };
