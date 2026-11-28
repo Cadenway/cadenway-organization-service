@@ -1,6 +1,8 @@
+import { metrics } from '@opentelemetry/api';
+import type { MeterProvider } from '@opentelemetry/api';
 import { sql } from 'drizzle-orm';
 import type { Pool, PoolClient } from 'pg';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DiscardableSystemTransactions } from './discardable-system.transaction.js';
 
@@ -161,7 +163,7 @@ describe('DiscardableSystemTransactions', () => {
       'discarded before it began',
     );
     expect(recorded.statements).toEqual([]);
-    expect(recorded.releases).toEqual([undefined]);
+    expect(recorded.releases).toEqual([false]);
   });
 
   it('never releases a connection twice when discarded after it committed', async () => {
@@ -197,5 +199,148 @@ describe('DiscardableSystemTransactions', () => {
     expect(recorded.releases).toHaveLength(1);
     expect(recorded.releases[0]).toBeInstanceOf(Error);
     expect(recorded.destroys).toBe(1);
+  });
+
+  it('reports each phase it starts, the rollback of a refused statement included', async () => {
+    const { pool } = poolWith(undefined, 'delete');
+    const transactions = new DiscardableSystemTransactions(pool);
+    const committed: string[] = [];
+    const refused: string[] = [];
+
+    await transactions.run(
+      () => Promise.resolve(1),
+      {},
+      new AbortController().signal,
+      (phase) => committed.push(phase),
+    );
+    await expect(
+      transactions.run(
+        ({ db }) => db.execute(sql`delete from invitation_batch_replays`),
+        {},
+        new AbortController().signal,
+        (phase) => refused.push(phase),
+      ),
+    ).rejects.toThrow('Failed query');
+
+    expect(committed).toEqual(['setup', 'work', 'commit']);
+    expect(refused).toEqual(['setup', 'work', 'rollback']);
+  });
+
+  describe('database metrics', () => {
+    /** The samples recorded, by histogram, with the meter that created it. */
+    const samples: {
+      meter: string;
+      name: string;
+      unit: string | undefined;
+      value: number;
+      attributes: unknown;
+    }[] = [];
+
+    /** Installs a meter provider that records every sample of every histogram. */
+    function recordSamples(): void {
+      samples.length = 0;
+      const provider = {
+        getMeter: (meter: string) => ({
+          createHistogram: (name: string, options?: { readonly unit?: string }) => ({
+            record: (value: number, attributes?: unknown): void => {
+              samples.push({ meter, name, unit: options?.unit, value, attributes });
+            },
+          }),
+        }),
+      } as unknown as MeterProvider;
+      metrics.setGlobalMeterProvider(provider);
+    }
+
+    afterEach(() => {
+      metrics.disable();
+    });
+
+    it('records the pool acquisition and the transaction duration under the kit instruments', async () => {
+      recordSamples();
+      const { pool } = poolWith(undefined, 'delete');
+      const transactions = new DiscardableSystemTransactions(pool);
+
+      await transactions.run(() => Promise.resolve(1), {}, new AbortController().signal);
+      await expect(
+        transactions.run(
+          ({ db }) => db.execute(sql`delete from invitation_batch_replays`),
+          {},
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow('Failed query');
+
+      expect(
+        samples.map(({ meter, name, unit, attributes }) => ({ meter, name, unit, attributes })),
+      ).toEqual([
+        {
+          meter: '@cadenway/nest-common',
+          name: 'cadenway.postgres.pool.acquire.duration',
+          unit: 'ms',
+          attributes: { kind: 'system', outcome: 'success' },
+        },
+        {
+          meter: '@cadenway/nest-common',
+          name: 'cadenway.postgres.transaction.duration',
+          unit: 'ms',
+          attributes: { kind: 'system', outcome: 'success' },
+        },
+        {
+          meter: '@cadenway/nest-common',
+          name: 'cadenway.postgres.pool.acquire.duration',
+          unit: 'ms',
+          attributes: { kind: 'system', outcome: 'success' },
+        },
+        {
+          meter: '@cadenway/nest-common',
+          name: 'cadenway.postgres.transaction.duration',
+          unit: 'ms',
+          attributes: { kind: 'system', outcome: 'error' },
+        },
+      ]);
+      for (const sample of samples) {
+        expect(sample.value).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('records a failed checkout and the transaction of a discarded connection', async () => {
+      recordSamples();
+      const failing = {
+        connect: vi.fn(() => Promise.reject(new Error('timeout exceeded when trying to connect'))),
+      } as unknown as Pool;
+      await expect(
+        new DiscardableSystemTransactions(failing).run(
+          () => Promise.resolve(1),
+          {},
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow('timeout exceeded');
+      const { pool, recorded } = poolWith('delete');
+      const discard = new AbortController();
+      const pending: Promise<unknown> = new DiscardableSystemTransactions(pool).run(
+        ({ db }) => db.execute(sql`delete from invitation_batch_replays`),
+        {},
+        discard.signal,
+      );
+      await vi.waitFor(() => {
+        expect(recorded.statements.at(-1)).toContain('delete');
+      });
+      discard.abort();
+      await expect(pending).rejects.toThrow('Failed query');
+
+      expect(samples.map(({ name, attributes }) => ({ name, attributes }))).toEqual([
+        {
+          name: 'cadenway.postgres.pool.acquire.duration',
+          attributes: { kind: 'system', outcome: 'error' },
+        },
+        {
+          name: 'cadenway.postgres.pool.acquire.duration',
+          attributes: { kind: 'system', outcome: 'success' },
+        },
+        {
+          name: 'cadenway.postgres.transaction.duration',
+          attributes: { kind: 'system', outcome: 'error' },
+        },
+      ]);
+    });
   });
 });
