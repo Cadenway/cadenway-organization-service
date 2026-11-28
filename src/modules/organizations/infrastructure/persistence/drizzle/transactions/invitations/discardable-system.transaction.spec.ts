@@ -1,6 +1,7 @@
 import { metrics } from '@opentelemetry/api';
 import type { MeterProvider } from '@opentelemetry/api';
 import { sql } from 'drizzle-orm';
+import { DatabaseError } from 'pg';
 import type { Pool, PoolClient } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -27,12 +28,14 @@ interface Recorded {
  * peer keeping the socket open never completes.
  *
  * @param hang - The text of the statement that hangs, if any.
- * @param fail - The text of a statement the server refuses at once, if any.
+ * @param fail - The text of a statement that fails at once, if any.
+ * @param failure - How it fails: a plain error by default.
  * @returns The pool and what its connection recorded.
  */
 function poolWith(
   hang?: string,
   fail?: string,
+  failure: () => Error = () => new Error('refused by the server'),
 ): { readonly pool: Pool; readonly recorded: Recorded } {
   const recorded: Recorded = { statements: [], releases: [], destroys: 0 };
   const destroyed: { reject?: (error: Error) => void } = {};
@@ -43,7 +46,7 @@ function poolWith(
       const statement: string = typeof text === 'string' ? text : text.text;
       recorded.statements.push(statement);
       if (fail !== undefined && statement.startsWith(fail)) {
-        return Promise.reject(new Error('refused by the server'));
+        return Promise.reject(failure());
       }
       if (hang !== undefined && statement.startsWith(hang)) {
         return new Promise((_resolve, reject) => {
@@ -224,6 +227,42 @@ describe('DiscardableSystemTransactions', () => {
 
     expect(committed).toEqual(['setup', 'work', 'commit']);
     expect(refused).toEqual(['setup', 'work', 'rollback']);
+  });
+
+  it('reports a commit whose answer was lost as unconfirmed, attempting no rollback', async () => {
+    const lost = new Error('Connection terminated unexpectedly');
+    const { pool, recorded } = poolWith(undefined, 'commit', () => lost);
+    const phases: string[] = [];
+
+    await expect(
+      new DiscardableSystemTransactions(pool).run(
+        () => Promise.resolve(1),
+        {},
+        new AbortController().signal,
+        (phase) => phases.push(phase),
+      ),
+    ).rejects.toBe(lost);
+
+    expect(phases).toEqual(['setup', 'work', 'commit', 'commit-unconfirmed']);
+    expect(recorded.statements).not.toContain('rollback');
+    expect(recorded.releases).toEqual([true]);
+  });
+
+  it('keeps a commit the server refused a confirmed failure, rolled back as any other', async () => {
+    const refused = new DatabaseError('could not serialize access', 0, 'error');
+    const { pool } = poolWith(undefined, 'commit', () => refused);
+    const phases: string[] = [];
+
+    await expect(
+      new DiscardableSystemTransactions(pool).run(
+        () => Promise.resolve(1),
+        {},
+        new AbortController().signal,
+        (phase) => phases.push(phase),
+      ),
+    ).rejects.toBe(refused);
+
+    expect(phases).toEqual(['setup', 'work', 'commit', 'rollback']);
   });
 
   describe('database metrics', () => {

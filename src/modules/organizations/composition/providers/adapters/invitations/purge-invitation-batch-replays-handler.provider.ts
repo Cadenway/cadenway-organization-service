@@ -26,7 +26,8 @@ export const purgeInvitationBatchReplaysHandlerProvider: FactoryProvider<PurgeIn
         scheduler,
         new ExpiredInvitationBatchReplays(
           new DiscardableSystemTransactions(pool),
-          (phase, trigger) => new InvitationBatchReplayPurgeCutShortError(phase, trigger),
+          (phase, trigger, cause) =>
+            new InvitationBatchReplayPurgeCutShortError(phase, trigger, cause),
         ),
         PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
       );

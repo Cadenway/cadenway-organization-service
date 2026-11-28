@@ -138,8 +138,8 @@ export class ExpiredInvitationBatchReplays {
    * given by the composition, since an adapter may only name it as a type.
    *
    * @param {DiscardableSystemTransactions} system - The discardable system transactions.
-   * @param {(phase: InvitationBatchReplayPurgeCutShortError['phase'], trigger: InvitationBatchReplayPurgeCutShortError['trigger']) => InvitationBatchReplayPurgeCutShortError} cutShort -
-   * Builds the error of a call cut short once started.
+   * @param {(phase: InvitationBatchReplayPurgeCutShortError['phase'], trigger: InvitationBatchReplayPurgeCutShortError['trigger'], cause?: unknown) => InvitationBatchReplayPurgeCutShortError} cutShort -
+   * Builds the error of a call cut short once started, with the transport error as its cause.
    * @param {() => number} now - The monotonic clock of the deadlines, in milliseconds.
    * @constructor
    */
@@ -148,6 +148,7 @@ export class ExpiredInvitationBatchReplays {
     private readonly cutShort: (
       phase: InvitationBatchReplayPurgeCutShortError['phase'],
       trigger: InvitationBatchReplayPurgeCutShortError['trigger'],
+      cause?: unknown,
     ) => InvitationBatchReplayPurgeCutShortError,
     private readonly now: () => number = (): number => performance.now(),
   ) {}
@@ -166,7 +167,8 @@ export class ExpiredInvitationBatchReplays {
    * @returns {Promise<number | null>} How many rows it deleted, or `null` when the deadline or the
    * abort had come before the call started (or a call given up on earlier had not settled by then).
    * @throws {InvitationBatchReplayPurgeCutShortError} When the deadline or the abort came once the
-   * call had started, with the phase it stood in.
+   * call had started, with the phase it stood in, or when the connection failed after its commit
+   * was sent and before its answer (`commit`, `transport`).
    */
   public purge(limit: number, window: PurgeWindow): Promise<number | null> {
     return this.within(window, {}, 'fail', async (db: TransactionDatabase): Promise<number> => {
@@ -218,7 +220,12 @@ export class ExpiredInvitationBatchReplays {
    * (`checkout`, `setup`, `delete`, `commit` or `rollback`): it is unconfirmed (a commit may have
    * taken effect, any other phase made no progress), and the job must fail so its queue retries
    * it, which is safe since a delete of expired rows is idempotent. Under `skip` (a read) it
-   * answers `null`. The first statement sets `statement_timeout` and
+   * answers `null`. The race is settled once, by the timer, the abort or a check of the clock that
+   * finds the deadline first, whichever comes first: the phase and the trigger are latched then,
+   * so the cleanup that follows (a rollback) never changes what is reported. A connection that
+   * fails after the commit was sent and before its answer (`commit-unconfirmed` from the runner)
+   * rejects under `fail` with the phase `commit`, the trigger `transport` and the transport error
+   * as `cause`; any other failure rejects as it is. The first statement sets `statement_timeout` and
    * `idle_in_transaction_session_timeout` to the time left plus `SERVER_TIMEOUT_GRACE_MS`, the
    * server's backstop for the locks a discarded transaction may hold until it notices.
    *
@@ -245,49 +252,55 @@ export class ExpiredInvitationBatchReplays {
     return new Promise<TResult | null>((resolve, reject) => {
       const attempt: { call?: Promise<TResult | null> } = {};
       const race: {
-        abandoned: boolean;
+        settled: boolean;
+        held: boolean;
+        unconfirmed: boolean;
         phase: InvitationBatchReplayPurgeCutShortError['phase'];
         timer?: ReturnType<typeof setTimeout>;
-      } = { abandoned: false, phase: 'checkout' };
+      } = { settled: false, held: false, unconfirmed: false, phase: 'checkout' };
       const discard: AbortController = new AbortController();
       const listeners: { abandon: () => void } = { abandon: (): void => undefined };
       const stopRace = (): void => {
         clearTimeout(race.timer);
         window.signal.removeEventListener('abort', listeners.abandon);
       };
-      const cutShortError = (): InvitationBatchReplayPurgeCutShortError =>
-        this.cutShort(race.phase, window.signal.aborted ? 'abort' : 'deadline');
-      listeners.abandon = (): void => {
-        if (!race.abandoned) {
-          race.abandoned = true;
-          stopRace();
-          if (attempt.call !== undefined) {
-            this.holdAbandoned(attempt.call);
-          }
-          // Destroys the connection of a transaction still running, so the call settles at once.
-          discard.abort();
-          if (cutShort === 'fail') {
-            reject(cutShortError());
-          } else {
-            resolve(null);
-          }
+      // Keeps the call given up on until it settles, once it exists.
+      const hold = (): void => {
+        if (!race.held && attempt.call !== undefined) {
+          race.held = true;
+          this.holdAbandoned(attempt.call);
         }
+      };
+      // Settles the race once, latching the phase and the trigger, and discards the connection.
+      listeners.abandon = (): void => {
+        if (race.settled) {
+          return;
+        }
+        race.settled = true;
+        stopRace();
+        hold();
+        if (cutShort === 'fail') {
+          reject(this.cutShort(race.phase, window.signal.aborted ? 'abort' : 'deadline'));
+        } else {
+          resolve(null);
+        }
+        // Destroys the connection of a transaction still running, so the call settles at once.
+        discard.abort();
       };
       const abandon = listeners.abandon;
       race.timer = setTimeout(abandon, Math.max(0, window.deadline - this.now()));
       window.signal.addEventListener('abort', abandon, { once: true });
-      // The deadline may pass between the checks of the clock and the timer that enforces it.
-      const stop = (): null => {
-        if (cutShort === 'fail') {
-          throw cutShortError();
-        }
-        return null;
+      // The deadline may pass between the checks of the clock and the timer that enforces it:
+      // the check settles the race itself, then ends the work, whose rejection nobody reads.
+      const stop = (): never => {
+        abandon();
+        throw new Error('The invitation batch replay purge call was given up on.');
       };
-      const stopped = (): boolean => race.abandoned || this.isOver(window);
+      const stopped = (): boolean => race.settled || this.isOver(window);
       attempt.call = this.system.run(
         async ({ db }): Promise<TResult | null> => {
           if (stopped()) {
-            return stop();
+            stop();
           }
           const timeout: string = timeoutOf(window.deadline - this.now());
           await db.execute(
@@ -296,32 +309,49 @@ export class ExpiredInvitationBatchReplays {
           );
           // The settings took a round trip: the deadline or the abort may have come meanwhile.
           if (stopped()) {
-            return stop();
+            stop();
           }
           race.phase = 'delete';
           return work(db);
         },
         options,
         discard.signal,
-        (phase: 'setup' | 'work' | 'commit' | 'rollback'): void => {
-          // `work` begins with the settings of the timeouts, still part of the setup.
-          if (phase !== 'work') {
+        (phase: 'setup' | 'work' | 'commit' | 'commit-unconfirmed' | 'rollback'): void => {
+          if (race.settled) {
+            return;
+          }
+          if (phase === 'commit-unconfirmed') {
+            race.unconfirmed = true;
+          } else if (phase !== 'work') {
+            // `work` begins with the settings of the timeouts, still part of the setup.
             race.phase = phase;
           }
         },
       );
+      // A runner that ran the work at once may have let a check of the clock settle the race.
+      if (race.settled) {
+        hold();
+      }
       attempt.call.then(
         (value: TResult | null): void => {
-          stopRace();
-          if (!race.abandoned) {
+          if (!race.settled) {
+            race.settled = true;
+            stopRace();
             resolve(value);
           }
         },
         (error: unknown): void => {
-          stopRace();
           // A transaction the call gave up on can only fail on its own; nobody waits for it.
-          if (!race.abandoned) {
-            reject(error instanceof Error ? error : new Error(String(error)));
+          if (!race.settled) {
+            race.settled = true;
+            stopRace();
+            reject(
+              race.unconfirmed && cutShort === 'fail'
+                ? this.cutShort('commit', 'transport', error)
+                : error instanceof Error
+                  ? error
+                  : new Error(String(error)),
+            );
           }
         },
       );
