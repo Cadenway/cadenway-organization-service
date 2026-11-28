@@ -62,7 +62,8 @@ export class InvitationBatchesController {
    * `200` with the outcome of each distinct address, replayed for an equivalent batch under the
    * same `Idempotency-Key`; `400` (a missing key included), `403 organization.role-forbidden`,
    * `404 organization.not-found`, `409 idempotency.request-in-progress`,
-   * `422 idempotency.key-reused`, `429 invitation.daily-limit-reached` with `Retry-After`.
+   * `422 idempotency.key-reused`, `429 invitation.keyed-batch-limit-reached` or
+   * `invitation.daily-limit-reached` with `Retry-After`.
    *
    * @param {InviteMembersKeyedBody} body - The addresses and the role.
    * @param {string | undefined} requestKey - The `Idempotency-Key` header.

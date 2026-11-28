@@ -135,6 +135,13 @@ function shapeOf(refusal: Refusal): ProblemShape {
         },
         retryAt: refusal.nextAvailableAt,
       };
+    case 'invitation-keyed-batch-limit-reached':
+      return {
+        status: 429,
+        code: 'invitation.keyed-batch-limit-reached',
+        details: { nextAvailableAt: refusal.nextAvailableAt.toISOString() },
+        retryAt: refusal.nextAvailableAt,
+      };
     case 'idempotency-key-reused':
       return { status: 422, code: 'idempotency.key-reused' };
     case 'idempotency-request-in-progress':
@@ -153,7 +160,8 @@ function shapeOf(refusal: Refusal): ProblemShape {
  * Runs a use case and turns its `OrganizationRefusal` into the problem of the contract; any other
  * error passes through to the `ProblemFilter` of the kit. A 429 also sets `Retry-After` on the
  * response, the seconds until the request can succeed, rounded up and 1 at least, as the contract
- * declares on `InvitationBatchLimited` and `InvitationResendLimited`: the routes that can answer
+ * declares on `InvitationBatchLimited`, `KeyedInvitationBatchLimited` and
+ * `InvitationResendLimited`: the routes that can answer
  * one pass their response.
  *
  * @param {() => Promise<TResult>} work - The call of the use case.

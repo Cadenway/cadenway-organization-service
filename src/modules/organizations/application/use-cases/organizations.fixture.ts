@@ -13,10 +13,12 @@ import {
   INVITATION_BATCH_LEASE_MS,
   invitationBatchReplayExpiresAt,
 } from '../../domain/policies/invitations/invitation-batch-replay.policy.js';
+import { keyedInvitationBatchStoredToRead } from '../../domain/policies/invitations/keyed-invitation-batch-budget.policy.js';
 import type { InvitationBatchRequest } from '../../domain/value-objects/invitations/invitation-batch-request.value-object.js';
 import type { InvitationDraft } from '../../domain/value-objects/invitations/invitation-draft.value-object.js';
 import type { InvitationEmailUsage } from '../../domain/value-objects/invitations/invitation-email-usage.value-object.js';
 import type { InvitationState } from '../../domain/value-objects/invitations/invitation-state.value-object.js';
+import type { KeyedInvitationBatchUsage } from '../../domain/value-objects/invitations/keyed-invitation-batch-usage.value-object.js';
 import type { MemberDraft } from '../../domain/value-objects/members/member-draft.value-object.js';
 import type { MemberState } from '../../domain/value-objects/members/member-state.value-object.js';
 import type { Role } from '../../domain/value-objects/members/role.value-object.js';
@@ -190,6 +192,12 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
 
   /** Makes every completion of a replay record fail, as a failure after the invitations would. */
   public failReplayRecords: boolean = false;
+
+  /** How many times a reservation step locked the reservations of its organization. */
+  public reservationLocks: number = 0;
+
+  /** The leases whose batch still holds its row, as a batch running past its lease does. */
+  public readonly heldLeases: Set<string> = new Set<string>();
 
   /** Leases handed out so far. */
   private leases: number = 0;
@@ -678,6 +686,49 @@ export class InMemoryOrganizations implements OrganizationsUnitOfWork, VerifiedE
                 },
           );
         },
+        lockReservations: (): Promise<void> => {
+          // One request at a time in these tests: the lock of PostgreSQL is proven by the
+          // integration tests.
+          this.reservationLocks += 1;
+          return Promise.resolve();
+        },
+        usage: (organizationId: string, budget: number): Promise<KeyedInvitationBatchUsage> => {
+          // Reservations are visible as soon as they are written, records once committed. A
+          // reservation past its lease that no batch holds is reclaimed; a held one keeps counting.
+          const now: Date = this.databaseNow();
+          for (const [claim, entry] of [...this.tables.replays]) {
+            if (
+              entry.organizationId === organizationId &&
+              entry.state === 'reserved' &&
+              entry.expiresAt.getTime() <= now.getTime() &&
+              !this.heldLeases.has(entry.leaseId ?? '')
+            ) {
+              this.tables.replays.delete(claim);
+              tables.replays.delete(claim);
+            }
+          }
+          const rows: StoredReplay[] = [...this.tables.replays.values()].filter(
+            (entry: StoredReplay) => entry.organizationId === organizationId,
+          );
+          const running: number = Math.min(
+            budget,
+            rows.filter((entry: StoredReplay) => entry.state === 'reserved').length,
+          );
+          return Promise.resolve({
+            running,
+            newestStoredExpiries: rows
+              .filter(
+                (entry: StoredReplay) =>
+                  entry.state === 'committed' && entry.expiresAt.getTime() > now.getTime(),
+              )
+              .map((entry: StoredReplay) => entry.expiresAt)
+              .sort((left: Date, right: Date) => right.getTime() - left.getTime())
+              .slice(0, keyedInvitationBatchStoredToRead(budget, running)),
+            readAt: now,
+          });
+        },
+        isReserved: (key: InvitationBatchReplayKey): Promise<boolean> =>
+          Promise.resolve(this.tables.replays.get(replayKeyOf(key))?.state === 'reserved'),
         reserve: (
           key: InvitationBatchReplayKey,
           request: InvitationBatchRequest,

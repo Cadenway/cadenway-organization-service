@@ -92,6 +92,13 @@
       "when": 1795855749361,
       "tag": "0012_invitation_batch_replays",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1795869691530,
+      "tag": "0013_invitation_batch_reservation_index",
+      "breakpoints": true
     }
   ]
 }

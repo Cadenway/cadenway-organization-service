@@ -28,7 +28,9 @@ import { organizations } from '../organizations/organization.schema.js';
  * bounded number of its organization's expired rows
  * (`invitation_batch_replays_organization_expiry_index`), and the
  * `organization.purge-invitation-batch-replays` job deletes expired rows, leases included, of every
- * organization in bounded batches (`invitation_batch_replays_expiry_index`). Row-level security on
+ * organization in bounded batches (`invitation_batch_replays_expiry_index`). The admission of a new
+ * key counts the reservations of its organization and deletes those whose lease ran out and that
+ * no transaction holds (`invitation_batch_replays_reservation_index`). Row-level security on
  * `organization_id`, forced by the migration.
  */
 export const invitationBatchReplays = pgTable(
@@ -56,6 +58,11 @@ export const invitationBatchReplays = pgTable(
       table.expiresAt,
     ),
     index('invitation_batch_replays_expiry_index').on(table.expiresAt),
+    // The reservations of an organization only, which its replay record budget counts and
+    // reclaims under its admission lock without scanning its records.
+    index('invitation_batch_replays_reservation_index')
+      .on(table.organizationId, table.expiresAt)
+      .where(sql`${table.state} = 'reserved'`),
     check('invitation_batch_replays_key_digest_check', sql`${table.keyDigest} ~ '^[0-9a-f]{64}$'`),
     check(
       'invitation_batch_replays_request_digest_check',

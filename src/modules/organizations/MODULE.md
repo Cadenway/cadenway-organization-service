@@ -164,6 +164,14 @@ primary key, since a `LIMIT` inside an `IN (subquery)` may be evaluated again by
 The migration is additive: the previous release never reads the table, and a rollback keeps it
 (see "Rollout and rollback of idempotent batches").
 
+`migrations/0013_invitation_batch_reservation_index.sql` adds the partial index
+`invitation_batch_replays_reservation_index` on (`organization_id`, `expires_at`) of the
+`reserved` rows only, which the replay record budget counts and reclaims. It is a plain
+`create index`, as `0006` is: the migrator applies every migration in one transaction, where
+`concurrently` is refused, and the table holds at most the budget of rows per organization, so the
+short lock on its writes is accepted. Additive: the previous release ignores it, and a rollback
+keeps it.
+
 `0005_organization_logo` adds the nullable opaque `organizations.logo_id`, an independent
 `logo_generation` and tenant-owned upload reservations. A reservation binds the uploader,
 declaration and generation for up to five minutes. Its optional 24-hour replay record holds a
@@ -246,7 +254,7 @@ members keep their access if the organization is over the reduced limit.
 | `PATCH /internal/v1/members/{memberId}`                    | Required     | 200, `ETag`             | 400, 403, 404, 412 `request.version-mismatch`, 422 `member.owner-protected`                                                                               |
 | `DELETE /internal/v1/members/{memberId}`                   | Required     | 204                     | 400, 403, 404, 422 `member.owner-protected`                                                                                                               |
 | `POST /internal/v1/invitations`                            | Required     | 200                     | 400, 403, 404 `organization.not-found`, 409 `idempotency.request-in-progress`, 422 `idempotency.key-reused`, 429 `invitation.daily-limit-reached`         |
-| `POST /internal/v1/invitation-batches`                     | Required     | 200                     | As above; 400 also without `Idempotency-Key`, which it requires                                                                                           |
+| `POST /internal/v1/invitation-batches`                     | Required     | 200                     | As above; 400 also without `Idempotency-Key`, which it requires; both, with a key, 429 `invitation.keyed-batch-limit-reached`                             |
 | `GET /internal/v1/invitations`                             | Required     | 200                     | 400, 403, 404                                                                                                                                             |
 | `GET /internal/v1/invitations/{invitationId}`              | Required     | 200, `no-store`, no tag | 400, 403, 404 `invitation.not-found` or `organization.not-found`                                                                                          |
 | `DELETE /internal/v1/invitations/{invitationId}`           | Required     | 204                     | 400, 403, 404 `invitation.not-found`, 409 `invitation.answered`                                                                                           |
@@ -275,6 +283,11 @@ reason phrases; the gateway answers the French titles of the public specs. A 429
 `Retry-After`, the seconds until `details.resendAvailableAt` or `details.nextAvailableAt`, rounded
 up and 1 at least. The gateway relays the two 429 codes only once it lists them: it must ship them
 in the same deployment as this module or before, otherwise they reach the browser as 503.
+
+`429 invitation.keyed-batch-limit-reached` (`@cadenway/contracts` 0.47.0, `KeyedInvitationBatchLimited`)
+answers a keyed batch on either invitation route when the replay record budget of the organization
+is used up (see Invariants), with `details.nextAvailableAt` only and the same `Retry-After`. The
+gateway must list it before this release reaches an environment, as for the two other 429 codes.
 
 ### Rollout and rollback of idempotent batches
 
@@ -553,6 +566,23 @@ retry. Storage uses the authoritative abandonment fact to reclaim the associated
   `409 idempotency.request-in-progress`, and only that. Only a `200` is recorded: a `429` or any
   other error leaves nothing (its reservation is deleted), and the key runs again once it can
   succeed.
+- Replay record budget (`inviteMembersKeyedInternal`, "Replay record budget"): an organization
+  holds at most `KEYED_INVITATION_BATCH_BUDGET` (1,000) keyed batches at once, across its users
+  and both invitation routes: its records still inside their 24 hours plus its reservations that
+  may still commit. A reservation counts from the moment it is taken until its batch stores its
+  record (it then counts as that record) or can no longer commit: deleted by its batch, or past
+  its lease with no transaction holding its row, when the admission of another key deletes it so
+  its batch can no longer renew it. The budget is checked only for a key without a live row,
+  after the authorization, the organization and the replay lookup, and before the daily
+  allowances, so replays, `409` and `422` answer as before; when the budget is full, a key whose
+  batch still runs past its lease answers the retryable `409 idempotency.request-in-progress`,
+  whatever the body, rather than the `429`. A key that would take the organization past the
+  budget answers
+  `429 invitation.keyed-batch-limit-reached`: nothing is created, sent, emitted or stored, and the
+  key is not reserved. `details.nextAvailableAt` is the expiry of the (count - budget + 1)-th
+  oldest record, read as the (budget - running)-th newest, in whole milliseconds rounded up; when
+  reservations alone fill the budget, the lease (30 s) after the read, on the database clock. A
+  batch without the key never counts nor answers that code.
 - `GET /internal/v1/invitations/{invitationId}` reads an invitation of the organization in any
   state, for the owner and the admins: `pending` or `expired` by its expiry while unanswered, then
   `accepted`, `refused` or `revoked` as stored. `answeredAt` is set for an acceptance or a refusal,
@@ -655,6 +685,25 @@ The Search readers open their snapshots directly with the kit's transaction runn
   (a crash: the server ends a dead holder's transaction within its `idle_in_transaction_session_timeout`,
   and its reservation is then free once the lease runs out). No step waits on a lock held by a
   batch in flight.
+- The replay record budget is checked in the first transaction of a keyed batch, as one step with
+  the reservation. Once the replay lookup found no live row, the transaction takes the
+  `for key share` lock on the organization, then a transaction advisory lock on the reservations
+  of the organization (`pg_advisory_xact_lock`, under the normal lock timeout of the role). It
+  deletes at most a budget of the organization's reservations past their lease that it can lock
+  with `for update skip locked` (`invitation_batch_replays_reservation_index`), never waiting: a
+  batch holds its reservation's row from its first statement (`renew` and `complete` are updates of
+  that row in the batch's transaction), so the rows it locks belong to holders that crashed, gave
+  up or have not renewed yet, whose `renew` then finds no lease once the admission commits. Then
+  it counts in one statement, read up to the budget, the remaining reservations, live or held, by
+  the same partial index, and the expiries of its newest records, backward by
+  `invitation_batch_replays_organization_expiry_index`; only then, within the budget, the 100 ms
+  `lock_timeout` and the per-key lock of the reservation follow. A full budget reads the key's row
+  once more, under the lock, so a key reserved by a request that went first still answers as
+  before, and a reservation of the key still there answers the retryable `409`; otherwise the
+  `429`, and the transaction rolls back, its deletes included. The organization lock is held only by these
+  short reservation transactions, never by a batch, the renewal, the record or the release, so
+  concurrent new keys of one organization queue for milliseconds; a wait beyond the 5 s lock
+  timeout of the role fails with a 500.
 - The purge job runs in system transactions, a bounded exception: each one `delete` of at most 500
   expired replay records, chosen by expiry and skipping the rows a batch is deleting. They are
   opened by `DiscardableSystemTransactions` on the service's pool rather than by the kit's runner,
@@ -738,13 +787,43 @@ Any failure rolls back the business rows and the outbox rows together
   exclusively) make every replay of that actor wait, each holding one of the five pooled
   connections, until the readiness probe and other tenants starved. Fresh batches create effects,
   so they keep the locked recheck.
-- No admission limit bounds the replay records. A keyed batch whose addresses are all members or
-  already invited sends no email, so the email allowance does not bound its record. Accepted
-  because each record is bounded (at most 50 addresses per batch, the limit of the contract's
-  `InvitationBatch`), the gateway throttles each session, and the purge drains more than 500 rows
-  per tick on demand. A hard cap would need a new public error code, a contract change. Revisit
-  with production figures: the `oldestExpiredAgeSeconds` the purge logs when it stops on its
-  budget, and the size of `invitation_batch_replays`.
+- A replay record budget bounds the replay records (`@cadenway/contracts` 0.47.0, which replaces
+  the earlier decision to admit keyed batches without a limit): a keyed batch whose addresses are
+  all members or already invited sends no email, so the email allowance does not bound its record.
+  The budget is 1,000 keyed batches per organization (`KEYED_INVITATION_BATCH_BUDGET`): ten times
+  the 100 batches that send an email the daily allowance admits in 24 hours, so retries and
+  batches without new addresses never meet it in normal use, while an organization keeps at most
+  1,000 records of at most 50 addresses each. Revisit with production figures: the size of
+  `invitation_batch_replays` per organization and how often the code is answered.
+- The budget lock is a transaction advisory lock on the organization's reservations, placed
+  between the existing `for key share` lock on the organization and the 100 ms per-key lock, whose
+  order stays as decided above: the check and the reservation must be serialized per organization
+  (two new keys checked on one snapshot would both pass at budget - 1), the organization row lock
+  in a stronger mode (`for no key update`) would make reservations wait on the allowance lock that
+  every batch and resend in flight holds, and a lock taken after the per-key lock would make the
+  100 ms timeout of the key give a false `409` to requests that only queue for the organization.
+  It waits under the normal lock timeout, as the `for key share` lock does, since its holders are
+  short reservations.
+- A running batch counts until it can no longer commit, not until its visible lease runs out:
+  other readers see a reservation's lease as its reservation committed it until its batch
+  commits, so a batch slower than its lease would otherwise stop counting while it can still
+  store its record, and two keys could fill one place (an earlier revision of this change). The
+  row lock tells the two apart without waiting: a reservation past its lease that `for update skip
+locked` cannot lock is held by its batch and counts; one it can lock has no running batch, and
+  the admission deletes it, so its holder, whose first statement is `renew`, finds no lease and
+  rolls back rather than commit later. Running batches alone filling the budget answer
+  `nextAvailableAt` a lease (30 s) away, a short delay within the life of a running batch. A
+  purge deleting an expired reservation also holds its row, which then counts until the purge
+  commits: a moment of a false `429`, never an overshoot.
+- The reservations have their own partial index, `invitation_batch_replays_reservation_index`
+  (`organization_id`, `expires_at`, `where state = 'reserved'`, `0013`), so the admission, under
+  the organization lock, reads only reservations: on the `(organization_id, expires_at)` index,
+  a burst of records expiring within the lease window was scanned and filtered out
+  (`tests/keyed-invitation-batch-budget.int-spec.ts` checks the plans on such a mix).
+- The budget is enforced only by releases that know it: during a rollout or a rollback, a previous
+  release admits new keys without counting them; their records count from then on, and an
+  organization may hold more than the budget until they expire, as the contract allows. The
+  reported `nextAvailableAt` stays exact then, since it reads the newest records only.
 - A purge call given up on at its deadline destroys its own connection on the client side rather
   than waiting for the server's timeouts (an earlier revision, on the kit's runner, which gives no
   handle on its connection) or terminating its backend from another connection: a connection stuck
