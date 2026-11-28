@@ -1,9 +1,50 @@
-import type { SystemTransactionRunner } from '@cadenway/nest-common/database';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { DiscardableSystemTransactions } from '../../transactions/invitations/discardable-system.transaction.js';
 import { ExpiredInvitationBatchReplays } from './expired-invitation-batch-replays.repository.js';
+
+/**
+ * A runner whose first transaction is stuck at the socket level: its `stuckOn` statement never
+ * answers until the call discards its connection, which then rejects it, as pg does once it
+ * destroys the socket. Later transactions answer at once.
+ *
+ * @param stuckOn - The statement that stalls: the setting of the timeouts or the delete.
+ * @returns The repository, the runner and the discards it received.
+ */
+function stuckSocket(stuckOn: 'setting' | 'delete') {
+  const dialect: PgDialect = new PgDialect();
+  const discards: AbortSignal[] = [];
+  const run = vi.fn(
+    async <TResult>(
+      work: (scope: {
+        readonly db: { readonly execute: (statement: SQL) => Promise<unknown> };
+      }) => Promise<TResult>,
+      _options: unknown,
+      discard: AbortSignal,
+    ): Promise<TResult> => {
+      discards.push(discard);
+      const stuck: boolean = run.mock.calls.length === 1;
+      const execute = (statement: SQL): Promise<unknown> => {
+        const setting: boolean = dialect.sqlToQuery(statement).sql.includes('statement_timeout');
+        if (stuck && setting === (stuckOn === 'setting')) {
+          return new Promise((_resolve, reject) => {
+            discard.addEventListener('abort', () => {
+              reject(new Error('Connection terminated'));
+            });
+          });
+        }
+        return Promise.resolve({ rowCount: 3, rows: [{ age: 7 }] });
+      };
+      return work({ db: { execute } });
+    },
+  );
+  const replays = new ExpiredInvitationBatchReplays({
+    run,
+  } as unknown as DiscardableSystemTransactions);
+  return { replays, run, discards };
+}
 
 /**
  * A system runner whose connection checkout takes `checkoutMs` on a fake clock, with a database
@@ -23,7 +64,7 @@ function slowCheckout(checkoutMs: number) {
       clock.now += checkoutMs;
       return work({ db: { execute } });
     },
-  } as unknown as SystemTransactionRunner;
+  } as unknown as DiscardableSystemTransactions;
   const replays = new ExpiredInvitationBatchReplays(system, () => clock.now);
   return { replays, execute };
 }
@@ -50,7 +91,7 @@ function saturatedPool() {
         pool.released += 1;
       }
     },
-  } as unknown as SystemTransactionRunner;
+  } as unknown as DiscardableSystemTransactions;
   return { replays: new ExpiredInvitationBatchReplays(system), execute, pool };
 }
 
@@ -77,7 +118,7 @@ function slowSetting(duringSetting: (clock: { now: number }) => void) {
     run: <TResult>(
       work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
     ): Promise<TResult> => work({ db: { execute } }),
-  } as unknown as SystemTransactionRunner;
+  } as unknown as DiscardableSystemTransactions;
   return { replays: new ExpiredInvitationBatchReplays(system, () => clock.now), others };
 }
 
@@ -108,7 +149,60 @@ describe('ExpiredInvitationBatchReplays', () => {
     vi.useRealTimers();
   });
 
-  it('checks out no connection while a call it gave up on still runs, and again once it ends', async () => {
+  it('discards the stuck connection of a call it gives up on, so the next call runs at once', async () => {
+    vi.useFakeTimers();
+    const { replays, run, discards } = stuckSocket('setting');
+
+    const abandoned = replays.purge(500, { deadline: performance.now() + 200, signal });
+    await vi.advanceTimersByTimeAsync(200);
+
+    await expect(abandoned).resolves.toBeNull();
+    expect(discards[0]?.aborted).toBe(true);
+    expect(replays.stalled).toBe(false);
+    await expect(replays.purge(500, { deadline: performance.now() + 5_000, signal })).resolves.toBe(
+      3,
+    );
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(discards[1]?.aborted).toBe(false);
+  });
+
+  it('fails a delete stuck past its deadline, discarding its connection, and lets the next call delete', async () => {
+    vi.useFakeTimers();
+    const { replays, discards } = stuckSocket('delete');
+
+    const cutShort = replays.purge(500, { deadline: performance.now() + 300, signal });
+    const failed = expect(cutShort).rejects.toThrow('while a delete was in flight');
+    await vi.advanceTimersByTimeAsync(300);
+
+    await failed;
+    expect(discards[0]?.aborted).toBe(true);
+    expect(replays.stalled).toBe(false);
+    await expect(
+      replays.oldestExpiredAgeSeconds({ deadline: performance.now() + 5_000, signal }),
+    ).resolves.toBe(7);
+    await expect(replays.purge(500, { deadline: performance.now() + 5_000, signal })).resolves.toBe(
+      3,
+    );
+  });
+
+  it('discards the connection when the job is aborted while a statement is stuck', async () => {
+    const { replays, discards } = stuckSocket('setting');
+    const job = new AbortController();
+
+    const abandoned = replays.purge(500, {
+      deadline: performance.now() + 60_000,
+      signal: job.signal,
+    });
+    await Promise.resolve();
+    job.abort();
+
+    await expect(abandoned).resolves.toBeNull();
+    expect(discards[0]?.aborted).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(replays.stalled).toBe(false);
+  });
+
+  it('checks out no connection while a call it gave up on has not settled, and again once it ends', async () => {
     vi.useFakeTimers();
     const execute = vi.fn(() => Promise.resolve({ rowCount: 3, rows: [{ age: 7 }] }));
     const stuck = { release: (): void => undefined };
@@ -117,7 +211,8 @@ describe('ExpiredInvitationBatchReplays', () => {
         work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
       ): Promise<TResult> => {
         if (run.mock.calls.length === 1) {
-          // A stalled connection: the first call never ends until the test lets it.
+          // A call that ignores its discard (still waiting for a pooled connection, say): the
+          // first call never ends until the test lets it.
           await new Promise<void>((resolve) => {
             stuck.release = resolve;
           });
@@ -127,36 +222,40 @@ describe('ExpiredInvitationBatchReplays', () => {
     );
     const replays = new ExpiredInvitationBatchReplays({
       run,
-    } as unknown as SystemTransactionRunner);
+    } as unknown as DiscardableSystemTransactions);
 
-    const abandoned = replays.purge(500, { deadline: Date.now() + 200, signal });
+    const abandoned = replays.purge(500, { deadline: performance.now() + 200, signal });
     await vi.advanceTimersByTimeAsync(200);
     await expect(abandoned).resolves.toBeNull();
     expect(replays.stalled).toBe(true);
 
-    await expect(replays.purge(500, { deadline: Date.now() + 5_000, signal })).resolves.toBeNull();
     await expect(
-      replays.oldestExpiredAgeSeconds({ deadline: Date.now() + 5_000, signal }),
+      replays.purge(500, { deadline: performance.now() + 5_000, signal }),
+    ).resolves.toBeNull();
+    await expect(
+      replays.oldestExpiredAgeSeconds({ deadline: performance.now() + 5_000, signal }),
     ).resolves.toBeNull();
     expect(run).toHaveBeenCalledTimes(1);
 
     stuck.release();
     await vi.advanceTimersByTimeAsync(0);
     expect(replays.stalled).toBe(false);
-    await expect(replays.purge(500, { deadline: Date.now() + 5_000, signal })).resolves.toBe(3);
+    await expect(replays.purge(500, { deadline: performance.now() + 5_000, signal })).resolves.toBe(
+      3,
+    );
     expect(run).toHaveBeenCalledTimes(2);
   });
 
   it('answers by its deadline while the pool has no connection, and gives a late one back unused', async () => {
     vi.useFakeTimers();
     const { replays, execute, pool } = saturatedPool();
-    const started: number = Date.now();
+    const started: number = performance.now();
     let answeredAt: number | undefined;
 
     const purge: Promise<number | null> = replays
       .purge(500, { deadline: started + 200, signal })
       .finally(() => {
-        answeredAt = Date.now();
+        answeredAt = performance.now();
       });
     await vi.advanceTimersByTimeAsync(200);
 
@@ -188,14 +287,14 @@ describe('ExpiredInvitationBatchReplays', () => {
       run: <TResult>(
         work: (scope: { readonly db: { readonly execute: typeof execute } }) => Promise<TResult>,
       ): Promise<TResult> => work({ db: { execute } }),
-    } as unknown as SystemTransactionRunner;
+    } as unknown as DiscardableSystemTransactions;
     const replays = new ExpiredInvitationBatchReplays(system);
-    const started: number = Date.now();
+    const started: number = performance.now();
 
     const purge: Promise<number | null> = replays.purge(500, { deadline: started + 300, signal });
     await vi.advanceTimersByTimeAsync(300);
     await expect(purge).resolves.toBeNull();
-    expect(Date.now() - started).toBeLessThanOrEqual(310);
+    expect(performance.now() - started).toBeLessThanOrEqual(310);
 
     stalled.finish();
     await vi.advanceTimersByTimeAsync(0);
@@ -221,21 +320,21 @@ describe('ExpiredInvitationBatchReplays', () => {
         });
         return result;
       },
-    } as unknown as SystemTransactionRunner;
+    } as unknown as DiscardableSystemTransactions;
     return { replays: new ExpiredInvitationBatchReplays(system), execute, commit };
   }
 
   it('fails the purge by its deadline when a delete is in flight or committing, without waiting', async () => {
     vi.useFakeTimers();
     const { replays, execute, commit } = stalledCommit();
-    const started: number = Date.now();
+    const started: number = performance.now();
 
     const purge: Promise<number | null> = replays.purge(500, { deadline: started + 300, signal });
     const failed = expect(purge).rejects.toThrow('while a delete was in flight');
     await vi.advanceTimersByTimeAsync(300);
 
     await failed;
-    expect(Date.now() - started).toBeLessThanOrEqual(310);
+    expect(performance.now() - started).toBeLessThanOrEqual(310);
     expect(execute).toHaveBeenCalledTimes(2);
     commit.finish();
     await vi.advanceTimersByTimeAsync(0);
@@ -244,7 +343,7 @@ describe('ExpiredInvitationBatchReplays', () => {
   it('answers null by its deadline when a backlog read is cut short, a read failing nothing', async () => {
     vi.useFakeTimers();
     const { replays, commit } = stalledCommit();
-    const started: number = Date.now();
+    const started: number = performance.now();
 
     const read: Promise<number | null> = replays.oldestExpiredAgeSeconds({
       deadline: started + 300,
@@ -262,7 +361,7 @@ describe('ExpiredInvitationBatchReplays', () => {
     const job = new AbortController();
 
     const read: Promise<number | null> = replays.oldestExpiredAgeSeconds({
-      deadline: Date.now() + 60_000,
+      deadline: performance.now() + 60_000,
       signal: job.signal,
     });
     job.abort();

@@ -152,6 +152,53 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     expect(warn).toHaveBeenCalledWith({ skippedTicks: 1 }, expect.any(String));
   });
 
+  it('runs the next tick once the call an earlier tick gave up on has settled', async () => {
+    const { handler, expired } = setup([120]);
+    expired.stalled = true;
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await handler.handle(system);
+    expired.stalled = false;
+    await handler.handle(system);
+
+    expect(warn).toHaveBeenCalledOnce();
+    expect(expired.purge).toHaveBeenCalledOnce();
+  });
+
+  it('measures its budget on a monotonic clock, whatever steps the wall clock takes', async () => {
+    vi.useFakeTimers();
+    try {
+      const workers = { work: vi.fn<JobWorkerRegistry['work']>() };
+      const scheduler = {
+        schedule: vi.fn<JobScheduler['schedule']>(),
+        unschedule: vi.fn<JobScheduler['unschedule']>(),
+      };
+      const remaining: number[] = [500, 500, 500, 120];
+      const deadlines: number[] = [];
+      const expired = {
+        stalled: false,
+        purge: vi.fn((_limit: number, window: Window): Promise<number | null> => {
+          deadlines.push(window.deadline);
+          // The wall clock jumps a minute forward at each delete, as a time synchronization would.
+          vi.setSystemTime(Date.now() + 60_000);
+          return Promise.resolve(remaining.shift() ?? 0);
+        }),
+        oldestExpiredAgeSeconds: vi.fn<(window: Window) => Promise<number | null>>(),
+      };
+      const handler = new PurgeInvitationBatchReplaysHandler(workers, scheduler, expired, queue);
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const started: number = performance.now();
+
+      await handler.handle(system);
+
+      expect(expired.purge).toHaveBeenCalledTimes(4);
+      expect(deadlines).toEqual(Array.from({ length: 4 }, () => started + 4_500));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('opens no system purge for a tenant job or an aborted one', async () => {
     const { handler, expired } = setup([500]);
     const aborted = new AbortController();

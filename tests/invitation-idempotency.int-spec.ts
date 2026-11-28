@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import net from 'node:net';
 
 import {
   GetInvitationInternalResponse,
@@ -8,15 +9,15 @@ import type {
   InvitationBatchResult,
   InvitationState,
 } from '@cadenway/contracts/types/internal/organization-service';
-import { SystemTransactionRunner } from '@cadenway/nest-common/database';
-import { JobScheduler } from '@cadenway/nest-jobs/runtime';
+import { DATABASE_POOL, SystemTransactionRunner } from '@cadenway/nest-common/database';
+import { JobScheduler, JobWorkerRegistry } from '@cadenway/nest-jobs/runtime';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import type pg from 'pg';
+import pg from 'pg';
 import request from 'supertest';
 import type { Response, Test } from 'supertest';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { PURGE_INVITATION_BATCH_REPLAYS_QUEUE } from '../src/config/job-queues.js';
 import { distinctAddresses } from '../src/modules/organizations/domain/policies/invitations/invitation-batch.policy.js';
@@ -26,6 +27,7 @@ import {
   ExpiredInvitationBatchReplays,
   expiredPurgeOf,
 } from '../src/modules/organizations/infrastructure/persistence/drizzle/repositories/invitations/expired-invitation-batch-replays.repository.js';
+import { DiscardableSystemTransactions } from '../src/modules/organizations/infrastructure/persistence/drizzle/transactions/invitations/discardable-system.transaction.js';
 import { PurgeInvitationBatchReplaysHandler } from '../src/modules/organizations/presentation/jobs/handlers/invitations/purge-invitation-batch-replays.handler.js';
 import { DeclaredErrors } from './support/declared-errors.js';
 import type { SeenError } from './support/declared-errors.js';
@@ -129,6 +131,28 @@ describe('idempotent invitation batches and the invitation state', () => {
   }
 
   /**
+   * Sends two different batches under one key at once and settles both against the winner. The
+   * loser answers `422` when it reads the winner's reservation, but under load it can give up on
+   * the 100 ms key lock the winner's reservation holds and answer the retryable `409` instead, as
+   * the contract allows; once both answered, the winner's record is committed, so the loser's
+   * retry (the same request) must answer `422`.
+   *
+   * @param send - Sends one of the two batches, by its index.
+   * @returns The two final responses, in the order of their indexes.
+   */
+  async function contend(send: (index: 0 | 1) => Promise<Response>): Promise<Response[]> {
+    const first: Response[] = await Promise.all([send(0), send(1)]);
+    return Promise.all(
+      first.map((response: Response, index: number) =>
+        response.status === 409 &&
+        (response.body as { code?: unknown }).code === 'idempotency.request-in-progress'
+          ? send(index === 0 ? 0 : 1)
+          : Promise.resolve(response),
+      ),
+    );
+  }
+
+  /**
    * Counts rows of an organization.
    *
    * @param text - A `select count(*)::int as count` query with the organization as `$1`.
@@ -138,6 +162,18 @@ describe('idempotent invitation batches and the invitation state', () => {
   async function count(text: string, organizationId: string): Promise<number> {
     const rows = await stack.system<{ count: number }>(text, [organizationId]);
     return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * A store of the expired replay records on the pool of the application, as the purge job has.
+   *
+   * @param pool - The pool its transactions check connections out of.
+   * @returns The store.
+   */
+  function purgeStore(
+    pool: pg.Pool = app.get<pg.Pool>(DATABASE_POOL),
+  ): ExpiredInvitationBatchReplays {
+    return new ExpiredInvitationBatchReplays(new DiscardableSystemTransactions(pool));
   }
 
   /** What a batch writes in an organization, to compare before and after a request. */
@@ -392,15 +428,18 @@ describe('idempotent invitation batches and the invitation state', () => {
       const contested = 'members-page-batch-contested';
       const before: Record<string, number> = await effects(atelierNordId);
 
-      const [left, right] = await Promise.all([
-        invite(ines, atelierNordId, contested, ['leo@ateliernord.fr']),
-        invite(ines, atelierNordId, contested, ['mia@ateliernord.fr']),
-      ]);
+      const emails: readonly (readonly string[])[] = [
+        ['leo@ateliernord.fr'],
+        ['mia@ateliernord.fr'],
+      ];
+      const [left, right] = await contend((index) =>
+        invite(ines, atelierNordId, contested, emails[index] ?? []),
+      );
 
-      const statuses: number[] = [left.status, right.status].sort();
+      const statuses: number[] = [left?.status ?? 0, right?.status ?? 0].sort();
       expect(statuses).toEqual([200, 422]);
-      const refused: Response = left.status === 422 ? left : right;
-      expect(refused.body).toMatchObject({ code: 'idempotency.key-reused' });
+      const refused: Response | undefined = left?.status === 422 ? left : right;
+      expect(refused?.body).toMatchObject({ code: 'idempotency.key-reused' });
       expect(await effects(atelierNordId)).toEqual({
         invitations: (before.invitations ?? 0) + 1,
         emails: (before.emails ?? 0) + 1,
@@ -473,16 +512,19 @@ describe('idempotent invitation batches and the invitation state', () => {
         [lyonId, anchor?.id],
       );
       const lock = await holdSenderLock();
-      const pending: Promise<Response>[] = [
-        invite(ines, lyonId, key, ['noe@ateliernord.fr']),
-        invite(ines, lyonId, key, ['oscar@ateliernord.fr']),
+      const emails: readonly (readonly string[])[] = [
+        ['noe@ateliernord.fr'],
+        ['oscar@ateliernord.fr'],
       ];
+      const pending: Promise<Response[]> = contend((index) =>
+        invite(ines, lyonId, key, emails[index] ?? []),
+      );
       try {
         await lock.waiting(1);
       } finally {
         await lock.release();
       }
-      const responses: Response[] = await Promise.all(pending);
+      const responses: Response[] = await pending;
 
       expect(responses.map((response) => response.status).sort()).toEqual([200, 422]);
       expect(responses.find((response) => response.status === 422)?.body).toMatchObject({
@@ -519,10 +561,10 @@ describe('idempotent invitation batches and the invitation state', () => {
         ]);
         try {
           await lock.waiting(1);
-          purged = await new ExpiredInvitationBatchReplays(app.get(SystemTransactionRunner)).purge(
-            500,
-            { deadline: Date.now() + 5_000, signal: new AbortController().signal },
-          );
+          purged = await purgeStore().purge(500, {
+            deadline: performance.now() + 5_000,
+            signal: new AbortController().signal,
+          });
           competitor = await invite(ines, atelierNordId, slow, ['tess@ateliernord.fr']);
           retry = await invite(ines, atelierNordId, slow, ['Sven@AtelierNord.fr']);
         } finally {
@@ -1196,9 +1238,10 @@ describe('idempotent invitation batches and the invitation state', () => {
         atelierNordId,
       );
 
-      const deleted: number | null = await new ExpiredInvitationBatchReplays(
-        app.get(SystemTransactionRunner),
-      ).purge(3, { deadline: Date.now() + 5_000, signal: new AbortController().signal });
+      const deleted: number | null = await purgeStore().purge(3, {
+        deadline: performance.now() + 5_000,
+        signal: new AbortController().signal,
+      });
       expect(deleted).toBe(3);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(9);
 
@@ -1252,12 +1295,12 @@ describe('idempotent invitation batches and the invitation state', () => {
       expect(inline).toBe(10);
       expect(await swept(atelierNordId)).toBe(30);
 
-      const purge = new ExpiredInvitationBatchReplays(system);
+      const purge = purgeStore();
       const batches: (number | null)[] = [];
       for (let round = 0; round < 3; round += 1) {
         batches.push(
           await purge.purge(500, {
-            deadline: Date.now() + 5_000,
+            deadline: performance.now() + 5_000,
             signal: new AbortController().signal,
           }),
         );
@@ -1265,6 +1308,234 @@ describe('idempotent invitation batches and the invitation state', () => {
 
       expect(batches).toEqual([500, 500, 230]);
       expect((await swept(atelierNordId)) + (await swept(lumenId))).toBe(0);
+    });
+
+    /**
+     * A TCP proxy to PostgreSQL that can stop forwarding in both directions while keeping its
+     * sockets open toward the client, as a network path that stalls without closing: once stalled,
+     * it ignores the client's half-close and the server's end of the session.
+     *
+     * - `now` stalls at once;
+     * - `after-error` forwards the server's messages one by one and stalls right after the first
+     *   `ErrorResponse`, withholding the `ReadyForQuery` that follows it;
+     * - `off` forwards everything, on new connections too.
+     *
+     * @param host - The host of PostgreSQL.
+     * @param port - The port of PostgreSQL.
+     * @returns The port of the proxy, the switch of the stall and its closing.
+     */
+    async function stallingProxy(
+      host: string,
+      port: number,
+    ): Promise<{
+      readonly port: number;
+      readonly stall: (mode: 'now' | 'after-error' | 'off') => void;
+      readonly close: () => Promise<void>;
+    }> {
+      const state: { stalled: boolean; afterError: boolean } = {
+        stalled: false,
+        afterError: false,
+      };
+      const sockets = new Set<net.Socket>();
+      const server: net.Server = net.createServer({ allowHalfOpen: true }, (client: net.Socket) => {
+        const upstream: net.Socket = net.connect(port, host);
+        sockets.add(client);
+        sockets.add(upstream);
+        let unread: Buffer = Buffer.alloc(0);
+        client.on('data', (chunk: Buffer) => {
+          if (!state.stalled) upstream.write(chunk);
+        });
+        upstream.on('data', (chunk: Buffer) => {
+          if (state.stalled) return;
+          if (!state.afterError) {
+            client.write(chunk);
+            return;
+          }
+          // A backend message is its type byte, then its length, which counts itself.
+          unread = Buffer.concat([unread, chunk]);
+          while (unread.length >= 5 && unread.length >= 1 + unread.readUInt32BE(1)) {
+            const end: number = 1 + unread.readUInt32BE(1);
+            const message: Buffer = unread.subarray(0, end);
+            unread = unread.subarray(end);
+            client.write(message);
+            if (message[0] === 0x45) {
+              state.stalled = true;
+              return;
+            }
+          }
+        });
+        // The client's close ends both sides; the server's only while the path is not stalled.
+        const closeBoth = (): void => {
+          client.destroy();
+          upstream.destroy();
+        };
+        client.on('close', closeBoth);
+        client.on('error', closeBoth);
+        client.on('end', () => {
+          if (!state.stalled) closeBoth();
+        });
+        for (const event of ['close', 'error'] as const) {
+          upstream.on(event, () => {
+            if (state.stalled) {
+              upstream.destroy();
+            } else {
+              closeBoth();
+            }
+          });
+        }
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      return {
+        port: (server.address() as net.AddressInfo).port,
+        stall: (mode: 'now' | 'after-error' | 'off'): void => {
+          state.stalled = mode === 'now';
+          state.afterError = mode === 'after-error';
+        },
+        close: (): Promise<void> => {
+          for (const socket of sockets) socket.destroy();
+          return new Promise<void>((resolve) => {
+            server.close(() => {
+              resolve();
+            });
+          });
+        },
+      };
+    }
+
+    /**
+     * A purge tick of the job, on a store of its own.
+     *
+     * @param store - The store of the expired records.
+     */
+    async function tick(store: ExpiredInvitationBatchReplays): Promise<void> {
+      await new PurgeInvitationBatchReplaysHandler(
+        app.get(JobWorkerRegistry),
+        app.get(JobScheduler),
+        store,
+        PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
+      ).handle({ organizationId: null, signal: new AbortController().signal });
+    }
+
+    it('discards a connection stuck at the socket level by its deadline, so a later tick deletes', async () => {
+      await expired(lumenId, 4, 'stuck-socket-');
+      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
+      const proxy = await stallingProxy(target.hostname, Number(target.port));
+      target.host = `127.0.0.1:${String(proxy.port)}`;
+      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
+      pool.on('error', () => undefined);
+      try {
+        // The purge reuses this idle connection, whose path then stalls: its statements are sent
+        // and never answered, and the socket stays open.
+        await pool.query('select 1');
+        const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+        proxy.stall('now');
+        const started: number = performance.now();
+
+        await expect(
+          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+        ).resolves.toBeNull();
+        // Without the discard, nothing would ever end that call: no answer comes back.
+        await vi.waitFor(
+          () => {
+            expect(store.stalled).toBe(false);
+          },
+          { timeout: 2_000, interval: 10 },
+        );
+        expect(performance.now() - started).toBeLessThan(2_000);
+        expect(pool.totalCount).toBe(0);
+
+        proxy.stall('off');
+        await tick(store);
+        expect(await swept(lumenId)).toBe(0);
+      } finally {
+        // The proxy closes first: a connection it still holds open would otherwise hang the end
+        // of the pool instead of failing an assertion.
+        await proxy.close();
+        await pool.end();
+      }
+    });
+
+    it('closes a connection whose rollback waits behind an error never followed by ReadyForQuery, so a later tick deletes', async () => {
+      await expired(lumenId, 4, 'stuck-rollback-');
+      const target = new URL(app.get<pg.Pool>(DATABASE_POOL).options.connectionString ?? '');
+      const proxy = await stallingProxy(target.hostname, Number(target.port));
+      target.host = `127.0.0.1:${String(proxy.port)}`;
+      const pool = new pg.Pool({ connectionString: target.toString(), max: 1 });
+      pool.on('error', () => undefined);
+      // The delete of the purge fails at once with an `ErrorResponse`.
+      await stack.migrator.query(
+        `create function refuse_invitation_batch_replay_delete() returns trigger language plpgsql as
+         $$ begin raise exception 'refused by the test'; end $$`,
+      );
+      await stack.migrator.query(
+        `create trigger refuse_invitation_batch_replay_delete before delete on invitation_batch_replays
+         for each row execute function refuse_invitation_batch_replay_delete()`,
+      );
+      const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+      try {
+        try {
+          await pool.query('select 1');
+          // The error reaches pg, which has then no active query and queues the rollback; the
+          // `ReadyForQuery` it waits for never comes, and the socket stays open.
+          proxy.stall('after-error');
+          const started: number = performance.now();
+
+          await expect(
+            store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+          ).rejects.toThrow('while a delete was in flight');
+          await vi.waitFor(
+            () => {
+              expect(store.stalled).toBe(false);
+            },
+            { timeout: 2_000, interval: 10 },
+          );
+          expect(pool.totalCount).toBe(0);
+        } finally {
+          await stack.migrator.query(
+            'drop trigger refuse_invitation_batch_replay_delete on invitation_batch_replays',
+          );
+          await stack.migrator.query('drop function refuse_invitation_batch_replay_delete()');
+        }
+
+        // The next tick deletes on a fresh connection, the stuck one being gone from the pool.
+        proxy.stall('off');
+        await tick(store);
+        expect(pool.totalCount).toBe(1);
+        expect(await swept(lumenId)).toBe(0);
+      } finally {
+        await proxy.close();
+        await pool.end();
+      }
+    });
+
+    it('drains with a later tick after a delete stalled on a held lock past its deadline', async () => {
+      await expired(lumenId, 4, 'stuck-lock-');
+      const store: ExpiredInvitationBatchReplays = purgeStore();
+      const holder: pg.PoolClient = await stack.migrator.connect();
+      try {
+        await holder.query('begin');
+        await holder.query('lock table invitation_batch_replays in access exclusive mode');
+        const started: number = performance.now();
+
+        // Whichever comes first, the deadline of the call or the server's statement timeout set
+        // to the same time left, fails the delete.
+        await expect(
+          store.purge(500, { deadline: started + 300, signal: new AbortController().signal }),
+        ).rejects.toThrow();
+        await vi.waitFor(
+          () => {
+            expect(store.stalled).toBe(false);
+          },
+          { timeout: 2_000, interval: 10 },
+        );
+      } finally {
+        await holder.query('rollback');
+        holder.release();
+      }
+      expect(await swept(lumenId)).toBe(4);
+
+      await tick(store);
+      expect(await swept(lumenId)).toBe(0);
     });
 
     it('finds the expired records of both purges by an index range on their expiry', async () => {

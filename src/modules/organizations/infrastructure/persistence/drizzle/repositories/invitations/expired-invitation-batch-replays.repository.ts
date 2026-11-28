@@ -1,12 +1,9 @@
-import type {
-  SystemTransactionRunner,
-  TransactionDatabase,
-  TransactionOptions,
-} from '@cadenway/nest-common/database';
+import type { TransactionDatabase, TransactionOptions } from '@cadenway/nest-common/database';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
 import { invitationBatchReplays } from '../../schemas/invitations/invitation-batch-replay.schema.js';
+import type { DiscardableSystemTransactions } from '../../transactions/invitations/discardable-system.transaction.js';
 import { boundedPurgeOf, PURGE_CUTOFF } from './drizzle-invitation-batch-replay.repository.js';
 
 /**
@@ -50,7 +47,8 @@ export interface PurgeWindow {
    * Property deadline
    *
    * @description
-   * The instant, in milliseconds on the clock of the repository, the call must be over by.
+   * The instant, in milliseconds on the monotonic clock of the repository (`performance.now()`
+   * by default), the call must be over by.
    *
    * @type {number}
    * @readonly
@@ -80,7 +78,9 @@ export interface PurgeWindow {
  * job's abort signal: the wait for a pooled connection races them (`within`), and once the
  * transaction holds one in time its statements are capped at the time left (`statement_timeout`,
  * which counts lock waits too), so a purge never outlasts its tick: a statement cut short fails,
- * rolls its batch back and leaves the rows to the next tick.
+ * rolls its batch back and leaves the rows to the next tick. When the deadline or the abort wins
+ * while the transaction still runs, its connection is destroyed on the client side, so the call
+ * given up on settles at once, even on a connection stuck at the socket level.
  */
 export class ExpiredInvitationBatchReplays {
   // #region Properties
@@ -91,6 +91,9 @@ export class ExpiredInvitationBatchReplays {
    * A call the purge gave up on (its deadline or its abort won) whose transaction has not ended
    * yet, and may still hold a pooled connection; `null` otherwise. While it is there, no other call
    * checks a connection out: at most one database call of the purge is in flight in the process.
+   * Its connection is destroyed when it is given up on, so it normally settles at once; only a
+   * call still waiting for a pooled connection stays until the pool hands one over (bounded by the
+   * pool's connection timeout) and gives it back unused.
    *
    * @type {Promise<void> | null}
    */
@@ -114,15 +117,16 @@ export class ExpiredInvitationBatchReplays {
    * Constructor
    *
    * @description
-   * Binds the purge to the system runner because it spans organizations.
+   * Binds the purge to system transactions because it spans organizations, on connections it can
+   * discard at its deadline.
    *
-   * @param {SystemTransactionRunner} system - The system transaction runner.
-   * @param {() => number} now - The clock of the deadlines, in milliseconds.
+   * @param {DiscardableSystemTransactions} system - The discardable system transactions.
+   * @param {() => number} now - The monotonic clock of the deadlines, in milliseconds.
    * @constructor
    */
   public constructor(
-    private readonly system: SystemTransactionRunner,
-    private readonly now: () => number = Date.now,
+    private readonly system: DiscardableSystemTransactions,
+    private readonly now: () => number = (): number => performance.now(),
   ) {}
   // #endregion
 
@@ -181,14 +185,14 @@ export class ExpiredInvitationBatchReplays {
    * first, the call never waits for the transaction. It answers `null` when no statement of `work`
    * had started (no time left, the normal end of a tick), and, under `cutShort: 'fail'`, rejects
    * when one was in flight or committing, since the server may have cancelled it: the job then
-   * fails and its queue's bounded retry applies, instead of a tick acknowledged as done. Left behind, the
-   * transaction runs no statement of its own past that point (it checks before each one), and the
-   * server ends it within the time that was left when it began: its first statement sets both
-   * `statement_timeout` and `idle_in_transaction_session_timeout` to that time, so a statement that
-   * runs too long is cancelled and a transaction left idle, a stalled commit's included, has its
-   * session terminated, which the pool discards instead of reusing. The kit's runner does not give
-   * the connection to its caller, so it cannot be destroyed from here; these two timeouts are the
-   * bound: at most the time left at the start of the transaction past its first statement.
+   * fails and its queue's bounded retry applies, instead of a tick acknowledged as done. Left
+   * behind, the transaction runs no statement of its own past that point (it checks before each
+   * one), and its connection is discarded at once: destroyed on the client side, so its pending
+   * statement rejects and the call settles, however stuck the socket is. The server side has its
+   * own bound, for the locks the rolled-back transaction may still hold until the server notices
+   * the disconnection: the first statement sets both `statement_timeout` and
+   * `idle_in_transaction_session_timeout` to the time left, so the server cancels a statement that
+   * runs too long and terminates a session left idle in its transaction.
    *
    * @param {PurgeWindow} window - The deadline and the abort signal.
    * @param {TransactionOptions} options - How the transaction is opened.
@@ -214,6 +218,7 @@ export class ExpiredInvitationBatchReplays {
         inFlight: boolean;
         timer?: ReturnType<typeof setTimeout>;
       } = { abandoned: false, inFlight: false };
+      const discard: AbortController = new AbortController();
       const listeners: { abandon: () => void } = { abandon: (): void => undefined };
       const stopRace = (): void => {
         clearTimeout(race.timer);
@@ -226,6 +231,8 @@ export class ExpiredInvitationBatchReplays {
           if (attempt.call !== undefined) {
             this.holdAbandoned(attempt.call);
           }
+          // Destroys the connection of a transaction still running, so the call settles at once.
+          discard.abort();
           if (race.inFlight && cutShort === 'fail') {
             reject(new Error('The deadline of the purge came while a delete was in flight.'));
           } else {
@@ -237,22 +244,26 @@ export class ExpiredInvitationBatchReplays {
       race.timer = setTimeout(abandon, Math.max(0, window.deadline - this.now()));
       window.signal.addEventListener('abort', abandon, { once: true });
       const stopped = (): boolean => race.abandoned || this.isOver(window);
-      attempt.call = this.system.run(async ({ db }): Promise<TResult | null> => {
-        if (stopped()) {
-          return null;
-        }
-        const timeout: string = timeoutOf(window.deadline - this.now());
-        await db.execute(
-          sql`select set_config('statement_timeout', ${timeout}, true),
+      attempt.call = this.system.run(
+        async ({ db }): Promise<TResult | null> => {
+          if (stopped()) {
+            return null;
+          }
+          const timeout: string = timeoutOf(window.deadline - this.now());
+          await db.execute(
+            sql`select set_config('statement_timeout', ${timeout}, true),
                        set_config('idle_in_transaction_session_timeout', ${timeout}, true)`,
-        );
-        // The settings took a round trip: the deadline or the abort may have come meanwhile.
-        if (stopped()) {
-          return null;
-        }
-        race.inFlight = true;
-        return work(db);
-      }, options);
+          );
+          // The settings took a round trip: the deadline or the abort may have come meanwhile.
+          if (stopped()) {
+            return null;
+          }
+          race.inFlight = true;
+          return work(db);
+        },
+        options,
+        discard.signal,
+      );
       attempt.call.then(
         (value: TResult | null): void => {
           stopRace();
