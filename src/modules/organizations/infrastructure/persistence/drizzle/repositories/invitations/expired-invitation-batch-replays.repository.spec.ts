@@ -7,7 +7,7 @@ import type { DiscardableSystemTransactions } from '../../transactions/invitatio
 import { ExpiredInvitationBatchReplays } from './expired-invitation-batch-replays.repository.js';
 
 /** The steps the runner reports, as `DiscardableSystemTransactions` does. */
-type Phase = 'setup' | 'work' | 'commit' | 'rollback';
+type Phase = 'setup' | 'work' | 'commit' | 'commit-unconfirmed' | 'rollback';
 
 /**
  * Builds the error of a call cut short, as the composition gives it.
@@ -19,8 +19,9 @@ type Phase = 'setup' | 'work' | 'commit' | 'rollback';
 function cutShort(
   phase: InvitationBatchReplayPurgeCutShortError['phase'],
   trigger: InvitationBatchReplayPurgeCutShortError['trigger'],
+  cause?: unknown,
 ): InvitationBatchReplayPurgeCutShortError {
-  return new InvitationBatchReplayPurgeCutShortError(phase, trigger);
+  return new InvitationBatchReplayPurgeCutShortError(phase, trigger, cause);
 }
 
 /**
@@ -502,5 +503,94 @@ describe('ExpiredInvitationBatchReplays', () => {
       .filter((query) => query.sql.includes('statement_timeout'))
       .map((query) => query.params[0]);
     expect(timeouts).toEqual(['4750ms', '3500ms']);
+  });
+
+  it('fails a delete whose commit lost its answer as unconfirmed, with the transport error as cause', async () => {
+    const lost = new Error('Connection terminated unexpectedly');
+    const system = {
+      run: async <TResult>(
+        work: (scope: {
+          readonly db: { readonly execute: () => Promise<unknown> };
+        }) => Promise<TResult>,
+        _options: unknown,
+        _discard: AbortSignal,
+        onPhase: (phase: Phase) => void,
+      ): Promise<TResult> => {
+        onPhase('setup');
+        onPhase('work');
+        await work({ db: { execute: () => Promise.resolve({ rowCount: 42, rows: [] }) } });
+        onPhase('commit');
+        onPhase('commit-unconfirmed');
+        throw lost;
+      },
+    } as unknown as DiscardableSystemTransactions;
+    const replays = new ExpiredInvitationBatchReplays(system, cutShort);
+
+    const error: unknown = await replays
+      .purge(500, { deadline: performance.now() + 5_000, signal })
+      .then(
+        () => undefined,
+        (rejected: unknown) => rejected,
+      );
+
+    expect(error).toBeInstanceOf(InvitationBatchReplayPurgeCutShortError);
+    expect(error).toMatchObject({ phase: 'commit', trigger: 'transport', cause: lost });
+    expect(replays.stalled).toBe(false);
+  });
+
+  it('latches the phase when the clock finds the deadline first, whatever the rollback after it reports', async () => {
+    const clock = { now: 0 };
+    const dialect: PgDialect = new PgDialect();
+    const discards: AbortSignal[] = [];
+    const reported: Phase[] = [];
+    const system = {
+      run: async <TResult>(
+        work: (scope: {
+          readonly db: { readonly execute: (statement: SQL) => Promise<unknown> };
+        }) => Promise<TResult>,
+        _options: unknown,
+        discard: AbortSignal,
+        onPhase: (phase: Phase) => void,
+      ): Promise<TResult> => {
+        discards.push(discard);
+        const report = (phase: Phase): void => {
+          reported.push(phase);
+          onPhase(phase);
+        };
+        report('setup');
+        report('work');
+        try {
+          return await work({
+            db: {
+              execute: (statement: SQL) => {
+                // The setting of the timeouts answers past the deadline.
+                if (dialect.sqlToQuery(statement).sql.includes('statement_timeout')) {
+                  clock.now += 2_000;
+                }
+                return Promise.resolve({ rowCount: 42, rows: [] });
+              },
+            },
+          });
+        } catch (error: unknown) {
+          // The cleanup reports its rollback, which hangs until the connection is discarded.
+          report('rollback');
+          if (!discard.aborted) {
+            await new Promise<void>((resolve) => {
+              discard.addEventListener('abort', () => {
+                resolve();
+              });
+            });
+          }
+          throw error;
+        }
+      },
+    } as unknown as DiscardableSystemTransactions;
+    const replays = new ExpiredInvitationBatchReplays(system, cutShort, () => clock.now);
+
+    await cutShortIn(replays.purge(500, { deadline: 1_000, signal }), 'setup');
+    expect(discards[0]?.aborted).toBe(true);
+    expect(reported).toEqual(['setup', 'work', 'rollback']);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(replays.stalled).toBe(false);
   });
 });

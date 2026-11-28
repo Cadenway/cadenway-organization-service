@@ -200,7 +200,7 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     }
   });
 
-  it('fails the tick when a delete is cut short once started, logging its phase and backlog', async () => {
+  it('fails the tick when a delete is cut short once started, warning with its phase and backlog, never at error', async () => {
     const { handler, expired } = setup([500]);
     const cutShort = new InvitationBatchReplayPurgeCutShortError('setup', 'deadline');
     expired.purge.mockResolvedValueOnce(500).mockRejectedValueOnce(cutShort);
@@ -209,11 +209,14 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
 
     await expect(handler.handle(system)).rejects.toBe(cutShort);
 
-    expect(error).toHaveBeenCalledWith(
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
       { phase: 'setup', trigger: 'deadline', deleted: 500, oldestExpiredAgeSeconds: 840 },
       expect.any(String),
     );
-    expect(warn).not.toHaveBeenCalled();
+    // The job runtime writes the one error-level event, for the last attempt only.
+    expect(error).not.toHaveBeenCalled();
+    expect(cutShort.message).toContain('deadline');
+    expect(cutShort.message).toContain('setup');
   });
 
   it('keeps the phase and rethrows the original error when the backlog read fails after a cut short', async () => {
@@ -221,11 +224,11 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     const cutShort = new InvitationBatchReplayPurgeCutShortError('delete', 'deadline');
     expired.purge.mockRejectedValueOnce(cutShort);
     expired.oldestExpiredAgeSeconds.mockRejectedValueOnce(new Error('connection refused'));
-    const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
     await expect(handler.handle(system)).rejects.toBe(cutShort);
 
-    expect(error).toHaveBeenCalledExactlyOnceWith(
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
       { phase: 'delete', trigger: 'deadline', deleted: 0, oldestExpiredAgeSeconds: null },
       expect.any(String),
     );
@@ -235,14 +238,37 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     const { handler, expired } = setup([]);
     const cutShort = new InvitationBatchReplayPurgeCutShortError('commit', 'abort');
     expired.purge.mockRejectedValueOnce(cutShort);
-    const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
     await expect(handler.handle(system)).rejects.toBe(cutShort);
 
-    expect(error).toHaveBeenCalledWith(
+    expect(warn).toHaveBeenCalledWith(
       {
         phase: 'commit',
         trigger: 'abort',
+        committed: 'unknown',
+        deleted: 0,
+        oldestExpiredAgeSeconds: 840,
+      },
+      expect.any(String),
+    );
+  });
+
+  it('reports a commit whose connection failed before its answer as unconfirmed, with its cause', async () => {
+    const { handler, expired } = setup([]);
+    const lost = new Error('Connection terminated unexpectedly');
+    const cutShort = new InvitationBatchReplayPurgeCutShortError('commit', 'transport', lost);
+    expired.purge.mockRejectedValueOnce(cutShort);
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await expect(handler.handle(system)).rejects.toBe(cutShort);
+
+    expect(cutShort.cause).toBe(lost);
+    expect(cutShort.message).toContain('whether it committed is unknown');
+    expect(warn).toHaveBeenCalledWith(
+      {
+        phase: 'commit',
+        trigger: 'transport',
         committed: 'unknown',
         deleted: 0,
         oldestExpiredAgeSeconds: 840,
@@ -272,9 +298,11 @@ describe('PurgeInvitationBatchReplaysHandler', () => {
     const refused = new Error('canceling statement due to statement timeout');
     expired.purge.mockRejectedValueOnce(refused);
     const error = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
     await expect(handler.handle(system)).rejects.toBe(refused);
     expect(error).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('starts no delete with less than its minimum window left, ending the tick on its budget', async () => {

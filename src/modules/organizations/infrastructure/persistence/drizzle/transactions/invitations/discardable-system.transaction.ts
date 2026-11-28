@@ -7,6 +7,7 @@ import type { TransactionDatabase, TransactionOptions } from '@cadenway/nest-com
 import { metrics } from '@opentelemetry/api';
 import type { Histogram, MeterProvider } from '@opentelemetry/api';
 import { drizzle } from 'drizzle-orm/node-postgres';
+import { DatabaseError } from 'pg';
 import type { Pool, PoolClient } from 'pg';
 
 /** The statement that opens a transaction, by isolation level, never assembled from input. */
@@ -101,14 +102,18 @@ export class DiscardableSystemTransactions {
    * the call then rejects as soon as its pending statement does, with no rollback attempted. A
    * signal that aborts during the checkout gives the connection back unused. `onPhase` learns
    * each step as it starts, after the checkout: `setup` (the opening statements), `work`,
-   * `commit`, `rollback`.
+   * `commit`, `rollback`; and `commit-unconfirmed` when the `COMMIT` was sent but its answer never
+   * came (the connection failed meanwhile): the server may have committed, so no rollback is
+   * attempted and the call rejects with the transport error. A commit the server answered stays
+   * distinct: refused (a `DatabaseError`) or turned into a rollback (`ROLLBACK`), it committed
+   * nothing and rejects as any failed statement.
    *
    * @param {(scope: { readonly db: TransactionDatabase }) => Promise<TResult>} work - The
    * statements, which must not keep `db` past their promise.
    * @param {TransactionOptions} options - The isolation level and the read-only flag.
    * @param {AbortSignal} discard - Aborts to destroy the connection.
-   * @param {(phase: 'setup' | 'work' | 'commit' | 'rollback') => void} onPhase - Learns the step
-   * the transaction starts.
+   * @param {(phase: 'setup' | 'work' | 'commit' | 'commit-unconfirmed' | 'rollback') => void} onPhase -
+   * Learns the step the transaction starts.
    * @returns {Promise<TResult>} What `work` resolved with, once committed.
    * @throws {Error} Inside a live transaction, when discarded, or when a statement fails.
    */
@@ -116,17 +121,20 @@ export class DiscardableSystemTransactions {
     work: (scope: { readonly db: TransactionDatabase }) => Promise<TResult>,
     options: TransactionOptions,
     discard: AbortSignal,
-    onPhase: (phase: 'setup' | 'work' | 'commit' | 'rollback') => void = (): void => undefined,
+    onPhase: (
+      phase: 'setup' | 'work' | 'commit' | 'commit-unconfirmed' | 'rollback',
+    ) => void = (): void => undefined,
   ): Promise<TResult> {
     assertNoActiveTransaction();
     const { poolAcquireDuration, transactionDuration } = databaseMetrics();
     const connection: PoolClient = await this.checkout(poolAcquireDuration);
     const started: number = performance.now();
-    const state: { discarded: boolean; broken: boolean; outcome: 'success' | 'error' } = {
-      discarded: false,
-      broken: false,
-      outcome: 'error',
-    };
+    const state: {
+      discarded: boolean;
+      broken: boolean;
+      unconfirmed: boolean;
+      outcome: 'success' | 'error';
+    } = { discarded: false, broken: false, unconfirmed: false, outcome: 'error' };
     // The pool removes its own error listener while a connection is checked out.
     const onConnectionError = (): void => {
       state.broken = true;
@@ -163,14 +171,23 @@ export class DiscardableSystemTransactions {
         onPhase('work');
         const result: TResult = await work({ db: drizzle({ client: connection }) });
         onPhase('commit');
-        const committed = await connection.query('commit');
+        const committed = await connection.query('commit').catch((error: unknown) => {
+          // The server answers a refused commit with an `ErrorResponse`, a `DatabaseError`. Any
+          // other failure, short of a discard, lost the answer: the commit may have taken effect.
+          if (!state.discarded && !(error instanceof DatabaseError)) {
+            state.unconfirmed = true;
+            state.broken = true;
+            onPhase('commit-unconfirmed');
+          }
+          throw error;
+        });
         if (committed.command === 'ROLLBACK') {
           throw new Error('The system transaction was rolled back at commit.');
         }
         state.outcome = 'success';
         return result;
       } catch (error: unknown) {
-        if (!state.discarded) {
+        if (!state.discarded && !state.unconfirmed) {
           onPhase('rollback');
           try {
             await connection.query('rollback');

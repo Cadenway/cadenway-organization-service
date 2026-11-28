@@ -182,8 +182,9 @@ describe('idempotent invitation batches and the invitation state', () => {
   function cutShortOf(
     phase: InvitationBatchReplayPurgeCutShortError['phase'],
     trigger: InvitationBatchReplayPurgeCutShortError['trigger'],
+    cause?: unknown,
   ): InvitationBatchReplayPurgeCutShortError {
-    return new InvitationBatchReplayPurgeCutShortError(phase, trigger);
+    return new InvitationBatchReplayPurgeCutShortError(phase, trigger, cause);
   }
 
   /**
@@ -1341,6 +1342,9 @@ describe('idempotent invitation batches and the invitation state', () => {
      * - `after-error` forwards the server's messages one by one and stalls right after the first
      *   `ErrorResponse`, withholding the `ReadyForQuery` that follows it: `errorWithheld` resolves
      *   once the error went through and the bytes after it were dropped;
+     * - `after-commit` forwards a simple-query `COMMIT` to the server, then closes the connection
+     *   as soon as the server answers, before any byte of the answer (`CommandComplete`,
+     *   `ReadyForQuery`) reaches the client: the server committed, the client never learns it;
      * - `off` forwards everything, on new connections too.
      *
      * @param host - The host of PostgreSQL.
@@ -1352,15 +1356,16 @@ describe('idempotent invitation batches and the invitation state', () => {
       port: number,
     ): Promise<{
       readonly port: number;
-      readonly stall: (mode: 'now' | 'after-error' | 'off') => void;
+      readonly stall: (mode: 'now' | 'after-error' | 'after-commit' | 'off') => void;
       readonly errorWithheld: Promise<void>;
       readonly close: () => Promise<void>;
     }> {
-      const state: { stalled: boolean; afterError: boolean; errorForwarded: boolean } = {
-        stalled: false,
-        afterError: false,
-        errorForwarded: false,
-      };
+      const state: {
+        stalled: boolean;
+        afterError: boolean;
+        afterCommit: boolean;
+        errorForwarded: boolean;
+      } = { stalled: false, afterError: false, afterCommit: false, errorForwarded: false };
       const withheld: { resolve: () => void } = { resolve: (): void => undefined };
       const errorWithheld = new Promise<void>((resolve) => {
         withheld.resolve = resolve;
@@ -1371,10 +1376,24 @@ describe('idempotent invitation batches and the invitation state', () => {
         sockets.add(client);
         sockets.add(upstream);
         let unread: Buffer = Buffer.alloc(0);
+        const sent: { commit: boolean } = { commit: false };
         client.on('data', (chunk: Buffer) => {
-          if (!state.stalled) upstream.write(chunk);
+          if (state.stalled) return;
+          // A simple query is `Q`, its length, then its text: the runner sends each one alone.
+          if (
+            state.afterCommit &&
+            chunk[0] === 0x51 &&
+            chunk.toString('utf8', 5).toLowerCase().startsWith('commit')
+          ) {
+            sent.commit = true;
+          }
+          upstream.write(chunk);
         });
         upstream.on('data', (chunk: Buffer) => {
+          if (sent.commit) {
+            closeBoth();
+            return;
+          }
           if (state.stalled) {
             if (state.errorForwarded) withheld.resolve();
             return;
@@ -1422,9 +1441,10 @@ describe('idempotent invitation batches and the invitation state', () => {
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       return {
         port: (server.address() as net.AddressInfo).port,
-        stall: (mode: 'now' | 'after-error' | 'off'): void => {
+        stall: (mode: 'now' | 'after-error' | 'after-commit' | 'off'): void => {
           state.stalled = mode === 'now';
           state.afterError = mode === 'after-error';
+          state.afterCommit = mode === 'after-commit';
         },
         errorWithheld,
         close: (): Promise<void> => {
@@ -1521,7 +1541,9 @@ describe('idempotent invitation batches and the invitation state', () => {
         work: (scope: { readonly db: TransactionDatabase }) => Promise<TResult>,
         options: TransactionOptions,
         discard: AbortSignal,
-        onPhase: (phase: 'setup' | 'work' | 'commit' | 'rollback') => void = (): void => undefined,
+        onPhase: (
+          phase: 'setup' | 'work' | 'commit' | 'commit-unconfirmed' | 'rollback',
+        ) => void = (): void => undefined,
       ): Promise<TResult> {
         return super.run(work, options, discard, (phase) => {
           onPhase(phase);
@@ -1634,6 +1656,43 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
     });
 
+    it('fails a tick whose connection is lost after its commit was sent as an unconfirmed commit, and the retry purges', async () => {
+      await expired(lumenId, 4, 'lost-commit-');
+      const { proxy, pool } = await proxiedPool();
+      try {
+        await pool.query('select 1');
+        const store: ExpiredInvitationBatchReplays = purgeStore(pool);
+        proxy.stall('after-commit');
+
+        const error: unknown = await tick(store).then(
+          () => undefined,
+          (rejected: unknown) => rejected,
+        );
+
+        expect(error).toMatchObject({
+          name: 'InvitationBatchReplayPurgeCutShortError',
+          phase: 'commit',
+          trigger: 'transport',
+        });
+        expect((error as Error).cause).toBeInstanceOf(Error);
+        expect((error as Error).cause).not.toBeInstanceOf(pg.DatabaseError);
+        // The server did commit the delete: the outcome the tick could not confirm.
+        expect(await swept(lumenId)).toBe(0);
+        expect(store.stalled).toBe(false);
+        expect(pool.totalCount).toBe(0);
+
+        // The retry purges on a fresh connection.
+        await expired(lumenId, 3, 'lost-commit-retry-');
+        proxy.stall('off');
+        await tick(store);
+        expect(pool.totalCount).toBe(1);
+        expect(await swept(lumenId)).toBe(0);
+      } finally {
+        await proxy.close();
+        await pool.end();
+      }
+    });
+
     it('fails the job of a tick whose delete waits on a held lock past its deadline, and its queue retries it', async () => {
       await expired(lumenId, 4, 'stuck-lock-');
       const producer = await NestTest.createTestingModule({
@@ -1650,11 +1709,27 @@ describe('idempotent invitation batches and the invitation state', () => {
       }).compile();
       await producer.init();
       const holder: pg.PoolClient = await stack.migrator.connect();
+      let jobId: string;
+      /**
+       * Reads the state of the job in pg-boss.
+       *
+       * @returns Its state, its retries started and whether its next attempt is delayed.
+       */
+      const job = async (): Promise<
+        { state: string; retry_count: number; delayed: boolean } | undefined
+      > =>
+        (
+          await stack.migrator.query<{ state: string; retry_count: number; delayed: boolean }>(
+            `select state, retry_count, start_after > now() as delayed
+             from pgboss.job where id = $1`,
+            [jobId],
+          )
+        ).rows[0];
       try {
         await holder.query('begin');
         await holder.query('lock table invitation_batch_replays in access exclusive mode');
         // The worker of the application runs the job on its own store and pool.
-        const { jobId } = await app
+        ({ jobId } = await app
           .get(SystemTransactionRunner)
           .run(({ client }) =>
             producer
@@ -1664,24 +1739,13 @@ describe('idempotent invitation batches and the invitation state', () => {
                 PURGE_INVITATION_BATCH_REPLAYS_QUEUE,
                 null,
               ),
-          );
+          ));
 
         // The attempt failed and the job waits for its retry, delayed by the backoff of the queue
         // (pg-boss counts a retry once it starts).
         await vi.waitFor(
           async () => {
-            const [job] = (
-              await stack.migrator.query<{
-                state: string;
-                retry_count: number;
-                delayed: boolean;
-              }>(
-                `select state, retry_count, start_after > now() as delayed
-                 from pgboss.job where id = $1`,
-                [jobId],
-              )
-            ).rows;
-            expect(job).toEqual({ state: 'retry', retry_count: 0, delayed: true });
+            expect(await job()).toEqual({ state: 'retry', retry_count: 0, delayed: true });
           },
           { timeout: 30_000, interval: 200 },
         );
@@ -1692,9 +1756,18 @@ describe('idempotent invitation batches and the invitation state', () => {
       }
       expect(await swept(lumenId)).toBe(4);
 
-      await app
-        .get(PurgeInvitationBatchReplaysHandler)
-        .handle({ organizationId: null, signal: new AbortController().signal });
+      // The backoff (30 s to a minute for a first retry) is shortened, the only change made to the
+      // job: the worker then runs the same job again, which deletes the records and completes.
+      await stack.migrator.query(
+        `update pgboss.job set start_after = now() where id = $1 and state = 'retry'`,
+        [jobId],
+      );
+      await vi.waitFor(
+        async () => {
+          expect(await job()).toMatchObject({ state: 'completed', retry_count: 1 });
+        },
+        { timeout: 30_000, interval: 200 },
+      );
       expect(await swept(lumenId)).toBe(0);
     });
 
