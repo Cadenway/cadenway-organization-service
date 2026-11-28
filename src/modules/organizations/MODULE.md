@@ -747,7 +747,7 @@ Any failure rolls back the business rows and the outbox rows together
   left, so a healthy tick never fails on a deadline it reached between two deletes.
 - The discardable runner records the kit's two database histograms itself, under the kit's meter
   and with the kit's names, units and attributes, because `@cadenway/nest-common` 0.8.1 does not
-  export its instruments; an export from the kit would replace that copy of four declarations.
+  export its instruments; an export from the kit would replace that copy of its two histograms.
 - Replay support is signalled by a route, not by a capability flag or a gateway switch: a keyed
   batch goes to `POST /internal/v1/invitation-batches`, which a release without replays does not
   serve, so a rolling deploy or a rollback can never run a keyed retry as a fresh batch (which
